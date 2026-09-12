@@ -80,7 +80,7 @@ repository's contribution rules, which take precedence in their own tree.
 
 ## The Factory Label Contract
 
-See [`pr-labels.md`](pr-labels.md) for projectbluefin's lifecycle label taxonomy, queue structure (`3-clanker-queue`, `3-human-queue`), and repository automation labels (`lgtm`, `automerge`).
+See [`pr-labels.md`](pr-labels.md) for projectbluefin's lifecycle label taxonomy, `3-clanker-queue` admission, `3-human-queue` routing, and repository automation labels (`lgtm`, `automerge`).
 
 ## Reconciling Long-Lived Branches
 

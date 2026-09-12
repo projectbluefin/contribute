@@ -216,7 +216,7 @@
     {
       "id": "pr-labels",
       "name": "pr-labels",
-      "one_line_purpose": "Enforce projectbluefin's lifecycle, queue, and automation label taxonomy.",
+      "one_line_purpose": "Enforce the canonical factory lifecycle, admission, and automation label contract.",
       "entry_point": "docs/skills/pr-labels.md",
       "category": "meta",
       "status": "active",
@@ -227,7 +227,7 @@
         "automation",
         "workflow"
       ],
-      "description": "Defines projectbluefin's lifecycle label taxonomy, queue structure (3-clanker-queue, 3-human-queue), and automation labels (lgtm, automerge). Use when managing labels or triage.",
+      "description": "Defines projectbluefin's lifecycle labels, 3-clanker-queue admission, 3-human-queue routing, and the lgtm approval flag. Use when managing labels or triage.",
       "version": "1.1",
       "last_updated": "2026-09-13",
       "doc_type": "policy"
@@ -272,18 +272,19 @@
     {
       "id": "review-dashboard",
       "name": "review-dashboard",
-      "one_line_purpose": "Change the maintainer dashboard without weakening its gate or hiding the queue.",
+      "one_line_purpose": "Maintain the Oh My Pi review extension and the retained Textual compatibility dashboard.",
       "entry_point": "docs/skills/review-dashboard.md",
       "category": "ci-ops",
       "status": "active",
       "tags": [
-        "textual",
-        "tui",
+        "omp",
+        "extension",
         "dashboard",
         "review",
+        "textual",
         "maintainer"
       ],
-      "description": "Maintains image/tui/bluefin_review_tui.py: the mutation gate, the queue view, and its Textual patterns. Use when editing the dashboard or its pilot tests.",
+      "description": "Maintains the primary Oh My Pi review extension in image/extension/bluefin-review/ and the retained Textual compatibility dashboard in image/tui/bluefin_review_tui.py. Use when editing review UI or action seams.",
       "version": "3.1",
       "last_updated": "2026-09-09",
       "doc_type": "runbook"

@@ -1,10 +1,17 @@
 # review — Agent Operating Contract
 
-`review` is the Bluefin review appliance: one OCI image fork and a launcher.
-The `review-container` (Codex-only) and `review-queue` (OMP default, Codex alternate)
-recipes run the Hive contributor worker and maintainer dashboard. Review owns the
-image, publication, launcher credential handoff, and review context; Hive owns its
-contributor protocol, task selection, tmux session, prompt injection, and output capture.
+`review` is the Bluefin review appliance: the `image/extension/bluefin-review`
+mode for Oh My Pi shipped in a distroless appliance image, and a launcher.
+The primary maintainer review product runs via the OMP extension entrypoints:
+in source via `bin/omp-review` or packaged via `just review-appliance` and
+`image/appliance/Containerfile`. The `review-container` recipe runs the Hive
+contributor worker, and `review-queue` runs the retained Textual maintainer
+compatibility dashboard. Review owns the appliance image, extension, launcher
+credential handoff, and review context; Hive owns its contributor protocol, task
+selection, tmux session, prompt injection, and output capture.
+OMP owns agent execution, sessions, tasks, and tool boundaries. Maintainer Hive
+reads remain optional, non-mutating context and ordering, while contributor
+task selection and assignment remain Hive-owned.
 
 ## Read order
 
@@ -15,7 +22,9 @@ contributor protocol, task selection, tmux session, prompt injection, and output
 
 ## Boundaries
 
-Keep this repository focused: it ships the maintainer-facing review appliance and the isolated `contribute` Hive worker. `contribute` is not a general agent distribution: OMP is its only selectable agent surface, Hive remains the sole task authority, and the registration file plus inherited provider credentials are its only runtime inputs.
+Keep this repository focused: it ships the review appliance and nothing
+beside it. Persistent state stays limited to launcher configuration and the
+review-queue landing record the launcher mounts for the dashboard.
 
 The interactive recipes run the image runtime in the foreground of the
 terminal that launched them, and Ctrl-C stops them. Detached contributor
@@ -39,12 +48,10 @@ contributor credential; never loosen that file's permissions as a workaround.
 That rule scopes how the launcher starts the container; it is not a ban
 on `&` anywhere in the repository. Backgrounding is required where it is what
 preserves signal responsiveness. Bash defers a trap handler while it waits on
-a foreground child, so `image/contribute/entrypoint.sh` runs the contributor
-agent and `tmux attach-session` as background jobs it `wait`s on, and
-`image/entrypoint.sh` runs the contributor agent and its passive
-`worker_status.py` companion the same way — keeping PID 1 signal-responsive
-in both; a foreground attach or companion swallowed SIGTERM for the whole
-session and forced podman's ten-second SIGKILL. Do not "fix" that.
+a foreground child, so `image/entrypoint.sh` runs the contributor agent and
+`tmux attach-session` as background jobs it `wait`s on, keeping PID 1
+signal-responsive; a foreground attach swallowed SIGTERM for the whole session
+and forced podman's ten-second SIGKILL. Do not "fix" that.
 
 `podman run --rm -it` does not bind a container's lifetime to its client:
 `conmon` supervises the container, survives the client, and reparents to the
@@ -60,14 +67,16 @@ one permitted filter is own-work exclusion on the maintainer-facing queue
 view — a reviewer never receives their own authored pull requests to review.
 
 Keep review checks and interactive skills as separate layers.
-`image/bin/bluefin-review` supplies the image-owned
-`/opt/bluefin/review-scope/.agents/` overlay directly by folding its `REVIEW.md`
-and five check definitions (`bluefin-doctrine`, `security`, `correctness`,
-`test-coverage`, `simplicity`) into a single consolidated prompt sent to the
-selected backend (Codex or OMP). Skills generated from the
-Bluefin catalog, or installed from `skills.sh` and other compatible open
-catalogs, belong under `~/.agents/skills/` for interactive contributor sessions
-and do not become review checks automatically. See [`docs/skills/review-checks.md`](docs/skills/review-checks.md).
+The review mode in `image/extension/bluefin-review/` equips OMP with companion
+review agents (`bluefin-doctrine`, `bluefin-reviewer`, `bluefin-security`,
+`bluefin-correctness`, `bluefin-test-coverage`, `bluefin-simplicity`,
+`bluefin-ci-triage`, `k3-final-review`) and LLM-callable inspection tools.
+The compatibility `goose review` flow does not consume `~/.agents/skills/`;
+it supplies the image-owned `/opt/bluefin/review-scope/.agents/` overlay
+through `--check-scope`. Skills generated from the Bluefin catalog, or
+installed from `skills.sh` and other compatible open catalogs, belong under
+`~/.agents/skills/` for interactive contributor sessions and do not become
+review checks automatically. See [`docs/skills/review-checks.md`](docs/skills/review-checks.md).
 
 Opening the maintainer dashboard never starts a contributor worker. Scaling
 cluster workers is an explicit, separate choice — `just review-container
@@ -162,16 +171,27 @@ labels. Never add a local workaround for an accepted upstream gap. See
 
 - `justfile` is the only shipped launcher artifact. Its public recipes and
   private helpers intentionally live together; `just --list` is the list.
-- `image/` builds the FSDK-derived contributor image and its layered runtime
-  configuration.
+- `image/appliance/` builds the distroless Bluefin Review appliance image
+  carrying OMP, Pi, GitHub CLI, shell, and the review extension.
+- `image/extension/bluefin-review/` is the TypeScript OMP review extension,
+  providing the queue rail, dashboard, pipeline trace, companion agents,
+  and tools.
+- `image/` also builds the FSDK-derived contributor/compatibility image
+  (`image/Containerfile`) and its layered runtime configuration.
 - `package.json` and `package-lock.json` at the root pin only the contributor
   relay's `ws` dependency for the image build. This repository is not a Node
   project.
+- `bin/omp-review` is the source entrypoint for the OMP review mode.
 - `scripts/` contains build-time skill generation, documentation checks, and
   the host-side lab broker `review-lab-broker.py` the launcher starts for an
   opted-in `review-queue` session.
-- `tests/` contains launcher and image contracts.
+- `tests/` contains launcher, extension, and image contracts.
 - `docs/` contains the skill router and catalog.
+- [`docs/appliance.md`](docs/appliance.md) provides detailed appliance
+  installation and configuration guidance.
+Hive rewrites `~/.config/goose/config.yaml`. Keep the controlled Goose
+configuration under `GOOSE_PATH_ROOT=/opt/bluefin/goose`; do not write it to
+the Hive-managed path.
 
 ## Permitted changes
 
