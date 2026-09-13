@@ -127,6 +127,12 @@ repos:
         entry: bash tests/appliance-contract.sh
         files: ^(image/appliance/|scripts/(review-appliance-version|generate-appliance-sbom)|tests/appliance-contract\.sh|\.github/workflows/publish-appliance\.yml|\.dockerignore)
         pass_filenames: false
+      - id: contribute-contract
+        name: contribute image and SBOM contract
+        language: system
+        entry: bash tests/contribute-contract.sh
+        files: ^(image/contribute/|scripts/generate-contribute-sbom\.py|tests/contribute.*|\.github/workflows/publish-contribute\.yml)
+        pass_filenames: false
       # A commit that merely writes about GitHub's CI-skip directive silently
       # skips its own validation and publish. Catch it at commit time.
       - id: check-commit-message

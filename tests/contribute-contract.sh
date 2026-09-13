@@ -121,6 +121,10 @@ grep -q '^GH_TOKEN=faketoken1234567890faketoken1234567890$' "$launcher_scratch/e
 grep -q '^GITHUB_TOKEN=faketoken1234567890faketoken1234567890$' "$launcher_scratch/env" || fail "resolved GITHUB_TOKEN must reach the contained process"
 grep -q -- '--env' "$launcher_scratch/argv" && fail "credential values must never be passed as --env arguments"
 echo "contribute-contract: bin/bluefin-contribute GH_TOKEN handling holds"
+
+# --- scripts/generate-contribute-sbom.py unit contract ------------------------
+python3 "$root/tests/contribute_sbom_contract.py" || fail "tests/contribute_sbom_contract.py failed"
+
 if [[ -z "$image" ]]; then
   echo "contribute-contract: static contract holds"
   exit 0

@@ -968,6 +968,13 @@ For each pull request, in order:
    contradicts the queue's own `merge_method`, and never bypass the queue with a
    direct merge. Only when no merge queue applies, merge directly using a method
    the ruleset's `allowed_merge_methods` permits.
+   The maintainer's batch already excludes, up front, any pull request its
+   repository's ruleset would block on approvals or self-approval: such a PR
+   is held `awaiting-reviewers` and removed from the batch rather than
+   dispatched, so do not try to land a PR that lacks the write-access
+   reviews its ruleset requires, and never bypass branch protection or
+   review requirements to force a merge — report it `blocked` with the
+   exact approval shortfall instead.
    Never approve or merge a pull request authored by @{task.login}: Bluefin
    policy requires review by a different contributor, so an own-authored
    pull request in this batch is reported `blocked` with the note

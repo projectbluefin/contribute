@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-11",
+  "generated_at": "2026-09-13",
   "schema_version": "1.0",
   "skills": [
     {
@@ -190,8 +190,8 @@
         "automerge"
       ],
       "description": "Manages batch landings, multi-repo lane partitioning, fix-and-land agents, and landing status persistence. Use when modifying batch execution or landing.py.",
-      "version": "1.2",
-      "last_updated": "2026-09-09",
+      "version": "1.3",
+      "last_updated": "2026-09-13",
       "doc_type": "procedure"
     },
     {
@@ -216,7 +216,7 @@
     {
       "id": "pr-labels",
       "name": "pr-labels",
-      "one_line_purpose": "Enforce the canonical factory seven-label and automation label contract.",
+      "one_line_purpose": "Enforce projectbluefin's lifecycle, queue, and automation label taxonomy.",
       "entry_point": "docs/skills/pr-labels.md",
       "category": "meta",
       "status": "active",
@@ -227,9 +227,9 @@
         "automation",
         "workflow"
       ],
-      "description": "Defines projectbluefin's canonical seven-label workflow contract and repository automation labels (lgtm, override, security-advisory). Use when managing labels or triage.",
-      "version": "1.0",
-      "last_updated": "2026-09-06",
+      "description": "Defines projectbluefin's lifecycle label taxonomy, queue structure (3-clanker-queue, 3-human-queue), and automation labels (lgtm, automerge). Use when managing labels or triage.",
+      "version": "1.1",
+      "last_updated": "2026-09-13",
       "doc_type": "policy"
     },
     {
@@ -246,9 +246,9 @@
         "labels",
         "testing"
       ],
-      "description": "Defines pull request, branch, title, trailer, and validation requirements, the factory's seven-label contract and this repository's three automation labels, how to reconcile a long-lived branch with squash-merged main, and why a test must run a feature.",
-      "version": "1.11",
-      "last_updated": "2026-09-09",
+      "description": "Defines pull request, branch, title, trailer, and validation requirements, repository lifecycle and queue label taxonomy, how to reconcile a long-lived branch with squash-merged main, and why a test must run a feature.",
+      "version": "1.12",
+      "last_updated": "2026-09-13",
       "doc_type": "policy"
     },
     {

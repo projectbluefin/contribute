@@ -4884,6 +4884,57 @@ class ReviewDashboard(App):
             return True
         return len(self.human_approvals(live)) >= required
 
+    def landing_ruleset_blocker(self, stop: Stop, live: dict) -> str:
+        """Why this PR cannot land under its repository's own ruleset (#514).
+
+        The [A] batch path and the [$] path must refuse the same PRs for the
+        same reason, so this mirrors the slay landing gate. It keys on the
+        PR's real approval evidence from the GitHub API, not on a heuristic:
+        a ruleset that requires more write-access reviews than GitHub carries
+        on this head, a require_last_push_approval that invalidates our own
+        approval, or an own-authored PR that policy bars us from landing.
+        Returns "" when the PR carries what its ruleset needs.
+        """
+        if stop.is_issue:
+            return ""
+        policy = repo_review_policy(stop.repository)
+        required = policy["approvals"]
+        if required <= 0:
+            return ""
+        approvals = self.human_approvals(live)
+        if len(approvals) < required:
+            shortfall = (
+                f"{len(approvals)}/{required} write-access review(s)"
+                if required > 1
+                else "a second write-access review"
+            )
+            return (
+                f"{stop.repository} ruleset requires {shortfall}; "
+                f"GitHub carries {len(approvals)} on this head"
+            )
+        if (
+            policy["last_push_approval"]
+            and self.self_login in approvals
+            and self.is_fixer_head(
+                stop.repository, stop.number,
+                str(live.get("headRefOid") or stop.head_sha),
+            )
+        ):
+            return (
+                f"{stop.repository} sets require_last_push_approval and our push "
+                f"invalidated our approval"
+            )
+        if (
+            self.self_login
+            and str(stop.author or "").casefold()
+            == str(self.self_login).casefold()
+        ):
+            return (
+                f"own pull request — {stop.repository} requires a different "
+                f"contributor to review and land it"
+            )
+        return ""
+
     def stop_lacks_my_review(self, stop: Stop) -> bool:
         if stop.is_issue or not self.self_login:
             return False
@@ -9772,6 +9823,52 @@ class ReviewDashboard(App):
 
             self.push_screen(FinalPolicyScreen(), chosen)
             return
+        # Pre-flight ruleset gate (#514): a PR its repository's own ruleset
+        # will block on approvals or self-approval must not be dispatched — it
+        # only spends a GitHub API round-trip and an agent run that ends
+        # blocked, and the batch loop then re-selects and re-dispatches it.
+        # Check the live approval count against the ruleset up front, hold
+        # those PRs as awaiting-reviewers with a visible note, and dispatch
+        # only what the ruleset will actually land.
+        dispatchable: list[Stop] = []
+        held: list[Stop] = []
+        for stop in batch:
+            try:
+                live_data = self.fetch_live_pr(stop.repository, stop.number, force=True)
+            except Exception as error:
+                # A flaky fetch must not strand the whole batch; the landing
+                # gate re-checks live right before any mutation anyway.
+                self.notify(
+                    f"[$] {stop.key}: could not pre-flight ruleset "
+                    f"(live fetch failed: {error})",
+                    severity="warning",
+                )
+                dispatchable.append(stop)
+                continue
+            blocker = self.landing_ruleset_blocker(stop, live_data)
+            if blocker:
+                stop.selected = False
+                stop.failure = f"awaiting-reviewers: {blocker}"
+                held.append(stop)
+            else:
+                dispatchable.append(stop)
+
+        if held:
+            self.notify(
+                "held " + str(len(held)) + " PR(s) out of this landing batch "
+                "awaiting a second write-access review before their ruleset will "
+                "land them: " + ", ".join(s.key for s in held),
+                severity="warning",
+            )
+            self.refresh_rows()
+        if not dispatchable:
+            self.notify(
+                "nothing to land — every selected PR is awaiting a second "
+                "write-access review",
+                severity="warning",
+            )
+            return
+        batch = dispatchable
         # Partition stops by repository to allow concurrent landing lanes (#399)
         groups: dict[str, list[Stop]] = {}
         for stop in batch:

@@ -18,7 +18,7 @@ bluefin-contribute
 
 This installs the `bluefin` CLI with both `review` and `contribute` subcommands (as well as `bluefin-contribute`):
 
-Maintainers: 
+Maintainers:
 ```bash
 # Review pull requests and inspect CI failures
 bluefin-review

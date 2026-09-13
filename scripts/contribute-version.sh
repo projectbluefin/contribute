@@ -10,9 +10,10 @@ base_tag="${base_tag%%@*}"
   echo "contribute-version: invalid base tag" >&2
   exit 1
 }
+series="${BASH_REMATCH[1]}"
 revision="$(tr -d '[:space:]' <"$revision_file")"
 [[ "$revision" =~ ^[0-9]+$ ]] || {
   echo "contribute-version: invalid revision" >&2
   exit 1
 }
-printf '%s.%02d\n' "${BASH_REMATCH[1]}" "$((10#$revision))"
+printf '%s.%02d\n' "$series" "$((10#$revision))"
