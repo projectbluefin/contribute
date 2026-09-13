@@ -1427,7 +1427,7 @@ test("the extension registers keyboard-only surfaces and real tools", async () =
 	assert.ok(pi.messages.length > 0, "alt+s must dispatch autoslay user message in Hive priority order");
 });
 
-test("autoslay falls back to unranked PR batch review and slaying with 7 subagents and K3 review when no Hive-ranked items exist", async () => {
+test("autoslay falls back to unranked PR batch review and slaying with 7 subagents when no Hive-ranked items exist", async () => {
 	const pi = fakeHost();
 	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl: fakeFetch([]), env: ISOLATED_ENV });
 	const ctx = fakeCtx();
@@ -1456,12 +1456,84 @@ test("autoslay falls back to unranked PR batch review and slaying with 7 subagen
 	assert.equal(slayable.length, 3);
 	assert.equal(slayable[0].id, 101);
 
-	// The actionPrompt for the batch must include the 7-subagent cap and k3-final-review
+	// The actionPrompt for the batch must include the 7-subagent cap
 	const prompt = actionPrompt({ kind: "slay", item: slayable[0], items: slayable });
 	assert.match(prompt, /ONE subagent per issue\/PR/);
 	assert.match(prompt, /capped at a maximum of 7 concurrent subagents/);
-	assert.match(prompt, /k3-final-review/);
+	assert.doesNotMatch(prompt, /k3-final-review/);
 	assert.match(prompt, /Execute the full fix-and-merge landing pass/);
+});
+
+test("dispatch prompts forbid sleeping on CI and cap the evidence they pull", () => {
+	const item = queueItem();
+	const slay = actionPrompt({ kind: "slay", item });
+	const approve = actionPrompt({ kind: "approve", item });
+	// The single-item landing pass is the path a one-item queue actually takes.
+	assert.match(slay, /Never sleep or run polling loops/);
+	assert.match(approve, /Never sleep or run polling loops/);
+	// "as soon as checks are green" invited the wait loop that burned the turns.
+	assert.doesNotMatch(slay, /as soon as checks are green/);
+	// Context is re-sent every turn, so evidence is read once and stays bounded.
+	for (const prompt of [slay, approve]) {
+		assert.match(prompt, /Evidence is bounded and read once/);
+		assert.match(prompt, /--name-only/);
+		assert.doesNotMatch(prompt, /--json [\w,]*\bbody\b/);
+	}
+	// A batch hands both rules to every subagent it fans out.
+	const batch = actionPrompt({ kind: "slay", item, items: [item, queueItem({ id: 7, repo: "projectbluefin/other" })] });
+	assert.match(batch, /Never sleep or run polling loops/);
+	assert.match(batch, /Evidence is bounded and read once/);
+});
+
+test("the queue read travels with its caveat and the subagent rules are copyable", () => {
+	const green = queueItem({ ciStatus: "success", mergeState: "clean", reviewState: "approved" });
+	const slay = actionPrompt({ kind: "slay", item: green });
+	// The state the queue already paid for travels with the item.
+	assert.match(slay, /\[queue read: ci=success merge=clean review=approved — revalidate head live before mutating\]/);
+	// Unknown fields are omitted rather than sent as noise.
+	const bare = actionPrompt({ kind: "slay", item: queueItem({ ciStatus: undefined, mergeState: "unknown", reviewState: "unknown" }) });
+	assert.doesNotMatch(bare, /merge=unknown|review=unknown/);
+	// A parent copies item lines and drops surrounding prose, so the caveat that makes
+	// a snapshot unsafe to mutate on is inside the brackets, not beside them.
+	const batch = actionPrompt({ kind: "slay", item: green, items: [green, queueItem({ id: 7, repo: "projectbluefin/other", ciStatus: "failure" })] });
+	for (const line of batch.split("\n").filter((l) => l.includes("queue read:"))) {
+		assert.match(line, /revalidate head live before mutating/, line);
+	}
+	// And the rules a subagent needs are a delimited block, not an instruction to paraphrase.
+	assert.match(batch, /<<<SUBAGENT-RULES[\s\S]*Never sleep or run polling loops[\s\S]*SUBAGENT-RULES>>>/);
+	assert.match(batch, /copied verbatim/);
+});
+
+test("a terminal block excludes an item only while it is still the truth", (t) => {
+	const root = stateTree();
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+
+	const blockedAt = NOW / 1000;
+	appendFileSync(
+		join(root, "landings", "task-blocked.jsonl"),
+		[
+			{ pr: "projectbluefin/review#101", state: "blocked", note: "ruleset requires 2 approvals", head: "a".repeat(40), ts: blockedAt },
+			{ pr: "projectbluefin/review#103", state: "blocked", note: "ruleset requires 2 approvals", head: "a".repeat(40), ts: blockedAt },
+			{ pr: "projectbluefin/review#104", state: "blocked", note: "needs a rebase", head: "a".repeat(40), ts: blockedAt },
+		].map((e) => JSON.stringify(e)).join("\n") + "\n",
+	);
+
+	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
+	mode.items = [
+		// Still blocked: same head, nothing has happened since the record.
+		prItem({ id: 101, repo: "projectbluefin/review", title: "blocked pr", headSha: "a".repeat(40), updatedAt: NOW - 60_000 }),
+		// Never blocked.
+		prItem({ id: 102, repo: "projectbluefin/review", title: "actionable pr", headSha: "c".repeat(40), updatedAt: NOW }),
+		// The second approval landed after the block: same head, newer activity.
+		prItem({ id: 103, repo: "projectbluefin/review", title: "approved since", headSha: "a".repeat(40), updatedAt: NOW + 60_000 }),
+		// The author pushed a fix: different head.
+		prItem({ id: 104, repo: "projectbluefin/review", title: "rebased since", headSha: "b".repeat(40), updatedAt: NOW - 60_000 }),
+	];
+	mode.reprioritize();
+
+	const ids = mode.slayableItems().map((i) => i.id).sort((a, b) => a - b);
+	assert.deepEqual(ids, [102, 103, 104], "a stale block must not outlive the state it described");
+	assert.ok(!ids.includes(101), "an unchanged blocked pull request stays excluded");
 });
 
 // The timeout is the assertion: a handler that waits on its own work never
@@ -1785,11 +1857,9 @@ test("action prompts name the evidence and refuse to merge red checks", () => {
 	assert.match(docs, /check-skill-frontmatter\.sh/);
 	const batchAction = { kind: "review", item, items: [item, queueItem({ id: 7, repo: "projectbluefin/other" })] };
 	const batchPrompt = actionPrompt(batchAction);
-	assert.match(batchPrompt, /k3-final-review/);
-	assert.match(batchPrompt, /Kimi K3 at max effort/);
+	assert.doesNotMatch(batchPrompt, /k3-final-review/);
 	assert.match(batchPrompt, /Repository `projectbluefin\/review`/);
 	assert.match(batchPrompt, /Repository `projectbluefin\/other`/);
-	assert.match(batchPrompt, /cross-repository contract compatibility/);
 	assert.equal(actionPrompt({ kind: "close" }), undefined);
 	assert.match(batchPrompt, /Never ask the user for confirmation/);
 	assert.match(batchPrompt, /execute all actions end-to-end autonomously/);
@@ -1990,8 +2060,7 @@ test("a filtered slice is selected and dispatched in one wave", (t) => {
 	const prompt = actionPrompt({ kind: "slay", item: batch[0], items: batch });
 	assert.match(prompt, /ONE subagent per issue\/PR/);
 	assert.match(prompt, /capped at a maximum of 7 concurrent subagents/);
-	assert.match(prompt, /k3-final-review/);
-	assert.match(prompt, /lands them all in one PR per repository/);
+	assert.doesNotMatch(prompt, /k3-final-review/);
 });
 
 test("RED: unlabeled open projectbluefin/review issue is rejected and NOT sent to sendUserMessage", async () => {
@@ -2994,4 +3063,3 @@ test("pilot: OMP dashboard mouse and click operable with keyboard parity (#462)"
 	dashboard.handleClick(15, 5);
 	assert.equal(mode.cursor, 1, "narrow stacked layout selects row on click");
 });
-

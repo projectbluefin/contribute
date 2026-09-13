@@ -70,7 +70,7 @@ Keep review checks and interactive skills as separate layers.
 The review mode in `image/extension/bluefin-review/` equips OMP with companion
 review agents (`bluefin-doctrine`, `bluefin-reviewer`, `bluefin-security`,
 `bluefin-correctness`, `bluefin-test-coverage`, `bluefin-simplicity`,
-`bluefin-ci-triage`, `k3-final-review`) and LLM-callable inspection tools.
+`bluefin-ci-triage`) and LLM-callable inspection tools.
 The compatibility `goose review` flow does not consume `~/.agents/skills/`;
 it supplies the image-owned `/opt/bluefin/review-scope/.agents/` overlay
 through `--check-scope`. Skills generated from the Bluefin catalog, or

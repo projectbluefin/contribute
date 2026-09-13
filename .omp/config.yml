@@ -27,8 +27,6 @@ task:
     bluefin-simplicity: github-copilot/gemini-3.8-flash:high
     bluefin-reviewer: github-copilot/gemini-3.8-flash:high
     bluefin-queue-triage: github-copilot/gemini-3.8-flash:high
-    # Final batch audit subagent runs Kimi K3 at max effort.
-    k3-final-review: github-copilot/kimi-k3:max
 # Role aliases the shipped review agents and any local agent may reference.
 # Concrete selectors live here so an agent definition can name a role without
 # hardcoding a provider.

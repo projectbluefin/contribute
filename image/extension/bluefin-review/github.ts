@@ -35,6 +35,8 @@ export interface QueueItem {
 	additions?: number;
 	deletions?: number;
 	changedFiles?: number;
+	/** Exact head of the pull request at queue-read time. */
+	headSha?: string;
 	/** `owner/repo#number` of every issue this pull request closes. */
 	closingIssues?: string[];
 	/** `owner/repo#number` of merged PRs that reference or close this issue. */
@@ -71,6 +73,7 @@ const PR_ITEM_FIELDS = `
 	additions
 	deletions
 	changedFiles
+	headRefOid
 	commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
 	closingIssuesReferences(first: 5) {
 		nodes { number repository { nameWithOwner } }
@@ -265,6 +268,7 @@ function toQueueItem(node: SearchNode, mode: QueueMode): QueueItem | undefined {
 		additions: node.additions,
 		deletions: node.deletions,
 		changedFiles: node.changedFiles,
+		headSha: node.headRefOid,
 		closingIssues: (node.closingIssuesReferences?.nodes ?? [])
 			.map((reference) =>
 				reference.repository?.nameWithOwner && typeof reference.number === "number"

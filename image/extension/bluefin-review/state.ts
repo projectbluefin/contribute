@@ -21,6 +21,28 @@ import { GLYPH, type SpanStatus } from "./glyphs.ts";
 const TAIL_BYTES = 64 * 1024;
 /** Most recent JSONL logs consulted per directory. */
 const MAX_LOGS = 12;
+/**
+ * Landing logs consulted for terminal outcomes.
+ *
+ * One confirmed batch writes one file, and a busy day writes hundreds, so the
+ * 12-file trace window silently forgot that a pull request was already blocked
+ * and the queue re-selected it. These files are a few KB each and every read is
+ * a bounded tail, so the wider window costs a stat per file and buys the
+ * exclusion its correctness.
+ */
+const MAX_LANDING_LOGS = 256;
+
+/** Terminal states in durable landing and run records that require human retry or a new head. */
+export const TERMINAL_BLOCKED_STATES: Record<string, true> = {
+	blocked: true,
+	failed: true,
+	review_missing: true,
+	review_failed: true,
+	review_incomplete: true,
+	review_unparsable: true,
+	mutation_failed: true,
+	human_review_missing: true,
+};
 
 export interface RunRecord {
 	repository: string;
@@ -229,7 +251,7 @@ export function readReviewEvents(root: string): ReviewEvent[] {
 
 export function readLandingEvents(root: string): LandingEvent[] {
 	const events: LandingEvent[] = [];
-	for (const path of recentFiles(join(root, "landings"), ".jsonl", MAX_LOGS)) {
+	for (const path of recentFiles(join(root, "landings"), ".jsonl", MAX_LANDING_LOGS)) {
 		for (const row of parseLines(readTail(path))) {
 			const watch = row.watch as Record<string, unknown> | undefined;
 			const watchRepository = watch ? asString(watch.repository) : "";
@@ -390,6 +412,55 @@ export function hasRecordedFindings(snapshot: StateSnapshot, key: string): boole
 		if (event.key !== key) continue;
 		return event.state === "findings";
 	}
+	return false;
+}
+
+/** What the live queue currently knows about an item, for judging a stale block. */
+export interface ItemCurrency {
+	headSha?: string;
+	/** Epoch ms of the item's newest GitHub activity. */
+	updatedAt?: number;
+}
+
+/**
+ * Is this item's newest terminal block still the truth?
+ *
+ * A block is evidence about one commit at one moment, and most of them here say
+ * "needs a second approval" — which a *review* clears, not a push. Suppressing on
+ * the record alone starved the queue: with no currency to compare against, every
+ * blocked pull request stayed excluded forever and autoslay ran out of work.
+ *
+ * So a record only suppresses while nothing has moved since: a different head, or
+ * any GitHub activity newer than the record, re-admits the item. Knowing nothing
+ * about the item suppresses, because that is the case the exclusion exists for.
+ */
+export function isItemTerminalBlocked(snapshot: StateSnapshot, key: string, current?: ItemCurrency): boolean {
+	const superseded = (recordHead: string | undefined, recordedAt: number): boolean => {
+		if (current?.headSha && recordHead && current.headSha !== recordHead) return true;
+		return current?.updatedAt !== undefined && recordedAt > 0 && current.updatedAt > recordedAt;
+	};
+
+	// Newest landing event for this item; anything newer than a block supersedes it.
+	for (let index = snapshot.landingEvents.length - 1; index >= 0; index--) {
+		const event = snapshot.landingEvents[index]!;
+		if (event.pullRequestKey !== key) continue;
+		if (event.state && event.state in TERMINAL_BLOCKED_STATES) {
+			return !superseded(event.headSha, event.timestamp);
+		}
+		// A newer non-terminal state means the item already moved past the block.
+		break;
+	}
+
+	// The run-state machine carries the same verdict for the slay pipeline.
+	for (let index = snapshot.runs.length - 1; index >= 0; index--) {
+		const run = snapshot.runs[index]!;
+		if (queueKey(run.repository, run.pullRequest) !== key) continue;
+		if (run.state in TERMINAL_BLOCKED_STATES) {
+			return !superseded(run.headSha, run.updatedAt);
+		}
+		break;
+	}
+
 	return false;
 }
 

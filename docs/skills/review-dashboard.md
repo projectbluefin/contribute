@@ -40,7 +40,7 @@ review mode. The extension provides:
 3. **Companion review agents**: Specialized task agents under
    `image/extension/bluefin-review/agents/` (`bluefin-doctrine`, `bluefin-reviewer`,
    `bluefin-security`, `bluefin-correctness`, `bluefin-test-coverage`,
-   `bluefin-simplicity`, `bluefin-ci-triage`, `k3-final-review`).
+   `bluefin-simplicity`, `bluefin-ci-triage`).
 4. **Inspection tools**: Registered tools in `tools.ts` (`bluefin_review_status`,
    `bluefin_review_queue`, `bluefin_review_diff`, `bluefin_review_trace`,
    `bluefin_hive_lookup`) returning real structured data.

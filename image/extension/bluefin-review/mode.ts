@@ -23,6 +23,7 @@ import {
 	type StateSnapshot,
 	buildPipelineSpans,
 	hasRecordedFindings,
+	isItemTerminalBlocked,
 	queueKey,
 	readStateSnapshot,
 	snapshotSignature,
@@ -340,8 +341,13 @@ export class ReviewMode {
 	slayableItems(): QueueItem[] {
 		const chosen = this.chosenItems();
 		if (chosen.length > 0) return chosen;
-		const visible = this.visibleItems();
-		if (visible.length > 0) return visible;
+		this.refreshState();
+		// A block is only current against the head and activity the queue just read;
+		// without that comparison every blocked item is excluded forever.
+		const actionable = (item: QueueItem) =>
+			!isItemTerminalBlocked(this.snapshot, itemKey(item), { headSha: item.headSha, updatedAt: item.updatedAt });
+		const actionableVisible = this.visibleItems().filter(actionable);
+		if (actionableVisible.length > 0) return actionableVisible;
 		// Fallback: when Hive-only filter leaves 0 items, fall back to unranked items
 		let base = this.ranked.items.length === this.items.length ? this.ranked.items : this.items;
 		if (this.skipRepos.size > 0) {
@@ -351,7 +357,7 @@ export class ReviewMode {
 				return !this.skipRepos.has(repoLower) && !this.skipRepos.has(shortName);
 			});
 		}
-		return base;
+		return base.filter(actionable);
 	}
 
 	/**

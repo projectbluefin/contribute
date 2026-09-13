@@ -137,8 +137,36 @@ export function isImplementationAction(action: DashboardAction): boolean {
 export function actionPrompt(action: DashboardAction, priority?: Priority): string | undefined {
 	const autonomousRule = "This is an automated review and landing tool: execute all actions end-to-end autonomously in a continuous loop. Never ask the user for confirmation, permission, or interactive prompts to proceed. Once a batch or queue item is complete, immediately request the next assignment from the queue or advance to the next item so the loop runs continuously without stopping.";
 	const mutationRule = "Typed GitHub mutations prefer native/gh/API tools. Browser is bounded fallback for UI-only work; equivalent preferred attempts are not repeated indefinitely. Preserved human confirmation and merge authority: stop and report instead of merging if any check is failing or pending.";
+	// A turn spent asleep is a turn billed for nothing: the queue re-dispatches on
+	// its own, so an unfinished check is reported and released, never waited on.
+	const noPollRule = "Never sleep or run polling loops: read CI status once, re-kick a completed failure if warranted, and if checks are still running or the pull request is policy-blocked, report the exact status and stop rather than waiting.";
+	// Context is the bill. Anything a command prints stays in the transcript and is
+	// re-sent on every later turn, so one unbounded diff early costs its size times
+	// the remaining turn count. Measured: 91% of tokens spent were re-sent context,
+	// and 80% of `gh pr view` calls re-read a pull request the agent had already read.
+	const evidenceRule = "Evidence is bounded and read once. Fetch each pull request's state a single time with a minimal field set (`gh pr view <n> --repo <r> --json number,state,isDraft,mergeable,mergeStateStatus,headRefOid,statusCheckRollup,reviewDecision`) and reuse what you already fetched instead of re-running it; re-read only after you push a commit. List changed files with `gh pr diff <n> --repo <r> --name-only` and pull a full patch or a `--log-failed` run log only for the specific file or failing job you must judge. Never paste a whole diff, log, or JSON blob into your report — cite file:line and the one failing step.";
+	// The queue already fetched CI, mergeability, review decision and draft for every
+	// row. Sending those few fields costs ~20 tokens per item and removes the first
+	// `gh pr view` each agent would otherwise run — the call that was 80% redundant.
+	//
+	// The caveat is part of the value, not a separate paragraph. A parent that fans
+	// this batch out to subagents copies the item lines and drops the surrounding
+	// prose — observed live: all seven children received the bracketed state and none
+	// received the rule qualifying it. So the words that make a snapshot unsafe to
+	// mutate on travel inside the brackets, where nothing can separate them from it.
+	const snapshotRule = "Each item carries the queue's own last read in brackets. Treat it as triage evidence: use it to decide what needs doing and do not re-fetch it to confirm. Before any approve, merge, label, or push, revalidate the head and checks live, because a snapshot describes a commit that may no longer be current.";
 	const hive = priority?.hiveRank === undefined ? ` ${autonomousRule}` : ` This is Hive-prioritized work (${priority.reason}); keep the linked issue's intent in view and reference it in what you report. ${autonomousRule}`;
 	const cite = (item: QueueItem) => `${item.repo}#${item.id} (${item.title})`;
+	/** The queue's own last read, carrying the caveat that makes it safe to act on. */
+	const stateOf = (item: QueueItem) => {
+		const parts = [
+			item.ciStatus ? `ci=${item.ciStatus}` : "",
+			item.mergeState === "unknown" ? "" : `merge=${item.mergeState}`,
+			item.reviewState === "unknown" ? "" : `review=${item.reviewState}`,
+			item.draft ? "draft" : "",
+		].filter(Boolean);
+		return parts.length > 0 ? ` [queue read: ${parts.join(" ")} — revalidate head live before mutating]` : "";
+	};
 	const batch = "items" in action && action.items && action.items.length > 1 ? action.items : undefined;
 	if (batch) {
 		// Group items by repository to minimize context-switching and cross-repo tool churn
@@ -154,12 +182,12 @@ export function actionPrompt(action: DashboardAction, priority?: Priority): stri
 		if (isCrossRepo) {
 			const sections: string[] = [];
 			for (const [repo, items] of repoGroups.entries()) {
-				const lines = items.map((it) => `  - #${it.id} (${it.title}): ${it.url}`).join("\n");
+				const lines = items.map((it) => `  - #${it.id} (${it.title}): ${it.url}${stateOf(it)}`).join("\n");
 				sections.push(`Repository \`${repo}\` (${items.length} item${items.length > 1 ? "s" : ""}):\n${lines}`);
 			}
 			list = sections.join("\n\n");
 		} else {
-			list = batch.map((it) => `- ${cite(it)}: ${it.url}`).join("\n");
+			list = batch.map((it) => `- ${cite(it)}: ${it.url}${stateOf(it)}`).join("\n");
 		}
 
 		const crossRepoHeader = isCrossRepo
@@ -171,16 +199,13 @@ export function actionPrompt(action: DashboardAction, priority?: Priority): stri
 		// only moves at one item per turn never comes down.
 		// Dispatch one subagent per individual issue or PR, capped at a maximum of 7 concurrent
 		// subagents at any time (queue remaining items and dispatch as running slots free up).
-		// Review agents do not count toward this cap so they can take their time.
-		// When subagents complete, the review agent (k3-final-review) clumps by repository:
-		// for each repository cohort (e.g. 10 issues in bluefin), it waits for that repo's queue
-		// to finish, then audits, consolidates all changes, and lands them together into ONE PR per repo.
-		const fanOut = `Work all ${batch.length} items with ONE subagent per issue/PR, capped at a maximum of 7 concurrent subagents at any time (queue remaining items and dispatch as running subagents complete; review/landing agents do not count against the 7 cap). Each subagent owns exactly its assigned item. Tell every subagent to skip formatters, linters, and project-wide suites and run only the smallest existing test covering what changed. Report per item — what you did, the evidence, and the outcome.`;
+		// Observed live: the parent copied each item line but dropped the surrounding
+		// rules, so seven subagents ran without them. A rule a parent must paraphrase
+		// is a rule that does not arrive; give it a delimited block to copy instead.
+		const subagentBrief = `${evidenceRule} ${noPollRule} Skip formatters, linters, and project-wide suites; run only the smallest existing test covering what changed. The bracketed queue read travels with your item: it is triage evidence, and you revalidate head and checks live before any approve, merge, label, or push.`;
+		const fanOut = `Work all ${batch.length} items with ONE subagent per issue/PR, capped at a maximum of 7 concurrent subagents at any time (queue remaining items and dispatch as running subagents complete; review/landing agents do not count against the 7 cap). Each subagent owns exactly its assigned item and its bracketed queue read. A subagent that stops instead of waiting frees its concurrency slot. Every subagent prompt MUST end with the block between the markers below, copied verbatim — do not summarise or omit it:\n<<<SUBAGENT-RULES\n${subagentBrief}\nSUBAGENT-RULES>>>\nReport per item — what you did, the evidence, and the outcome.`;
 
-		const auditInstruction = `When issues/PRs are worked, repository clumping happens at the review agent level: for each repository (e.g. all items in \`${[...repoGroups.keys()].join("`, `")}\`), dispatch one \`k3-final-review\` subagent (Kimi K3 at max effort; review agents do not consume the 7 cap). If the review agent has to wait for that repository's queue to finish through the 7-subagent cap, it waits. Once that repository cohort finishes, the review agent audits, consolidates all changes, and lands them all in one PR per repository, verifying cross-repository contract compatibility, shared schema and dependency alignment, doctrine invariants, and simplicity.`;
-
-		const autonomousRule = "This is an automated review and landing tool: execute all actions end-to-end autonomously in a continuous loop. Never ask the user for confirmation, permission, or interactive prompts to proceed. Once a batch or queue item is complete, immediately request the next assignment from the queue or advance to the next item so the loop runs continuously without stopping.";
-		const protocol = `${fanOut}\n\n${auditInstruction}\n\n${mutationRule}\n\n${autonomousRule}`;
+		const protocol = `${snapshotRule}\n\n${fanOut}\n\n${mutationRule}\n\n${autonomousRule}`;
 		switch (action.kind) {
 			case "review":
 				return `Review the following ${batch.length} selected items grouped by repository for efficiency:\n\n${list}\n\n${crossRepoHeader ? `${crossRepoHeader}\n\n` : ""}For each repository group: read bounded diffs and recorded pipelines before judging. Report findings by severity with file:line evidence covering doctrine, correctness, security, tests, and simplicity. State explicitly what you verified and what you could not.\n\n${protocol}`;
@@ -210,7 +235,7 @@ export function actionPrompt(action: DashboardAction, priority?: Priority): stri
 		case "docs":
 			return `Update and align documentation for ${cite(action.item)}. Enforce the projectbluefin/common agentic documentation system with brutal alignment: inspect the actual diff and changed surface, update the closest matching docs/skills/*.md file or core contract (AGENTS.md, docs/factory/agentic-model.md, docs/SKILL.md), eliminate any grandfathering/speculative filler, enforce token efficiency (descriptions <= 256 chars, skill documents <= 200 lines soft max), and run \`bash scripts/check-skill-frontmatter.sh --write\` to ensure docs/skills/index.json is synchronized perfectly for token-efficient agent ingestion. ${autonomousRule}`;
 		case "approve":
-			return `For ${cite(action.item)}: confirm every required check is green with \`gh pr checks ${action.item.id} --repo ${action.item.repo}\`, restate the merge risk in one line, then approve with \`gh pr review ${action.item.id} --repo ${action.item.repo} --approve\`. Attempt squash merge with \`gh pr merge ${action.item.id} --repo ${action.item.repo} --squash\`; if the repository uses a merge queue or ruleset, enable auto-merge (\`gh pr merge ${action.item.id} --repo ${action.item.repo} --auto --squash\`) and ensure the \`lgtm\` label is present (\`gh pr edit ${action.item.id} --repo ${action.item.repo} --add-label lgtm\`). Stop and report instead of merging if any check is failing or pending. ${mutationRule} ${autonomousRule}`;
+			return `For ${cite(action.item)}${stateOf(action.item)}: confirm every required check is green with \`gh pr checks ${action.item.id} --repo ${action.item.repo}\`, restate the merge risk in one line, then approve with \`gh pr review ${action.item.id} --repo ${action.item.repo} --approve\`. Attempt squash merge with \`gh pr merge ${action.item.id} --repo ${action.item.repo} --squash\`; if the repository uses a merge queue or ruleset, enable auto-merge (\`gh pr merge ${action.item.id} --repo ${action.item.repo} --auto --squash\`) and ensure the \`lgtm\` label is present (\`gh pr edit ${action.item.id} --repo ${action.item.repo} --add-label lgtm\`). Stop and report instead of merging if any check is failing or pending. ${snapshotRule} ${evidenceRule} ${noPollRule} ${mutationRule} ${autonomousRule}`;
 		case "fix":
 			return `Fix the findings recorded for ${cite(action.item)}. Read them with bluefin_review_trace, address each one at its source, run the smallest contract test that covers the changed surface, and prepare one clean commit. Typed GitHub mutations prefer native/gh/API tools. When repairing defects such as invalid PR titles or labels (e.g. repairing PR title like #440), prefer native gh commands first (\`gh pr edit ${action.item.id} --repo ${action.item.repo} --title "<title>"\` or \`gh pr edit ${action.item.id} --repo ${action.item.repo} --add-label <label>\`). Browser is bounded fallback for UI-only work; equivalent preferred attempts are not repeated indefinitely. Do not suppress a finding you cannot fix — report it.${hive}`;
 		case "slay":
@@ -218,7 +243,7 @@ export function actionPrompt(action: DashboardAction, priority?: Priority): stri
 			// asked for and handing it to a human as a pull request.
 			return action.item.type === "issue"
 				? `Close out ${cite(action.item)} by implementing and shipping the solution. Do not dismiss or conclude with no_work_needed if there is any actionable bug, test failure, code change, documentation fix, or underlying root cause to address. Inspect the code, diagnose the problem, implement the fix, run the smallest existing test that covers the changed surface, then open a pull request against the default branch whose body contains \`Closes ${action.item.repo}#${action.item.id}\`. Someone else reviews and merges it: never merge your own, never approve it. Only if the issue has already been resolved or closed by an existing merged PR or commit on the default branch: confirm the evidence and close the issue directly with \`gh issue close ${action.item.id} --repo ${action.item.repo} --reason completed --comment "<evidence of live resolution or commit>"\`. Otherwise implement what it asks for and open the PR.${hive}`
-				: `Execute the full fix-and-merge landing pass on ${cite(action.item)}: review the diff, patch what is broken, fix and commit any failing tests or defects, ensure contract tests pass, re-kick transient CI failures (\`gh run rerun <run-id> --failed\`), and as soon as checks are green, approve and land the pull request: approve with \`gh pr review ${action.item.id} --repo ${action.item.repo} --approve\`, squash-merge with \`gh pr merge ${action.item.id} --repo ${action.item.repo} --squash\` (or enable auto-merge \`gh pr merge ${action.item.id} --repo ${action.item.repo} --auto --squash\` if using a merge queue), and apply \`lgtm\` label if required by branch protection/rulesets (\`gh pr edit ${action.item.id} --repo ${action.item.repo} --add-label lgtm\`). Once merged or if blocked by policy, advance immediately to the next queue assignment.${hive}`;
+				: `Execute the full fix-and-merge landing pass on ${cite(action.item)}${stateOf(action.item)}: review the diff, patch what is broken, fix and commit any failing tests or defects, ensure contract tests pass, re-kick transient CI failures (\`gh run rerun <run-id> --failed\`), and when checks are already green, approve and land the pull request: approve with \`gh pr review ${action.item.id} --repo ${action.item.repo} --approve\`, squash-merge with \`gh pr merge ${action.item.id} --repo ${action.item.repo} --squash\` (or enable auto-merge \`gh pr merge ${action.item.id} --repo ${action.item.repo} --auto --squash\` if using a merge queue), and apply \`lgtm\` label if required by branch protection/rulesets (\`gh pr edit ${action.item.id} --repo ${action.item.repo} --add-label lgtm\`). ${snapshotRule} ${evidenceRule} ${noPollRule} Once merged or if blocked by policy, advance immediately to the next queue assignment.${hive}`;
 		case "snapshot":
 			return `Submit the Argo workflow in deploy/argo-review-fsdk-build.yaml to build and push a container snapshot of the current tree, then report the workflow name and how to watch it.`;
 		default:
@@ -255,6 +280,7 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 	let autoslayActive = false;
 	let activeDashboardDone: ((action: DashboardAction) => void) | undefined;
 	let activeCtx: CtxLike | undefined;
+	let lastAutoslayKeys = "";
 	let started: Promise<void> = Promise.resolve();
 	let dispatchGeneration = 0;
 	pi.setLabel("Bluefin Review");
@@ -532,6 +558,7 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			const slayable = mode.slayableItems();
 			const items = (slayable.length > 0 ? slayable.slice(0, 7) : [mode.selected()].filter(Boolean)) as QueueItem[];
 			if (items.length > 0) {
+				lastAutoslayKeys = items.map((it) => `${it.repo}#${it.id}`).sort().join(",");
 				const action: DashboardAction = { kind: "slay", item: items[0]!, items: items.length > 1 ? items : undefined };
 				void dispatch(ctx, action);
 				return;
@@ -650,11 +677,20 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			const nextBatch = mode.slayableItems();
 			if (nextBatch.length > 0) {
 				const items = nextBatch.slice(0, 7);
+				const batchKeys = items.map((it) => `${it.repo}#${it.id}`).sort().join(",");
+				if (batchKeys === lastAutoslayKeys) {
+					autoslayActive = false;
+					lastAutoslayKeys = "";
+					if (ctxToUse.hasUI) ctxToUse.ui.notify("Autoslay stopped: items require human review or updated commits", "info");
+					return;
+				}
+				lastAutoslayKeys = batchKeys;
 				const action: DashboardAction = { kind: "slay", item: items[0]!, items: items.length > 1 ? items : undefined };
 				void dispatch(ctxToUse, action, { deliverAs: "followUp" });
 				return;
 			}
 			autoslayActive = false;
+			lastAutoslayKeys = "";
 			if (ctxToUse.hasUI) ctxToUse.ui.notify("Autoslay completed: queue fully drained", "info");
 		}
 		if (autoReopenDashboard && ctxToUse && ctxToUse.hasUI && !dashboardOpen) {
@@ -672,11 +708,20 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			const nextBatch = mode.slayableItems();
 			if (nextBatch.length > 0) {
 				const items = nextBatch.slice(0, 7);
+				const batchKeys = items.map((it) => `${it.repo}#${it.id}`).sort().join(",");
+				if (batchKeys === lastAutoslayKeys) {
+					autoslayActive = false;
+					lastAutoslayKeys = "";
+					if (ctxToUse.hasUI) ctxToUse.ui.notify("Autoslay stopped: items require human review or updated commits", "info");
+					return;
+				}
+				lastAutoslayKeys = batchKeys;
 				const action: DashboardAction = { kind: "slay", item: items[0]!, items: items.length > 1 ? items : undefined };
 				void dispatch(ctxToUse, action);
 				return;
 			}
 			autoslayActive = false;
+			lastAutoslayKeys = "";
 			if (ctxToUse.hasUI) ctxToUse.ui.notify("Autoslay completed: queue fully drained", "info");
 		}
 	});
