@@ -1150,6 +1150,85 @@ run_recipe review-queue GH_READY=1 FAKE_GH_TOKEN=gho-test-token \
 assert_file_contains "/run/bluefin-review-lab" "$runner_log"
 assert_file_not_contains "host-uds" "$runner_log"
 
+# ── 2c-1. The optional review-exec broker: one socket, one session, nothing else ═
+# The launcher offers review-exec only when the host can reach a cluster and
+# the operator accepts, handing the container exactly one Unix socket. This is
+# the review-exec mirror of the lab boundary (#379): the socket and two
+# non-secret env strings cross, the cluster and every credential stay behind.
+assert_no_review_exec_handoff() {
+  assert_file_not_contains "/run/bluefin-review-exec" "$runner_log"
+  assert_file_not_contains "BLUEFIN_REVIEW_EXEC_SOCKET" "$runner_log"
+  assert_file_not_contains "BLUEFIN_REVIEW_EXEC_SESSION" "$runner_log"
+  assert_file_not_contains "BLUEFIN_REVIEW_EXEC_AVAILABLE" "$runner_log"
+  assert_file_not_contains "host-uds" "$runner_log"
+}
+
+begin "review-queue: a disabled review-exec hands over nothing"
+reset_logs
+run_recipe review-queue GH_READY=1 FAKE_GH_TOKEN=gho-test-token \
+  REVIEW_EXEC=0
+assert_no_review_exec_handoff
+assert_not_contains "review-exec enabled for this session" "$OUT"
+
+begin "review-queue: a declined review-exec hands over nothing"
+reset_logs
+run_recipe review-queue GH_READY=1 FAKE_GH_TOKEN=gho-test-token
+# REVIEW_EXEC unset: the probe clears (kubectl is present) but there is no
+# terminal to answer the prompt, so the offer returns before a broker starts.
+assert_no_review_exec_handoff
+assert_not_contains "review-exec enabled for this session" "$OUT"
+
+begin "review-queue: an accepted review-exec hands over one socket and nothing else"
+reset_logs
+run_recipe review-queue GH_READY=1 FAKE_GH_TOKEN=gho-test-token \
+  REVIEW_EXEC=1
+assert_contains "review-exec enabled for this session (context ghost-lab)" "$OUT"
+assert_file_contains ":/run/bluefin-review-exec:rw,z" "$runner_log"
+assert_file_contains "--env BLUEFIN_REVIEW_EXEC_SOCKET=/run/bluefin-review-exec/broker.sock" "$runner_log"
+assert_file_contains "--env BLUEFIN_REVIEW_EXEC_SESSION=" "$runner_log"
+assert_file_contains "--env BLUEFIN_REVIEW_EXEC_AVAILABLE=1" "$runner_log"
+# The credential boundary: the container gets the socket, never the cluster.
+assert_file_not_contains "kubeconfig" "$runner_log"
+assert_file_not_contains ".kube" "$runner_log"
+assert_file_not_contains "--network host" "$runner_log"
+assert_file_not_contains "podman.sock" "$runner_log"
+assert_file_not_contains "docker.sock" "$runner_log"
+assert_file_not_contains "/var/run" "$runner_log"
+# Exactly one host socket crosses the boundary, and it is the broker's.
+exec_socket_mounts="$(tr ' ' '\n' <"$runner_log" | grep -c '/run/bluefin-review-exec' || true)"
+assert_eq "$exec_socket_mounts" 2 "expected exactly the socket mount and its env"
+# The broker is the real one and dies with the session, not left running.
+socket_dir="$(tr ' ' '\n' <"$runner_log" | sed -n 's|^\(.*bluefin-review-exec\.[^:]*\):/run/bluefin-review-exec:rw,z$|\1|p' | head -1)"
+[[ -n "$socket_dir" ]] || fail "the accepted review-exec must name its socket directory"
+assert_file_not_exists "$socket_dir"
+pgrep -f "review-exec-broker.py serve --socket ${socket_dir}" >/dev/null 2>&1 &&
+  fail "the broker must not outlive the foreground session"
+
+begin "review-queue: gVisor gets host-uds=open, other runtimes never do (review-exec)"
+reset_logs
+run_recipe review-queue GH_READY=1 FAKE_GH_TOKEN=gho-test-token \
+  REVIEW_EXEC=1 FAKE_PODMAN_RUNTIME=runsc
+assert_file_contains "--runtime-flag=host-uds=open" "$runner_log"
+reset_logs
+run_recipe review-queue GH_READY=1 FAKE_GH_TOKEN=gho-test-token \
+  REVIEW_EXEC=1 FAKE_PODMAN_RUNTIME=crun
+assert_file_contains "/run/bluefin-review-exec" "$runner_log"
+assert_file_not_contains "host-uds" "$runner_log"
+
+begin "review-container: the contributor worker receives no review-exec capability"
+reset_logs
+run_recipe review-container GH_READY=1 REVIEW_EXEC=1
+assert_no_review_exec_handoff
+assert_not_contains "review-exec enabled for this session" "$OUT"
+
+begin "static: the review-exec prompt names the context, never a hardcoded cluster"
+# The interactive prompt must display the reachable context, not a literal
+# placeholder. A hardcoded cluster name hides the real bug: the operator is
+# asked to offload to a cluster they never saw named.
+if grep -n 'ghost cluster' "$justfile"; then
+  fail "the review-exec prompt must format the context name, not a literal cluster"
+fi
+
 begin "review-container: the contributor worker receives no lab capability"
 reset_logs
 run_recipe review-container GH_READY=1 \

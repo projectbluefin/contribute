@@ -1120,8 +1120,8 @@ offer_review_exec_session() {
   if [[ "${REVIEW_EXEC:-}" == "1" ]]; then
     answer="y"
   elif ( : </dev/tty && : >/dev/tty ) 2>/dev/null; then
-    printf '?  Kubernetes context %s is reachable. Offload batch reviews to ghost cluster for this session only? [y/N] ' \
-      "$REVIEW_EXEC_CONTEXT" >/dev/tty
+    printf '?  Kubernetes context %s is reachable. Offload batch reviews to %s for this session only? [y/N] ' \
+      "$REVIEW_EXEC_CONTEXT" "$REVIEW_EXEC_CONTEXT" >/dev/tty
     read -r answer </dev/tty || answer=""
   else
     return 0

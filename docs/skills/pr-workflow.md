@@ -1,7 +1,7 @@
 ---
 name: pr-workflow
-version: "1.11"
-last_updated: 2026-09-09
+version: "1.12"
+last_updated: 2026-09-13
 id: pr-workflow
 one_line_purpose: Open review pull requests that merge cleanly.
 entry_point: docs/skills/pr-workflow.md
@@ -11,7 +11,7 @@ optimization_status: draft
 status: active
 dependencies: []
 tags: [git, pullrequest, branches, labels, testing]
-description: "Defines pull request, branch, title, trailer, and validation requirements, the factory's seven-label contract and this repository's three automation labels, how to reconcile a long-lived branch with squash-merged main, and why a test must run a feature."
+description: "Defines pull request, branch, title, trailer, and validation requirements, repository lifecycle and queue label taxonomy, how to reconcile a long-lived branch with squash-merged main, and why a test must run a feature."
 metadata:
   type: policy
   context7-sources: [/pre-commit/pre-commit]
@@ -80,7 +80,7 @@ repository's contribution rules, which take precedence in their own tree.
 
 ## The Factory Label Contract
 
-See [`pr-labels.md`](pr-labels.md) for projectbluefin's canonical seven-label workflow contract and repository automation labels (`lgtm`, `override`, `security-advisory`).
+See [`pr-labels.md`](pr-labels.md) for projectbluefin's lifecycle label taxonomy, queue structure (`3-clanker-queue`, `3-human-queue`), and repository automation labels (`lgtm`, `automerge`).
 
 ## Reconciling Long-Lived Branches
 
@@ -123,8 +123,8 @@ Write `skip-ci` without brackets.
 - Using `--no-verify` to bypass a real failure.
 - Reporting task completion before the required artifact exists.
 - Adding or removing a task-admission label to influence a Hive assignment.
-- A label outside the seven canonical names plus this repository's three
-  documented automation labels.
+- A label outside the documented lifecycle, queue, automation, and domain label
+  taxonomy (or attempting to use obsolete labels like `3-ready` or `override`).
 - Recording kind, area, size, or priority as a label instead of as issue text
   or a project field.
 - Rebasing a long-lived branch onto `main` instead of merging `main` into it.
@@ -161,8 +161,10 @@ included: the hook uses the shellcheck-py wheel, so it needs no container
 socket and behaves identically locally and in the required `validate`
 workflow.
 
-`gh label list -R projectbluefin/review` returns the seven canonical labels and
-the three automation labels above, and nothing else.
+`gh label list -R projectbluefin/review` returns the repository's lifecycle
+and queue labels (`1-triage`, `2-discussing`, `3-clanker-queue`,
+`3-human-queue`, `4-review`, `blocked`, `hold`), automation labels (`lgtm`,
+`automerge`), and recognized agent/domain labels.
 
 A new script must carry the executable bit and match its directory's `shfmt`
 style — two spaces under `scripts/` and `tests/`, tabs under `image/`. Set the
