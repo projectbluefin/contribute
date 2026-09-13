@@ -20,6 +20,7 @@ import type { KeyMatcher } from "./keys.ts";
 import { type ToolHost, registerTools } from "./tools.ts";
 import { BluefinAnsiSplash } from "./splash.ts";
 import { HiveLeaderboardComponent } from "./leaderboard.ts";
+import { hiveFailureStatus } from "./hive.ts";
 export {
 	type MutationKind,
 	type MutationCapability,
@@ -510,7 +511,7 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		// never shown in the wrong order, not even for one frame.
 		const hive = await mode.refreshHive();
 		if (hive.configured && hive.error) {
-			ctx.ui.notify(`Hive unreachable, ordering locally: ${hive.error}`, "warning");
+			ctx.ui.notify(`${hiveFailureStatus(hive.error)}, ordering locally`, "warning");
 		}
 		await refreshQueue(ctx);
 		mode.restore(persisted);
