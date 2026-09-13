@@ -714,7 +714,7 @@ Execute the following end-to-end loop:
 
 2. Check out the PR branch in a dedicated scratch directory and fix each evidenced finding:
    {reporter} report --status {status} event --pr {pr} --state "fixing" --note "applying fixes for findings"
-   WORKDIR=$(mktemp -d /tmp/pr-{number}-XXXXXX)
+   WORKDIR=$(mktemp -d -t pr-{number}.XXXXXX)
    gh repo clone {repository} "$WORKDIR"
    cd "$WORKDIR"
    gh pr checkout {number} --repo {repository}
@@ -794,7 +794,7 @@ For each issue, in order:
 
 3. Fix it in a scratch workdir on its own branch:
    {reporter} report --status {status} event --pr "<owner/repo#N>" --state "fixing" --note "applying the fix"
-   WORKDIR=$(mktemp -d /tmp/issue-<number>-XXXXXX)
+   WORKDIR=$(mktemp -d -t issue-number.XXXXXX)
    gh repo clone <owner>/<repo> "$WORKDIR" && cd "$WORKDIR"
    git checkout -b fix/issue-<number>
    Keep the change surgical and scoped to the issue. Run the project's own
@@ -1043,8 +1043,10 @@ For each pull request, in order:
    sides make incompatible decisions a human must arbitrate — and name which.
 2. Repair mechanical CI failures only — a stale sha256 after a version bump,
    a lockfile, formatting. If applying fixes, operate in a scratch workdir:
-   `WORKDIR=$(mktemp -d /tmp/landing-XXXXXX) && gh repo clone <owner>/<repo> "$WORKDIR" && cd "$WORKDIR" && gh pr checkout <number> --repo <owner>/<repo>`.
-   Push the fix with a bare `git push` when you have permission, then clean up.
+   `WORKDIR=$(mktemp -d -t landing.XXXXXX) && gh repo clone <owner>/<repo> "$WORKDIR" && cd "$WORKDIR" && gh pr checkout <number> --repo <owner>/<repo>`.
+   Push the fix with a bare `git push` when you have permission, then remove the
+   workdir with `rm -rf "$WORKDIR"` — a clone you leave behind stays until the
+   host reboots, and enough of them fill the scratch filesystem for everyone.
    Most contributor pull requests come from a fork and `gh pr checkout` already
    set `branch.<name>.pushRemote` to it; naming a remote pushes to the base
    repository instead and leaves the pull request untouched.
