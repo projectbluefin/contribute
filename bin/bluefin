@@ -8,14 +8,54 @@ repo_root="$(cd "$(dirname "$script_path")/.." && pwd)"
 
 case "$command_name" in
   contribute)
-    exec "${repo_root}/bin/bluefin-contribute"
+    exec "${repo_root}/bin/bluefin-contribute" "$@"
     ;;
   review)
-    sif="${BLUEFIN_REVIEW_SIF:-${repo_root}/bluefin-review.sif}"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      exec "${repo_root}/bin/omp-review" "$@"
+    fi
+    runtime_home="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/bluefin-review"
+    sif="${BLUEFIN_REVIEW_SIF:-}"
+    if [[ -z "$sif" ]]; then
+      if [[ -x "${repo_root}/bluefin-review.sif" ]]; then
+        sif="${repo_root}/bluefin-review.sif"
+      elif [[ -x "${runtime_home}/bluefin-review.sif" ]]; then
+        sif="${runtime_home}/bluefin-review.sif"
+      else
+        sif="${runtime_home}/bluefin-review.sif"
+      fi
+    fi
     command -v apptainer >/dev/null 2>&1 || { echo "ERROR: apptainer is required." >&2; exit 127; }
-    [[ -x "$sif" ]] || { echo "ERROR: review SIF is missing: ${sif}" >&2; exit 1; }
-    runtime_home="${XDG_STATE_HOME:-${HOME}/.local/state}/bluefin-review"
+    if [[ ! -e "${BLUEFIN_KVM_DEVICE:-/dev/kvm}" ]]; then
+      echo "ERROR: KVM is required for sandboxing (${BLUEFIN_KVM_DEVICE:-/dev/kvm} not found)." >&2
+      exit 1
+    fi
+    if [[ ! -x "$sif" ]]; then
+      mkdir -p "$runtime_home"
+      image_uri="${BLUEFIN_REVIEW_IMAGE:-docker://ghcr.io/projectbluefin/review:stable}"
+      echo "bluefin: pulling review image (${image_uri}) to ${sif} ..." >&2
+      if ! apptainer pull --force "$sif" "$image_uri"; then
+        echo "ERROR: failed to pull review image from ${image_uri}." >&2
+        echo "  Set BLUEFIN_REVIEW_SIF=/path/to/bluefin-review.sif to specify an existing SIF image." >&2
+        exit 1
+      fi
+      chmod 0755 "$sif"
+    fi
+    first_launch=0
+    if [[ ! -d "$runtime_home" ]]; then
+      first_launch=1
+    fi
     mkdir -p "$runtime_home"
+    if [[ "$first_launch" -eq 1 ]]; then
+      msg="Deploying Raptor Containment with KVM. It's the only way to be sure ..."
+      dinosay_bin="${repo_root}/bin/dinosay"
+      if command -v node >/dev/null 2>&1 && [[ -x "$dinosay_bin" ]]; then
+        node "$dinosay_bin" -d raptor "$msg" || echo "$msg"
+      else
+        echo "$msg"
+      fi
+      echo "[+] KVM sandbox verified: ${BLUEFIN_KVM_DEVICE:-/dev/kvm} (status: ready)"
+    fi
     # The distroless review SIF bundles its own gh binary but no persisted
     # `gh auth login` state — each apptainer run gets a fresh $HOME, and gh's
     # credential is stored in ~/.config/gh, not an env var, so it never
@@ -72,7 +112,30 @@ if os.path.exists(db_path):
         bind_args+=(--bind "$cfg")
       fi
     done
-    exec apptainer run --home "${runtime_home}:/home/bluefin" ${bind_args[@]+"${bind_args[@]}"} "$sif" "$@"
+    # Positional shortcuts, mirroring bin/omp-review
+    app_args=()
+    if [[ "${1:-}" =~ ^#?[0-9]+$ ]]; then
+      app_args+=(--pr "${1#\#}")
+      shift
+    elif [[ "${1:-}" =~ ^(https://github\.com/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ || "${1:-}" =~ ^org:[A-Za-z0-9._-]+$ ]]; then
+      app_args+=(--repo "$1")
+      shift
+      if [[ "${1:-}" =~ ^#?[0-9]+$ ]]; then
+        app_args+=(--pr "${1#\#}")
+        shift
+      fi
+    fi
+    if [[ "${1:-}" == "issues" ]]; then
+      app_args+=(--issues)
+      shift
+    elif [[ "${1:-}" == "all" ]]; then
+      app_args+=(--all)
+      shift
+    elif [[ "${1:-}" == "autoslay" || "${1:-}" == "slay" ]]; then
+      app_args+=(--autoslay)
+      shift
+    fi
+    exec apptainer run --home "${runtime_home}:/home/bluefin" ${bind_args[@]+"${bind_args[@]}"} "$sif" ${app_args[@]+"${app_args[@]}"} "$@"
     ;;
   *)
     echo "Usage: bluefin {contribute|review}" >&2

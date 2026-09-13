@@ -1,0 +1,15 @@
+# AppArmor profile allowing Apptainer unprivileged user namespaces
+# on Ubuntu 24.04+ where kernel.apparmor_restrict_unprivileged_userns=1.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile apptainer /{usr,home/linuxbrew/.linuxbrew}/**/bin/apptainer flags=(unconfined) {
+  userns,
+  @{exec_path} mr,
+}
+
+profile apptainer_starter /{usr,home/linuxbrew/.linuxbrew}/**/{lib,libexec}/apptainer/bin/starter flags=(unconfined) {
+  userns,
+  @{exec_path} mr,
+}

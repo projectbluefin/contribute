@@ -4,7 +4,17 @@ set -euo pipefail
 
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 repo_root="$(cd "$(dirname "$script_path")/.." && pwd)"
-sif="${BLUEFIN_CONTRIBUTE_SIF:-${repo_root}/bluefin-contribute.sif}"
+runtime_home="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/bluefin-contribute"
+sif="${BLUEFIN_CONTRIBUTE_SIF:-}"
+if [[ -z "$sif" ]]; then
+  if [[ -x "${repo_root}/bluefin-contribute.sif" ]]; then
+    sif="${repo_root}/bluefin-contribute.sif"
+  elif [[ -x "${runtime_home}/bluefin-contribute.sif" ]]; then
+    sif="${runtime_home}/bluefin-contribute.sif"
+  else
+    sif="${runtime_home}/bluefin-contribute.sif"
+  fi
+fi
 registration="${HIVE_CONTRIBUTOR_ENV:-${HOME}/.config/hive/contributor.env}"
 omp_state="${BLUEFIN_OMP_STATE:-${HOME}/.omp}"
 
@@ -12,10 +22,21 @@ command -v apptainer >/dev/null 2>&1 || {
   echo "ERROR: apptainer is required to run Bluefin Contribute." >&2
   exit 127
 }
-[[ -x "$sif" ]] || {
-  echo "ERROR: contributor SIF is missing: ${sif}" >&2
+if [[ ! -e "${BLUEFIN_KVM_DEVICE:-/dev/kvm}" ]]; then
+  echo "ERROR: KVM is required for sandboxing (${BLUEFIN_KVM_DEVICE:-/dev/kvm} not found)." >&2
   exit 1
-}
+fi
+if [[ ! -x "$sif" ]]; then
+  mkdir -p "$runtime_home"
+  image_uri="${BLUEFIN_CONTRIBUTE_IMAGE:-docker://ghcr.io/projectbluefin/contribute:stable}"
+  echo "bluefin-contribute: pulling contributor image (${image_uri}) to ${sif} ..." >&2
+  if ! apptainer pull --force "$sif" "$image_uri"; then
+    echo "ERROR: failed to pull contributor image from ${image_uri}." >&2
+    echo "  Set BLUEFIN_CONTRIBUTE_SIF=/path/to/bluefin-contribute.sif to specify an existing SIF image." >&2
+    exit 1
+  fi
+  chmod 0755 "$sif"
+fi
 [[ -r "$registration" ]] || {
   echo "ERROR: Hive registration is missing or unreadable: ${registration}" >&2
   exit 1
@@ -74,7 +95,7 @@ if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" ]]; then
   echo "ERROR: no GitHub token available; the agent would have no GitHub identity." >&2
   echo "  It cannot fork, clone, push, or open a pull request, and would hang at an" >&2
   echo "  interactive 'gh auth login' device-code prompt nobody can answer." >&2
-  echo "  Fix it with: gh auth login --web --hostname github.com --scopes repo,read:org,workflow" >&2
+  echo "  Fix it with: gh auth login --web --hostname github.com --scopes repo,read:org" >&2
   echo "  Or export GH_TOKEN with a scoped PAT." >&2
   exit 1
 fi
@@ -86,8 +107,21 @@ fi
 export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 export GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 
-runtime_home="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/bluefin-contribute"
+first_launch=0
+if [[ ! -d "$runtime_home" ]]; then
+  first_launch=1
+fi
 mkdir -p "${runtime_home}/.config/hive"
+if [[ "$first_launch" -eq 1 ]]; then
+  msg="Deploying Raptor Containment with KVM. It's the only way to be sure ..."
+  dinosay_bin="${repo_root}/bin/dinosay"
+  if command -v node >/dev/null 2>&1 && [[ -x "$dinosay_bin" ]]; then
+    node "$dinosay_bin" -d raptor "$msg" || echo "$msg"
+  else
+    echo "$msg"
+  fi
+  echo "[+] KVM sandbox verified: ${BLUEFIN_KVM_DEVICE:-/dev/kvm} (status: ready)"
+fi
 if [[ -f "${HOME:-/no-such-home}/.gitconfig" && ! -f "${runtime_home}/.gitconfig" ]]; then
   cp "${HOME}/.gitconfig" "${runtime_home}/.gitconfig"
 fi
@@ -112,4 +146,4 @@ fi
 exec apptainer run \
   --home "${runtime_home}:/home/bluefin" \
   ${bind_args[@]+"${bind_args[@]}"} \
-  "$sif"
+  "$sif" "$@"
