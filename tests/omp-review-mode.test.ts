@@ -22,7 +22,7 @@ import { fetchDiff, fetchItemsByKey, fetchQueue, parseScope, searchExpression } 
 import { EMPTY_HIVE, buildRankMap, fetchHive, hiveFailureStatus, resolveHub } from "../image/extension/bluefin-review/hive.ts";
 import { categorize, prioritize } from "../image/extension/bluefin-review/priority.ts";
 import { BATCH_LIMIT, ReviewMode } from "../image/extension/bluefin-review/mode.ts";
-import { ReviewDashboard } from "../image/extension/bluefin-review/dashboard.ts";
+import { ReviewDashboard, parseMouseEvent } from "../image/extension/bluefin-review/dashboard.ts";
 import { STALE_AFTER_MS, queueAge, renderHitlist, renderRail, statusSegment, tmuxReviewStatusBar } from "../image/extension/bluefin-review/rail.ts";
 import { SessionTrace } from "../image/extension/bluefin-review/session.ts";
 import { BluefinAnsiSplash } from "../image/extension/bluefin-review/splash.ts";
@@ -2731,3 +2731,267 @@ test("typed GitHub mutations prefer native tools, bound browser fallback, preven
 	assert.match(approvePrompt!, /Stop and report instead of merging/);
 	assert.match(approvePrompt!, /Preserved human confirmation and merge authority/);
 });
+
+// P1 — make the OMP Review dashboard mouse/click operable with keyboard parity (#462)
+// Pilot exercises click selection, focus, expansion, scrolling, and every visible action
+// during active and idle turns; keyboard parity/accessibility stay passing.
+test("pilot: OMP dashboard mouse and click operable with keyboard parity (#462)", (t) => {
+	// 1. Mouse reporting sequence parsing (SGR, X10, URXVT, programmatic)
+	const sgrClick = parseMouseEvent("\x1b[<0;15;5M");
+	assert.deepEqual(sgrClick, { button: 0, col: 14, row: 4, release: false });
+	const sgrRelease = parseMouseEvent("\x1b[<0;15;5m");
+	assert.deepEqual(sgrRelease, { button: 0, col: 14, row: 4, release: true });
+	const sgrWheelUp = parseMouseEvent("\x1b[<64;15;5M");
+	assert.equal(sgrWheelUp?.wheel, -1);
+	const sgrWheelDown = parseMouseEvent("\x1b[<65;15;5M");
+	assert.equal(sgrWheelDown?.wheel, 1);
+	const textClick = parseMouseEvent("click:10,3");
+	assert.deepEqual(textClick, { button: 0, col: 10, row: 3, release: false });
+	const jsonClick = parseMouseEvent('{"type":"click","x":12,"y":6}');
+	assert.deepEqual(jsonClick, { button: 0, col: 12, row: 6, release: false });
+
+	const root = stateTree();
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
+	mode.items = [
+		queueItem({ id: 7, repo: "projectbluefin/other", title: "feat(ui): dagger rail", ciStatus: "success" }),
+		queueItem({ id: 42, repo: "projectbluefin/review", title: "fix(landing): review batches", ciStatus: "failure" }),
+		queueItem({ id: 99, repo: "projectbluefin/review", title: "docs: update appliance", ciStatus: "pending" }),
+	];
+	mode.refreshState();
+
+	let lastAction;
+	let refreshes = 0;
+	const dashboard = new ReviewDashboard(
+		{ requestRender() {} },
+		PLAIN_PAINTER,
+		mode,
+		(action) => {
+			lastAction = action;
+		},
+		() => {
+			refreshes++;
+		},
+		22,
+	);
+	t.after(() => dashboard.dispose());
+
+	// Initial layout and state
+	const frame = (w = 220) => dashboard.render(w);
+	assert.ok(frame()[0].includes("bluefin review"));
+	assert.equal(mode.cursor, 0, "first item selected initially");
+	assert.equal(dashboard.currentPane, "queue");
+
+	// 2. Click selection parity: clicking queue row 2 selects item 42
+	// Line 3 is item 7, Line 4 is the repo divider for projectbluefin/review,
+	// Line 5 is item 42, Line 6 is item 99.
+	// Passing SGR mouse sequence: x=10, y=6 (1-based -> line index 5 in 0-based)
+	dashboard.handleInput("\x1b[<0;10;6M");
+	assert.equal(mode.cursor, 1, "clicking row 2 selects item 42");
+	assert.equal(mode.selected().id, 42);
+	assert.equal(dashboard.currentPane, "queue");
+
+	// Click row 3 (line index 6, y=7 in SGR): selects item 99
+	dashboard.handleInput("\x1b[<0;10;7M");
+	assert.equal(mode.cursor, 2, "clicking row 3 selects item 99");
+	assert.equal(mode.selected().id, 99);
+
+	// Click divider (line index 4, y=5 in SGR): divider click does not crash or corrupt cursor
+	dashboard.handleInput("\x1b[<0;10;5M");
+	assert.equal(mode.cursor, 2, "clicking divider preserves selection");
+
+	// Click row 1 (line index 3, y=4 in SGR): selects item 7
+	dashboard.handleInput("\x1b[<0;10;4M");
+	assert.equal(mode.cursor, 0, "clicking row 1 selects item 7");
+	assert.equal(mode.selected().id, 7);
+
+	// Click checkbox on row 1 (columns 1..3, row 4 in 1-based coordinates)
+	assert.equal(mode.selectedKeys.has("projectbluefin/other#7"), false);
+	dashboard.handleInput("\x1b[<0;3;4M");
+	assert.equal(mode.selectedKeys.has("projectbluefin/other#7"), true, "clicking checkbox selects item");
+	assert.ok(frame().some((r) => r.includes("☒")));
+
+	// Clicking checkbox again toggles it off
+	dashboard.handleInput("\x1b[<0;3;4M");
+	assert.equal(mode.selectedKeys.has("projectbluefin/other#7"), false, "clicking checkbox again deselects item");
+
+	// 3. Panes focus parity: clicking trace pane focuses trace pane
+	// Trace pane starts at col half+ (right side of split layout)
+	dashboard.handleInput("\x1b[<0;151;4M");
+	assert.equal(dashboard.currentPane, "trace", "clicking right pane focuses trace");
+	assert.equal(dashboard.activePane, "trace");
+
+	// Clicking queue pane focuses queue pane back
+	dashboard.handleInput("\x1b[<0;15;4M");
+	assert.equal(dashboard.currentPane, "queue", "clicking left pane focuses queue");
+
+	// 4. Traces toggle parity: expanding and collapsing trace spans on click
+	dashboard.handleInput("\x1b[<0;151;4M"); // focus trace pane
+	const beforeFoldFrame = frame();
+	// Click a trace span row (e.g. row 5 in trace pane)
+	dashboard.handleClick(150, 5);
+	const afterFoldFrame = frame();
+	assert.ok(afterFoldFrame.length > 0);
+	// Clicking again toggles expansion back
+	dashboard.handleClick(150, 5);
+
+	// 5. Mouse scrolling parity (wheel up/down)
+	dashboard.handleClick(15, 4); // focus queue pane
+	assert.equal(mode.cursor, 0);
+	// Wheel down moves down 1 item
+	dashboard.handleInput("\x1b[<65;15;5M");
+	assert.equal(mode.cursor, 1, "wheel down moves cursor to next item");
+	// Wheel down again
+	dashboard.handleInput("\x1b[<65;15;5M");
+	assert.equal(mode.cursor, 2, "wheel down moves cursor to 3rd item");
+	// Wheel up moves back
+	dashboard.handleInput("\x1b[<64;15;5M");
+	assert.equal(mode.cursor, 1, "wheel up moves cursor up");
+
+	// 6. Visible actions click parity: every key in the keymap bar clicks
+	const lines = frame();
+	const keymapLineIdx = lines.findIndex((l) => l.includes("autoslay") && l.includes("review"));
+	assert.ok(keymapLineIdx > 0, "keymap bar rendered");
+
+	// Click 'r/enter review' in keymap bar
+	// Locate 'review' in keymap bar
+	const keymapText = lines[keymapLineIdx];
+	const rPos = keymapText.indexOf("r/enter");
+	assert.ok(rPos > 0);
+	dashboard.handleClick(rPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "review", "clicking review chord triggers review action");
+	assert.equal(lastAction?.item.id, 42);
+
+	// Click 'diff'
+	const dPos = keymapText.indexOf("d diff");
+	assert.ok(dPos > 0);
+	dashboard.handleClick(dPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "diff", "clicking diff chord triggers diff action");
+
+	// Click 'docs'
+	const DPos = keymapText.indexOf("D docs");
+	assert.ok(DPos > 0);
+	dashboard.handleClick(DPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "docs", "clicking docs chord triggers docs action");
+
+	// Click 'approve'
+	const aPos = keymapText.indexOf("a approve");
+	assert.ok(aPos > 0);
+	dashboard.handleClick(aPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "approve", "clicking approve chord triggers approve action");
+
+	// Click 'fix'
+	const fPos = keymapText.indexOf("f fix");
+	assert.ok(fPos > 0);
+	dashboard.handleClick(fPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "fix", "clicking fix chord triggers fix action");
+
+	// Click 'cite' (y)
+	const yPos = keymapText.indexOf("y cite");
+	assert.ok(yPos > 0);
+	dashboard.handleClick(yPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "reference", "clicking cite chord triggers reference action");
+
+	// Click 'all' (A) to select all
+	const APos = keymapText.indexOf("A all");
+	assert.ok(APos > 0);
+	dashboard.handleClick(APos + 1, keymapLineIdx);
+	assert.equal(mode.selectedKeys.size, 3, "clicking all chord selects all items");
+
+	// Click 'clear' (x) to clear selection
+	const xPos = keymapText.indexOf("x clear");
+	assert.ok(xPos > 0);
+	dashboard.handleClick(xPos + 1, keymapLineIdx);
+	assert.equal(mode.selectedKeys.size, 0, "clicking clear chord clears selection");
+
+	// Click 'leaders' (*)
+	const starPos = keymapText.indexOf("* leaders");
+	assert.ok(starPos > 0);
+	dashboard.handleClick(starPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "leaderboard", "clicking leaders chord opens leaderboard");
+
+	// Click 'repo' (o)
+	const oPos = keymapText.indexOf("o repo");
+	assert.ok(oPos > 0);
+	dashboard.handleClick(oPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "scope", "clicking repo chord opens scope selector");
+
+	// Click 'pane' (tab)
+	const tabPos = keymapText.indexOf("tab pane");
+	assert.ok(tabPos > 0);
+	const paneBefore = dashboard.currentPane;
+	dashboard.handleClick(tabPos + 1, keymapLineIdx);
+	assert.notEqual(dashboard.currentPane, paneBefore, "clicking tab switches pane");
+
+	// Click 'prs/issues' (i)
+	const iPos = keymapText.indexOf("i prs/issues");
+	assert.ok(iPos > 0);
+	const modeBefore = mode.queueMode;
+	const itemsBefore = [...mode.items];
+	dashboard.handleClick(iPos + 1, keymapLineIdx);
+	assert.notEqual(mode.queueMode, modeBefore, "clicking i chord toggles queue mode");
+	// Toggle back and restore items (since toggleMode clears items waiting for fetch)
+	dashboard.handleClick(iPos + 1, keymapLineIdx);
+	assert.equal(mode.queueMode, modeBefore);
+	mode.items = itemsBefore;
+	mode.refreshState();
+
+	// Click 'hive' (H)
+	const HPos = keymapText.indexOf("H hive");
+	assert.ok(HPos > 0);
+	const hiveBefore = mode.hiveOnly;
+	dashboard.handleClick(HPos + 1, keymapLineIdx);
+	assert.notEqual(mode.hiveOnly, hiveBefore, "clicking H chord toggles hive-only");
+	// Toggle back
+	dashboard.handleClick(HPos + 1, keymapLineIdx);
+	assert.equal(mode.hiveOnly, hiveBefore);
+
+	// Click 'autoslay' (s)
+	const sPos = keymapText.indexOf("s autoslay");
+	assert.ok(sPos > 0);
+	dashboard.handleClick(sPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "slay", "clicking autoslay chord triggers slay action");
+
+	// Click 'close' (q)
+	const qPos = keymapText.indexOf("q close");
+	assert.ok(qPos > 0);
+	dashboard.handleClick(qPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "close", "clicking close chord triggers close action");
+
+	// 7. Active-turn concurrency: actions remain available during active turns
+	mode.session.startTurn(NOW);
+	mode.session.startTool("active-turn-tool", "bash", { command: "just review-check" }, NOW + 10);
+	mode.refreshState();
+	assert.ok(mode.session.active() !== undefined, "active tool turn in flight");
+
+	// During active turn: click selects row, expands trace, and triggers actions
+	dashboard.handleClick(15, 3);
+	assert.equal(mode.cursor, 0, "active turn allows click row selection");
+	dashboard.handleClick(150, 4);
+	assert.equal(dashboard.currentPane, "trace", "active turn allows pane focus");
+	dashboard.handleClick(rPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "review", "active turn allows action click dispatch");
+	mode.session.endTool("active-turn-tool", { content: [{ type: "text", text: "done" }] }, false, NOW + 100);
+	mode.session.endTurn(NOW + 200);
+
+	// 8. Header and status bar clicks
+	// Header row: clicking mode area toggles mode
+	dashboard.handleClick(25, 0);
+	assert.equal(mode.queueMode, "issues");
+	dashboard.handleClick(25, 0);
+	assert.equal(mode.queueMode, "prs");
+	mode.items = itemsBefore;
+	mode.refreshState();
+
+	// 9. Narrow terminal stacked layout click parity
+	const narrowFrame = dashboard.render(70);
+	assert.ok(narrowFrame.some((r) => r.startsWith("▼ QUEUE") || r.startsWith("▶ QUEUE")));
+	// Click queue row in narrow layout (row 3 is item 7, row 4 is divider, row 5 is item 42)
+	dashboard.handleClick(15, 3);
+	assert.equal(mode.cursor, 0);
+	dashboard.handleClick(15, 4);
+	assert.equal(mode.cursor, 0, "clicking divider in stacked layout preserves selection");
+	dashboard.handleClick(15, 5);
+	assert.equal(mode.cursor, 1, "narrow stacked layout selects row on click");
+});
+

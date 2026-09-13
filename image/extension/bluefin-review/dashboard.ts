@@ -16,8 +16,8 @@ import type { QueueItem } from "./github.ts";
 import { type KeyMatcher, canonicalKey, rawKeyMatcher } from "./keys.ts";
 import { type ReviewMode, ciGlyph } from "./mode.ts";
 import { type RailKey, keymapBar, orderSourceLabel, priorityChip, tmuxReviewStatusBar } from "./rail.ts";
-import { type RenderedRow, type Span, findSpan, hasChildren, renderSpanTree, visibleSpanIds } from "./trace.ts";
-import { fitToWidth, truncateToWidth } from "./width.ts";
+import { type RenderedRow, type Span, defaultExpanded, findSpan, hasChildren, renderSpanTree, visibleSpanIds } from "./trace.ts";
+import { fitToWidth, truncateToWidth, visibleWidth } from "./width.ts";
 import { BLUEFIN_RAPTOR_BANNER, renderRaptorGlyph } from "./mascot.ts";
 export type DashboardAction =
 	| { kind: "close" }
@@ -84,6 +84,12 @@ const HELP: readonly string[] = [
 	"  ?                close this help",
 	"  q, esc           close the dashboard",
 	"",
+	"Mouse / Click parity:",
+	"  Click any queue row to select it; click the checkbox to toggle it.",
+	"  Click panes to focus; click trace spans to collapse/expand.",
+	"  Scroll with the mouse wheel to navigate queue or trace.",
+	"  Click any visible keymap action to trigger it.",
+	"",
 	"Trace spans come from the appliance's own durable state under",
 	"bluefin-review/: run-state, review batches, landings, receipts.",
 	"Live turn spans come from this session's tool executions.",
@@ -98,7 +104,107 @@ interface TuiLike {
 	requestRender(): void;
 }
 
-type Pane = "queue" | "trace";
+export type Pane = "queue" | "trace";
+
+export interface MouseEvent {
+	button: number;
+	col: number; // 0-based column
+	row: number; // 0-based row
+	release: boolean;
+	wheel?: -1 | 1;
+}
+
+/**
+ * Parses terminal mouse reporting sequences into structured MouseEvent objects.
+ * Supports SGR 1006 (\x1b[<b;x;y[Mm]), X10/X11 (\x1b[MCbCxCy), URXVT (\x1b[b;x;yM),
+ * and direct programmatic/pilot strings (click:col,row, wheel:up/down, or JSON).
+ */
+export function parseMouseEvent(data: string): MouseEvent | undefined {
+	// SGR format: \x1b[<button;x;y[Mm]
+	const sgrMatch = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
+	if (sgrMatch) {
+		const button = Number.parseInt(sgrMatch[1]!, 10);
+		const col = Number.parseInt(sgrMatch[2]!, 10) - 1;
+		const row = Number.parseInt(sgrMatch[3]!, 10) - 1;
+		const release = sgrMatch[4] === "m";
+		if ((button & 64) !== 0 || button === 64 || button === 65) {
+			const dir = (button & 1) === 0 && button !== 65 ? -1 : 1;
+			return { button, col: Math.max(0, col), row: Math.max(0, row), release: false, wheel: dir };
+		}
+		return { button, col: Math.max(0, col), row: Math.max(0, row), release };
+	}
+
+	// Normal X10/X11 format: \x1b[M Cb Cx Cy
+	if (data.startsWith("\x1b[M") && data.length === 6) {
+		const cb = data.charCodeAt(3) - 32;
+		const cx = data.charCodeAt(4) - 32 - 1;
+		const cy = data.charCodeAt(5) - 32 - 1;
+		const release = (cb & 3) === 3;
+		if ((cb & 64) !== 0 || cb === 64 || cb === 65) {
+			const dir = (cb & 1) === 0 && cb !== 65 ? -1 : 1;
+			return { button: cb, col: Math.max(0, cx), row: Math.max(0, cy), release: false, wheel: dir };
+		}
+		return { button: cb, col: Math.max(0, cx), row: Math.max(0, cy), release };
+	}
+
+	// URXVT format: \x1b[button;x;yM
+	const urxvtMatch = /^\x1b\[(\d+);(\d+);(\d+)M$/.exec(data);
+	if (urxvtMatch) {
+		const rawBtn = Number.parseInt(urxvtMatch[1]!, 10);
+		const button = rawBtn >= 32 ? rawBtn - 32 : rawBtn;
+		const col = Number.parseInt(urxvtMatch[2]!, 10) - 1;
+		const row = Number.parseInt(urxvtMatch[3]!, 10) - 1;
+		if ((button & 64) !== 0 || button === 64 || button === 65) {
+			const dir = (button & 1) === 0 && button !== 65 ? -1 : 1;
+			return { button, col: Math.max(0, col), row: Math.max(0, row), release: false, wheel: dir };
+		}
+		return { button, col: Math.max(0, col), row: Math.max(0, row), release: false };
+	}
+
+	// Direct text commands: "click(x, y)", "click:x,y", "mouse:click:x,y"
+	const directClick = /^(?:mouse:)?click(?:\((\d+),\s*(\d+)\)|:(\d+)[,:](\d+))$/.exec(data);
+	if (directClick) {
+		const col = Number.parseInt(directClick[1] ?? directClick[3]!, 10);
+		const row = Number.parseInt(directClick[2] ?? directClick[4]!, 10);
+		return { button: 0, col: Math.max(0, col), row: Math.max(0, row), release: false };
+	}
+
+	// Wheel text commands: "wheel:up", "wheel:down", etc.
+	const directWheel = /^(?:mouse:)?wheel:(up|down)(?::(\d+)[,:](\d+))?$/.exec(data);
+	if (directWheel) {
+		const dir = directWheel[1] === "up" ? -1 : 1;
+		const col = directWheel[2] ? Number.parseInt(directWheel[2], 10) : 0;
+		const row = directWheel[3] ? Number.parseInt(directWheel[3], 10) : 0;
+		return { button: dir === -1 ? 64 : 65, col: Math.max(0, col), row: Math.max(0, row), release: false, wheel: dir };
+	}
+
+	// JSON-formatted mouse events
+	if (data.startsWith("{") && data.endsWith("}")) {
+		try {
+			const obj = JSON.parse(data) as Record<string, unknown>;
+			if (obj.type === "click" || obj.event === "click") {
+				return {
+					button: typeof obj.button === "number" ? obj.button : 0,
+					col: Math.max(0, typeof obj.col === "number" ? obj.col : (typeof obj.x === "number" ? obj.x : 0)),
+					row: Math.max(0, typeof obj.row === "number" ? obj.row : (typeof obj.y === "number" ? obj.y : 0)),
+					release: obj.release === true,
+				};
+			}
+			if (obj.type === "wheel" || obj.event === "wheel") {
+				const dir = typeof obj.direction === "number" ? (obj.direction < 0 ? -1 : 1) : -1;
+				return {
+					button: dir === -1 ? 64 : 65,
+					col: Math.max(0, typeof obj.col === "number" ? obj.col : (typeof obj.x === "number" ? obj.x : 0)),
+					row: Math.max(0, typeof obj.row === "number" ? obj.row : (typeof obj.y === "number" ? obj.y : 0)),
+					release: false,
+					wheel: dir,
+				};
+			}
+		} catch {}
+	}
+
+	return undefined;
+}
 
 /** Minimum width before the panes stack instead of sitting side by side. */
 const SPLIT_MIN_WIDTH = 96;
@@ -117,6 +223,9 @@ export class ReviewDashboard {
 	private filterDraft = "";
 	private expansion = new Map<string, boolean>();
 	private stopTick: (() => void) | undefined;
+	private lastWidth = 120;
+	private queueRowItems: (number | "divider")[] = [];
+	private traceRowSpans: (string | "hive" | undefined)[] = [];
 
 	private readonly tui: TuiLike;
 	private readonly painter: Painter;
@@ -142,6 +251,7 @@ export class ReviewDashboard {
 		this.onRefresh = onRefresh;
 		this.rows = rows;
 		this.matchKey = matchKey;
+		this.enableMouse();
 		const handle = setInterval(() => {
 			try {
 				this.frame += 1;
@@ -153,6 +263,34 @@ export class ReviewDashboard {
 		}, SPINNER_TICK_MS * 2);
 		(handle as { unref?(): void }).unref?.();
 		this.stopTick = () => clearInterval(handle);
+	}
+
+	get activePane(): Pane {
+		return this.pane;
+	}
+
+	get currentPane(): Pane {
+		return this.pane;
+	}
+
+	private enableMouse(): void {
+		if (process.stdout?.isTTY) {
+			try {
+				process.stdout.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+			} catch {
+				// Ignore write failures in restricted environments
+			}
+		}
+	}
+
+	private disableMouse(): void {
+		if (process.stdout?.isTTY) {
+			try {
+				process.stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+			} catch {
+				// Ignore write failures in restricted environments
+			}
+		}
 	}
 
 	// ---- trace helpers -------------------------------------------------------
@@ -177,12 +315,393 @@ export class ReviewDashboard {
 	// ---- input ---------------------------------------------------------------
 
 	handleInput(data: string): void {
+		const mouse = parseMouseEvent(data);
+		if (mouse) {
+			if (mouse.wheel !== undefined) {
+				this.handleWheel(mouse.wheel, mouse.col, mouse.row);
+				return;
+			}
+			if (!mouse.release && (mouse.button & 3) === 0 && (mouse.button & 32) === 0) {
+				this.handleClick(mouse.col, mouse.row, mouse.button);
+				return;
+			}
+			return;
+		}
+
 		const key = canonicalKey(data, this.matchKey);
 		if (this.filtering) {
 			this.handleFilterInput(key, data);
 			return;
 		}
 
+		this.executeKey(key);
+	}
+
+	handleClick(col: number, row: number, _button = 0): void {
+		if (this.showHelp) {
+			this.showHelp = false;
+			this.tui.requestRender();
+			return;
+		}
+
+		const width = this.lastWidth || 120;
+		const bodyHeight = Math.max(4, this.rows - 4);
+		const isSplit = width >= SPLIT_MIN_WIDTH;
+		const leftWidth = isSplit ? Math.floor((width - 3) / 2) : width;
+		const rightWidth = isSplit ? width - leftWidth - 3 : width;
+
+		// 1. Header row
+		if (row === 0) {
+			this.handleHeaderClick(col, width);
+			return;
+		}
+
+		// 2. Border row
+		if (row === 1) {
+			return;
+		}
+
+		// 3. Panes (Body)
+		if (row >= 2 && row < 2 + bodyHeight) {
+			const bodyRow = row - 2;
+			if (isSplit) {
+				if (col < leftWidth + 1) {
+					this.handleQueuePaneClick(col, bodyRow, leftWidth, bodyHeight);
+				} else {
+					this.handleTracePaneClick(col - (leftWidth + 3), bodyRow, rightWidth, bodyHeight);
+				}
+			} else {
+				const queueHeight = Math.max(3, Math.floor((bodyHeight - 2) / 2));
+				if (bodyRow === 0) {
+					this.pane = "queue";
+					this.tui.requestRender();
+				} else if (bodyRow <= queueHeight) {
+					this.handleQueuePaneClick(col, bodyRow, width, queueHeight + 1);
+				} else if (bodyRow === queueHeight + 1) {
+					this.pane = "trace";
+					this.tui.requestRender();
+				} else {
+					this.handleTracePaneClick(col, bodyRow - (queueHeight + 1), width, bodyHeight - queueHeight - 1);
+				}
+			}
+			return;
+		}
+
+		// 4. Filter / Search line (if present)
+		const hasFilterLine = this.filtering || Boolean(this.mode.filter);
+		const filterRow = 2 + bodyHeight;
+		if (hasFilterLine && row === filterRow) {
+			this.handleFilterLineClick(col);
+			return;
+		}
+
+		// 5. Keymap bar
+		const keymapRow = filterRow + (hasFilterLine ? 1 : 0);
+		if (row === keymapRow) {
+			this.handleKeymapClick(col, width);
+			return;
+		}
+
+		// 6. Status bar
+		const statusRow = keymapRow + 1;
+		if (row === statusRow) {
+			this.handleStatusBarClick(col, width);
+			return;
+		}
+	}
+
+	handleWheel(direction: -1 | 1, col?: number, _row?: number): void {
+		const width = this.lastWidth || 120;
+		const isSplit = width >= SPLIT_MIN_WIDTH;
+		const leftWidth = isSplit ? Math.floor((width - 3) / 2) : width;
+
+		if (col !== undefined && isSplit) {
+			if (col < leftWidth + 1) {
+				this.pane = "queue";
+			} else {
+				this.pane = "trace";
+			}
+		}
+		this.move(direction);
+		this.tui.requestRender();
+	}
+
+	private handleHeaderClick(col: number, width: number): void {
+		if (col <= 16) {
+			this.showHelp = !this.showHelp;
+			this.tui.requestRender();
+			return;
+		}
+		if (col >= 18 && col <= 36) {
+			this.mode.toggleMode();
+			this.onRefresh();
+			this.tui.requestRender();
+			return;
+		}
+		if (col > 36 && col < width - 20) {
+			if (this.mode.hiveLevel !== undefined) {
+				this.mode.cycleHiveLevel();
+			} else {
+				this.mode.toggleHiveOnly();
+			}
+			this.tui.requestRender();
+			return;
+		}
+		if (col >= width - 20) {
+			this.onRefresh();
+		}
+	}
+
+	private handleQueuePaneClick(col: number, bodyRow: number, _width: number, _height: number): void {
+		this.pane = "queue";
+		if (bodyRow === 0) {
+			this.tui.requestRender();
+			return;
+		}
+		const queueOffset = bodyRow - 1;
+		const itemOrDivider = this.queueRowItems[queueOffset];
+		if (itemOrDivider === "divider") {
+			this.tui.requestRender();
+			return;
+		}
+		if (typeof itemOrDivider === "number") {
+			const itemIndex = itemOrDivider;
+			if (col >= 1 && col <= 3) {
+				this.mode.cursor = itemIndex;
+				this.mode.toggleSelected();
+			} else {
+				this.mode.cursor = itemIndex;
+				this.traceCursor = 0;
+			}
+			this.tui.requestRender();
+			return;
+		}
+
+		// Fallback when rendered map is not populated yet
+		const items = this.activeItems();
+		if (items.length === 0) {
+			this.tui.requestRender();
+			return;
+		}
+		const itemIndex = this.queueScroll + queueOffset;
+		if (itemIndex >= 0 && itemIndex < items.length) {
+			if (col >= 1 && col <= 3) {
+				this.mode.cursor = itemIndex;
+				this.mode.toggleSelected();
+			} else {
+				this.mode.cursor = itemIndex;
+				this.traceCursor = 0;
+			}
+			this.tui.requestRender();
+		}
+	}
+
+	private handleTracePaneClick(_col: number, bodyRow: number, width: number, height: number): void {
+		this.pane = "trace";
+		if (bodyRow === 0) {
+			this.tui.requestRender();
+			return;
+		}
+		const traceOffset = bodyRow - 1;
+		const spanId = this.traceRowSpans[traceOffset];
+		if (spanId === "hive") {
+			this.tui.requestRender();
+			return;
+		}
+		if (typeof spanId === "string") {
+			const ids = this.traceIds(Date.now());
+			const cursorIdx = ids.indexOf(spanId);
+			if (cursorIdx >= 0) {
+				this.traceCursor = cursorIdx;
+			}
+			const roots = this.traceRoots(Date.now());
+			const span = findSpan(roots, spanId);
+			if (span && hasChildren(span)) {
+				const current = this.expansion.get(span.id) ?? defaultExpanded(span);
+				this.expansion.set(span.id, !current);
+			}
+			this.tui.requestRender();
+			return;
+		}
+
+		// Fallback when rendered map is not populated yet
+		const hive = this.hiveRows(width);
+		if (traceOffset < hive.length) {
+			this.tui.requestRender();
+			return;
+		}
+		const spanRowIndex = traceOffset - hive.length;
+		const roots = this.traceRoots(Date.now());
+		const rendered = renderSpanTree(roots, {
+			painter: this.painter,
+			width,
+			now: Date.now(),
+			frame: this.frame,
+			expansion: this.expansion,
+			focusedId: undefined,
+			maxLogLines: Math.max(3, Math.floor((height - 1 - hive.length) / 3)),
+		});
+		const targetRow = rendered[this.traceScroll + spanRowIndex];
+		if (targetRow && targetRow.kind === "span") {
+			const ids = this.traceIds(Date.now());
+			const cursorIdx = ids.indexOf(targetRow.spanId);
+			if (cursorIdx >= 0) {
+				this.traceCursor = cursorIdx;
+			}
+			const span = findSpan(roots, targetRow.spanId);
+			if (span && hasChildren(span)) {
+				const current = this.expansion.get(span.id) ?? defaultExpanded(span);
+				this.expansion.set(span.id, !current);
+			}
+		}
+		this.tui.requestRender();
+	}
+
+	private handleFilterLineClick(col: number): void {
+		if (this.filtering) {
+			if (col > 70) {
+				this.filtering = false;
+				this.tui.requestRender();
+				return;
+			}
+			if (col > 55) {
+				this.filtering = false;
+				this.mode.setFilter(this.filterDraft.trim());
+				this.queueScroll = 0;
+				this.tui.requestRender();
+				return;
+			}
+			if (col > 40) {
+				this.mode.selectAllVisible();
+				this.tui.requestRender();
+				return;
+			}
+			this.toggleSelection();
+			this.tui.requestRender();
+		} else if (this.mode.filter) {
+			if (col > 50) {
+				this.mode.setFilter("");
+				this.queueScroll = 0;
+			} else {
+				this.filtering = true;
+				this.filterDraft = this.mode.filter;
+			}
+			this.tui.requestRender();
+		}
+	}
+
+	private handleKeymapClick(col: number, _width: number): void {
+		let currentOffset = 3;
+		for (const key of DASHBOARD_KEYS) {
+			const chordWidth = visibleWidth(key.chord);
+			const labelWidth = visibleWidth(key.label);
+			const itemWidth = chordWidth + 1 + labelWidth;
+			const startCol = currentOffset;
+			const endCol = currentOffset + itemWidth;
+			const nextOffset = endCol + 3;
+
+			if (col >= startCol && col < nextOffset) {
+				this.triggerChordAction(key.chord, col, startCol, chordWidth);
+				return;
+			}
+			currentOffset = nextOffset;
+		}
+	}
+
+	private triggerChordAction(chord: string, col: number, startCol: number, chordWidth: number): void {
+		switch (chord) {
+			case "s":
+				this.executeKey("s");
+				break;
+			case "r/enter":
+				this.executeKey("r");
+				break;
+			case "a":
+				this.executeKey("a");
+				break;
+			case "space":
+				this.executeKey("space");
+				break;
+			case "A":
+				this.executeKey("A");
+				break;
+			case "x":
+				this.executeKey("x");
+				break;
+			case "j/k":
+				if (col < startCol + Math.floor(chordWidth / 2)) {
+					this.executeKey("k");
+				} else {
+					this.executeKey("j");
+				}
+				break;
+			case "tab":
+				this.executeKey("tab");
+				break;
+			case "h/l":
+				if (col < startCol + Math.floor(chordWidth / 2)) {
+					this.executeKey("h");
+				} else {
+					this.executeKey("l");
+				}
+				break;
+			case "i":
+				this.executeKey("i");
+				break;
+			case "H":
+				this.executeKey("H");
+				break;
+			case "L":
+				this.executeKey("L");
+				break;
+			case "d":
+				this.executeKey("d");
+				break;
+			case "D":
+				this.executeKey("D");
+				break;
+			case "f":
+				this.executeKey("f");
+				break;
+			case "y":
+				this.executeKey("y");
+				break;
+			case "*":
+				this.executeKey("*");
+				break;
+			case "o":
+				this.executeKey("o");
+				break;
+			case "/":
+				this.executeKey("/");
+				break;
+			case "q":
+				this.executeKey("q");
+				break;
+			default:
+				break;
+		}
+	}
+
+	private handleStatusBarClick(col: number, _width: number): void {
+		if (col < 30) {
+			this.mode.toggleHiveOnly();
+			this.tui.requestRender();
+			return;
+		}
+		if (col < 55) {
+			const item = this.mode.selected();
+			if (item) {
+				this.executeKey("r");
+			}
+			return;
+		}
+		this.mode.toggleMode();
+		this.onRefresh();
+		this.tui.requestRender();
+	}
+
+	private executeKey(key: string): void {
 		switch (key) {
 			case "escape":
 			case "q":
@@ -190,13 +709,16 @@ export class ReviewDashboard {
 				return;
 			case "?":
 				this.showHelp = this.showHelp === false;
+				this.tui.requestRender();
 				return;
 			case "tab":
 				this.pane = this.pane === "queue" ? "trace" : "queue";
+				this.tui.requestRender();
 				return;
 			case "/":
 				this.filtering = true;
 				this.filterDraft = this.mode.filter;
+				this.tui.requestRender();
 				return;
 			case " ":
 			case "space":
@@ -204,9 +726,11 @@ export class ReviewDashboard {
 				return;
 			case "A":
 				this.mode.selectAllVisible();
+				this.tui.requestRender();
 				return;
 			case "x":
 				this.mode.clearSelected();
+				this.tui.requestRender();
 				return;
 			case "j":
 			case "down":
@@ -226,21 +750,26 @@ export class ReviewDashboard {
 			case "left":
 				if (this.pane === "trace") this.toggleSpan(false);
 				else this.pane = "queue";
+				this.tui.requestRender();
 				return;
 			case "l":
 			case "right":
 				if (this.pane === "trace") this.toggleSpan(true);
 				else this.pane = "trace";
+				this.tui.requestRender();
 				return;
 			case "i":
 				this.mode.toggleMode();
 				this.onRefresh();
+				this.tui.requestRender();
 				return;
 			case "H":
 				this.mode.toggleHiveOnly();
+				this.tui.requestRender();
 				return;
 			case "L":
 				this.mode.cycleHiveLevel();
+				this.tui.requestRender();
 				return;
 			case "u":
 				this.onRefresh();
@@ -405,6 +934,7 @@ export class ReviewDashboard {
 	}
 
 	private queueRows(width: number, height: number): string[] {
+		this.queueRowItems = [];
 		const items = this.activeItems();
 		const rows: string[] = [];
 		if (items.length === 0) {
@@ -429,6 +959,7 @@ export class ReviewDashboard {
 				if (lastRepo !== undefined && rows.length < height) {
 					const divider = `─── ${item.repo} `.padEnd(width, "─");
 					rows.push(truncateToWidth(this.painter.fg("dim", divider), width));
+					this.queueRowItems.push("divider");
 				}
 				lastRepo = item.repo;
 			}
@@ -449,6 +980,7 @@ export class ReviewDashboard {
 			const chip = priorityChip(this.painter, this.mode.priorityFor(item));
 			const meta = this.painter.fg("dim", ` ${GLYPH.dot} ${shortRepo(item.repo)} @${item.author}`);
 			rows.push(truncateToWidth(`${caret} ${check} ${icon} ${chip ? `${chip} ` : ""}${number} ${title}${meta}`, width));
+			this.queueRowItems.push(i);
 		}
 
 		if (items.length > this.queueScroll + height) {
@@ -539,9 +1071,14 @@ export class ReviewDashboard {
 	}
 
 	private traceRows(width: number, height: number, now: number): string[] {
+		this.traceRowSpans = [];
 		const hive = this.hiveRows(width);
+		for (let i = 0; i < hive.length; i++) {
+			this.traceRowSpans.push("hive");
+		}
 		const roots = this.traceRoots(now);
 		if (roots.length === 0) {
+			this.traceRowSpans.push(undefined);
 			return [...hive, this.painter.fg("dim", `  ${statusIcon("pending")} no pipeline state recorded yet`)];
 		}
 		const ids = this.traceIds(now);
@@ -567,9 +1104,15 @@ export class ReviewDashboard {
 			const cursorRow = rendered.findIndex((row) => row.kind === "span" && row.spanId === focusedId);
 			this.traceScroll = clampScroll(Math.max(0, cursorRow), this.traceScroll, height);
 		}
-		const spans = rendered
-			.slice(this.traceScroll, this.traceScroll + Math.max(1, height - hive.length))
-			.map((row) => row.text);
+		const spanSlice = rendered.slice(this.traceScroll, this.traceScroll + Math.max(1, height - hive.length));
+		for (const row of spanSlice) {
+			if (row.kind === "span") {
+				this.traceRowSpans.push(row.spanId);
+			} else {
+				this.traceRowSpans.push(undefined);
+			}
+		}
+		const spans = spanSlice.map((row) => row.text);
 		return [...hive, ...spans];
 	}
 
@@ -581,6 +1124,7 @@ export class ReviewDashboard {
 	}
 
 	render(width: number): string[] {
+		this.lastWidth = width;
 		const now = Date.now();
 		const lines: string[] = [this.headerRow(width, now), this.painter.fg("border", "─".repeat(width))];
 
@@ -637,6 +1181,7 @@ export class ReviewDashboard {
 	invalidate(): void {}
 
 	dispose(): void {
+		this.disableMouse();
 		this.stopTick?.();
 		this.stopTick = undefined;
 	}
