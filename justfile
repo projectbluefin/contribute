@@ -81,7 +81,7 @@ hive_repo_url := "https://github.com/hivecommons/hive"
 # kubestellar/hive#6670 (fix: scope OMP's login/onboarding checks to the
 # pane's last 3 lines instead of a 15-line tail a tip or a finished turn's
 # own prose could still land in).
-hive_commit := "ea9bc11311bcf1f6acf1c7aec7d7f775ad42616a"
+hive_commit := "2f22a223e2bedd1477ab5d21097109637688e300"
 gemini_model := "gemini-3.8-flash"
 opus_model := "claude-opus-5"
 sol_model := "gpt-5.6-sol"
