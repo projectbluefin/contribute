@@ -233,6 +233,11 @@ jobs:
             rm -f "$archive"
           done
 
+      - name: Homebrew installation end-to-end contract
+        run: |
+          set -euo pipefail
+          bash tests/brew-install-e2e.sh
+
       - name: Publish update-time Apptainer artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
