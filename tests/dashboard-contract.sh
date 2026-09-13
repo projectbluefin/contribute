@@ -339,6 +339,9 @@ fi
 # suite to one invocation.
 python3 "$repo_root/tests/review_cache_contract.py"
 python3 "$repo_root/tests/review_receipt_contract.py"
+# The shared wire layer both brokers delegate to: framing, byte caps and the
+# socket lifecycle, none of which a broker's own dispatch reaches.
+python3 "$repo_root/tests/broker_protocol_contract.py"
 python3 "$repo_root/tests/lab-broker-contract.py"
 python3 "$repo_root/tests/review-exec-broker-contract.py"
 
