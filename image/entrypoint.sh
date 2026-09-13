@@ -32,9 +32,25 @@ BANNER
   } >&2
 }
 
+# Prefer the backend selected by Hive's contributor registration if present.
+# The launcher may also pass AGENT_BACKEND; prefer the mounted contributor.env
+# selection so the image truly consumes Hive's decision rather than enforcing
+# a local default.
+hive_config="${HOME}/.config/hive"
+selected_backend="${AGENT_BACKEND:-}"
+if [ -f "${hive_config}/contributor.env" ]; then
+  # Parse AGENT_BACKEND from the registration file if present.
+  parsed_backend="$(awk -F= '$1=="AGENT_BACKEND" {sub(/^[^=]*=/, ""); print; exit}' "${hive_config}/contributor.env" 2>/dev/null | tr -d "\"' " || true)"
+  if [ -n "${parsed_backend}" ]; then
+    selected_backend="${parsed_backend}"
+  fi
+fi
+if [ -z "${selected_backend}" ]; then
+  selected_backend="omp"
+fi
+
 # Validate the selected backend before startup. Hive remains responsible for
 # assignment selection; this only proves the selected CLI can run here.
-selected_backend="${AGENT_BACKEND:-omp}"
 case "$selected_backend" in
 omp)
   command -v omp >/dev/null 2>&1 || {
