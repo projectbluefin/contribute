@@ -70,8 +70,12 @@ or image-layer pinning. Those belong to the Hive or image build skill documents.
    explicit alternate backend (`BLUEFIN_REVIEW_BACKEND=codex`). Model profiles
    set `AGENT_MODEL` and `AGENT_REASONING_EFFORT` (profiles: `gemini`, `sol`,
    `opus5`, `k3`). Environment variables always take precedence.
-5. Pass credentials via inherited environment, never CLI args; stage Codex auth at `0600`.
-6. When renaming launcher identifiers, do a full sweep and leave no aliases.
+5. Keep `COPILOT_INTEGRATION_ID=copilot-developer-cli` exported; `bin/omp-review`
+   pins it. Copilot gates its catalog on that header, so dropping it 400s the
+   `/models` request and takes every Gemini, Claude, GPT and Kimi id out of the
+   picker at once. OMP names the casualties `header_omitted_model_ids`.
+6. Pass credentials via inherited environment, never CLI args; stage Codex auth at `0600`.
+7. When renaming launcher identifiers, do a full sweep and leave no aliases.
 
 ## Container Ownership
 
@@ -142,14 +146,14 @@ broker is offered only to the local Podman dashboard.
 ## Red Flags
 
 - An undocumented public recipe, or a detached/background contributor launch.
-- Altering a remote canonical configuration directory or file during remote
-  staging, or broad deletion on cleanup.
-- An interactive launch path whose final process is neither `exec`'d nor the
-  last foreground command whose status propagates (`nohup`, `setsid`).
-  Background jobs the shell `wait`s on and reaps by trap are allowed for signals.
-- A host directory mount beyond the read-only Hive configuration for the
-  contributor container, or a host Codex config/login mount instead of the
-  one-run staged auth file.
+- Altering a remote canonical configuration directory or file during remote staging,
+  or broad deletion on cleanup.
+- An interactive launch path whose final process is neither `exec`'d nor the last
+  foreground command whose status propagates (`nohup`, `setsid`); background jobs
+  the shell `wait`s on and reaps by trap are allowed, for signals.
+- A host directory mount beyond the read-only Hive configuration for the contributor
+  container, or a host Codex config/login mount instead of the staged auth file.
+- Unsetting or overriding `COPILOT_INTEGRATION_ID` on a launch path.
 - A token in output, files, Podman arguments, or any persisted launcher file.
 - Ownership inferred from `pgrep` rather than a label plus a live, same-boot,
   still-naming PID.

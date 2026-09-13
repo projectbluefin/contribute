@@ -146,28 +146,28 @@ A completed landing never silently arms a retry. Merged rows leave the selection
 unfinished, missing-outcome, and `awaiting-stable` rows keep a bounded visible reason but are
 deselected, and a maintainer reconfirms any later retry.
 
-After every confirmed batch reaches terminal PR outcomes, the existing final-review lane starts
-exactly one consolidated recovery review. Its prompt names only that confirmed batch and includes
-its bounded, JSON-quoted terminal states and reasons. The reviewer and any fresh fixer may repair
-only those already authorized branches; neither retries landing, approves, merges, completes Hive
-work, or expands the batch. Human retry and merge remain separate explicit actions.
+After every confirmed batch reaches terminal PR outcomes, the existing final-review lane starts exactly
+one consolidated recovery review. Its prompt names only that confirmed batch and includes its bounded,
+JSON-quoted terminal states and reasons. The reviewer and any fresh fixer may repair only those already
+authorized branches; neither retries landing, approves, merges, completes Hive work, or expands the
+batch. Human retry and merge remain separate explicit actions.
 
-Deselection alone does not stop an unattended loop: autoslay reselects from the queue, not from
-that selection. `slayableItems()` excludes an item whose newest durable record is a terminal
-blocked state (`isItemTerminalBlocked`). A block describes one commit at one moment, so it
-suppresses only while nothing has moved since: a different head or newer GitHub activity re-admits
-it, since most blocks here say "needs a second approval" — a review clears that, not a push.
-Comparing against no currency excluded every blocked item forever and starved the queue. That read
-needs its own wider bounded window, since one batch writes one landing file. Autoslay stops
-outright when a refreshed queue hands it the identical batch twice.
+Deselection alone does not stop an unattended loop: autoslay reselects from the queue, not from that
+selection. `slayableItems()` excludes an item whose newest durable record is a terminal blocked state
+(`isItemTerminalBlocked`). A block describes one commit at one moment, so it suppresses only while
+nothing has moved since: a different head or newer GitHub activity re-admits it, since most blocks here
+say "needs a second approval" — a review clears that, not a push. Comparing against no currency excluded
+every blocked item forever and starved the queue. That read needs its own wider bounded window, since
+one batch writes one landing file. Autoslay stops outright when a refreshed queue hands it the identical
+batch twice.
 
-A dispatch prompt never tells an agent to wait for CI, and caps what it may pull: whatever a
-command prints is re-sent every later turn, and one measured run spent 91% of its tokens on
-re-sent context with 80% of its `gh pr view` calls re-reading a pull request it already had. So it
-ships the queue's own read inline per item, and says read state once with a minimal `--json` set
-and list changes with `--name-only`. The caveat that the read is stale lives *inside* the
-brackets, and subagent rules ship as a delimited verbatim block: a parent copies item lines and
-drops the prose around them — observed live, seven subagents got the state and none got its rule.
+A dispatch prompt never tells an agent to wait for CI, and caps what it may pull: whatever a command
+prints is re-sent every later turn, and one measured run spent 91% of its tokens on re-sent context. So
+it ships the queue's own read inline per item, says read state once with a minimal `--json` set and list
+changes with `--name-only`, and keeps the stale-read caveat inside the brackets — subagent rules ship as
+a delimited verbatim block because a parent copies item lines and drops the prose around them. Scratch
+uses `mktemp -d -t <prefix>.XXXXXX`: an absolute template makes mktemp ignore `TMPDIR`, so it cannot
+move off a small `/tmp`, and 43 abandoned clones once filled a 16G tmpfs. The brief names `rm -rf "$WORKDIR"`, since "clean up" was never obeyed.
 
 ## Common Rationalizations
 
