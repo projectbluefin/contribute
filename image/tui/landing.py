@@ -942,30 +942,30 @@ def branch_target_block(
     cycle, or None when it may proceed.
 
     Pure, so the dashboard's pre-flight and the unit tests feed it the same
-    live evidence GitHub reports. Two conditions block, either one alone:
-    the pull request targets a branch its repository's policy forbids (a
-    release stream cut from the wrong base), or the merge base itself is
-    CONFLICTING/DIRTY. Both are states no repair inside the pull request's
-    own branch can fix, and both cost a full agent dispatch to rediscover —
-    the pull request is blocked and deselected instead. If both apply the
-    note names both; the wrong-target reason leads.
+    live evidence GitHub reports. One condition blocks: the pull request
+    targets a branch its repository's policy forbids (a release stream cut
+    from the wrong base). No repair inside the pull request's own branch can
+    fix that, and it costs a full agent dispatch to rediscover.
+
+    A CONFLICTING or DIRTY merge base does *not* block. Merging the base
+    branch back into the pull request is a repair inside its own branch, and
+    it is the repair a maintainer expects slaying to perform. It is still
+    named in the note when the target is also wrong, because a wrong-target
+    pull request usually conflicts as a consequence of the wrong base rather
+    than on its own merits.
     """
     required = BRANCH_TARGET_POLICY.get(str(repository or "").lower())
     base_ref = str(base_ref or "").strip()
     mergeable = str(mergeable or "").upper()
     merge_state = str(merge_state or "").upper()
     wrong_target = required is not None and base_ref not in ("", required)
-    conflicting = mergeable == "CONFLICTING" or merge_state == "DIRTY"
-    if not wrong_target and not conflicting:
+    if not wrong_target:
         return None
-    reasons: list[str] = []
-    if wrong_target:
-        drift = f", {drift_files} files drifted" if drift_files is not None else ""
-        reasons.append(
-            f"wrong target branch: base {base_ref}, {required} required{drift}"
-        )
+    conflicting = mergeable == "CONFLICTING" or merge_state == "DIRTY"
+    drift = f", {drift_files} files drifted" if drift_files is not None else ""
+    reasons = [f"wrong target branch: base {base_ref}, {required} required{drift}"]
     if conflicting:
-        reasons.append("merge base conflicting; rebase before landing")
+        reasons.append("merge base conflicting")
     return "; ".join(reasons)
 
 
@@ -1031,9 +1031,16 @@ For each pull request, in order:
    Report it `blocked` immediately, naming the base you found and the
    required target, and move to the next pull request without diagnosing,
    fixing, or waiting on its checks. A CONFLICTING or DIRTY merge base is
-   the same kind of blocker: report `blocked` naming it and move on. The
-   dispatch pre-flight already deselected these; this rule covers evidence
-   that arrives after dispatch.
+   different: it is a repair you perform, not a blocker. Merge the base
+   branch back into the pull request's branch in your scratch workdir
+   (`git fetch origin <base> && git merge origin/<base>`), resolve each
+   conflicted hunk on its merits, and keep both sides' intent. Never rebase
+   the branch, never resolve with `--ours` or `--theirs`, and never
+   force-push. Run the smallest existing test covering the conflicted files,
+   then push the merge to the pull request's branch and carry on with the
+   landing pass. Report `blocked` only when the conflict genuinely cannot be
+   resolved from the branch — you lack push access to a fork, or the two
+   sides make incompatible decisions a human must arbitrate — and name which.
 2. Repair mechanical CI failures only — a stale sha256 after a version bump,
    a lockfile, formatting. If applying fixes, operate in a scratch workdir:
    `WORKDIR=$(mktemp -d /tmp/landing-XXXXXX) && gh repo clone <owner>/<repo> "$WORKDIR" && cd "$WORKDIR" && gh pr checkout <number> --repo <owner>/<repo>`.

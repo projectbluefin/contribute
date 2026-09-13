@@ -1485,6 +1485,21 @@ test("dispatch prompts forbid sleeping on CI and cap the evidence they pull", ()
 	assert.match(batch, /Evidence is bounded and read once/);
 });
 
+test("slaying a conflicted pull request repairs it instead of reporting it blocked", () => {
+	const dirty = queueItem({ ciStatus: "failure", mergeState: "dirty", reviewState: "review_required" });
+	const slay = actionPrompt({ kind: "slay", item: dirty });
+	// A dirty merge base is work the branch can do to itself, not a verdict.
+	assert.match(slay, /conflicting merge base .* is a repair you perform, not a reason to stop/);
+	assert.match(slay, /git merge origin\/<base>/);
+	// The repo's conflict doctrine: merge the base in, never rewrite history.
+	assert.match(slay, /Never rebase the branch, never resolve with `--ours` or `--theirs`, and never force-push/);
+	// Blocked stays available, but only for a conflict the branch cannot settle.
+	assert.match(slay, /no push access to the fork, or two sides make incompatible decisions/);
+	// Every fanned-out subagent inherits it, since they are what actually do the work.
+	const batch = actionPrompt({ kind: "slay", item: dirty, items: [dirty, queueItem({ id: 7, repo: "projectbluefin/other", mergeState: "dirty" })] });
+	assert.match(batch, /<<<SUBAGENT-RULES[\s\S]*is a repair you perform[\s\S]*SUBAGENT-RULES>>>/);
+});
+
 test("the queue read travels with its caveat and the subagent rules are copyable", () => {
 	const green = queueItem({ ciStatus: "success", mergeState: "clean", reviewState: "approved" });
 	const slay = actionPrompt({ kind: "slay", item: green });

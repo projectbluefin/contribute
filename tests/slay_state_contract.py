@@ -349,13 +349,16 @@ class SlayStateMachineContractTests(unittest.TestCase):
             self.assertEqual(len(enqueued), 1)
             self.assertEqual(enqueued[0].stops, [pr970])
 
-    def test_landing_branch_blocker_holds_wrong_target_and_conflicts(self):
-        """#517: a wrong target branch and a conflicting merge base block.
+    def test_landing_branch_blocker_holds_only_the_wrong_target(self):
+        """#517: a wrong target branch blocks; a conflicting base does not.
 
         projectbluefin/bluefin lands from `testing`; a PR cut from `main`
         was dispatched pass after pass, each agent rediscovering the same
         ~176-file drift before dying on the conflict. The pre-flight names
-        that drift and refuses the dispatch. Absent evidence never blocks.
+        that drift and refuses the dispatch. A conflicting merge base on the
+        *right* base is a repair the branch can perform, so it proceeds; the
+        conflict is still named when the target is also wrong, because there
+        it is a consequence of the wrong base. Absent evidence never blocks.
         """
         app = tui.ReviewDashboard()
         stop = tui.Stop(
@@ -400,13 +403,14 @@ class SlayStateMachineContractTests(unittest.TestCase):
             ),
             "",
         )
-        self.assertIn(
-            "merge base conflicting",
+        self.assertEqual(
             app.landing_branch_blocker(
                 common,
                 {"baseRefName": "main", "mergeable": "CONFLICTING",
                  "mergeStateStatus": "DIRTY"},
             ),
+            "",
+            "a conflicting base on the right target is repaired, not blocked",
         )
         # Absent evidence is a pass: no base named, nothing conflicting.
         self.assertEqual(
@@ -486,8 +490,15 @@ class SlayStateMachineContractTests(unittest.TestCase):
             self.assertEqual(len(enqueued), 1)
             self.assertEqual(enqueued[0].stops, [right])
 
-    def test_plan_landing_preflight_holds_conflicted_prs(self):
-        """#517: CONFLICTING/DIRTY merge bases stay out of landing queues."""
+    def test_plan_landing_dispatches_conflicted_prs_for_repair(self):
+        """A conflicting merge base is work the branch can do to itself.
+
+        #517 held CONFLICTING/DIRTY out of the landing queue alongside a
+        wrong target branch. Only the second is unfixable from the branch:
+        merging the base back in is an ordinary repair, and holding it meant
+        a maintainer who slayed a conflicted pull request got a blocked note
+        instead of a resolved conflict. The wrong-target hold is unchanged.
+        """
         class _FakeTask:
             def __init__(self, stops):
                 self.stops = stops
@@ -523,12 +534,14 @@ class SlayStateMachineContractTests(unittest.TestCase):
                 )
                 app.plan_landing([conflicted])
 
-            self.assertFalse(conflicted.selected)
-            self.assertIn("merge base conflicting", conflicted.failure)
-            self.assertEqual(enqueued, [])
+            self.assertTrue(
+                conflicted.selected,
+                "a conflicted pull request on the right base is dispatched, not held",
+            )
+            self.assertNotIn("merge base conflicting", conflicted.failure or "")
             self.assertEqual(
-                pushed, [],
-                "a fully conflicted selection must never reach the batch gate",
+                len(pushed), 1,
+                "a conflicted selection reaches the batch gate like any other",
             )
 
     def _setup_app(self, store_dir):

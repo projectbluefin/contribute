@@ -43,14 +43,15 @@ or cluster scale-out (`cluster-workers.md`).
    the batch dispatches only PRs the ruleset will actually land. This is what
    stops the same blocked PR being re-spawned and re-blocked pass after pass
    (see `[#514](https://github.com/projectbluefin/review/issues/514)`).
-3. **Branch-Target Pre-Flight:** The same gate also judges the branch
-   target itself (#517): `projectbluefin/bluefin` and `bluefin-lts` land
-   only from `testing`, so a PR aimed at `main` — or any PR whose merge
-   base is `CONFLICTING`/`DIRTY` — is held with a note naming the base
-   found, the required target, and the file drift between them, and is
-   deselected so no later pass re-selects it. Absent evidence never
-   blocks. The landing brief states the same rule, so an agent also
-   fast-fails rather than repairing an unmergeable configuration.
+3. **Branch-Target Pre-Flight:** The same gate judges the branch target (#517):
+   `projectbluefin/bluefin` and `bluefin-lts` land only from `testing`, so a PR
+   aimed at `main` is held with a note naming the base found, the required target,
+   and the drift between them, and deselected so no later pass re-selects it. A
+   `CONFLICTING`/`DIRTY` merge base does **not** hold: merging the base back in is
+   a repair inside the PR's own branch, and it is what a maintainer expects slaying
+   to perform. It is still named when the target is also wrong, where it follows
+   from the wrong base. Absent evidence never blocks, and the landing brief states
+   the same split.
 4. **Multi-Repository Partitioning:** Multi-repo selections partition into
    independent per-repository `LandingTask` lanes.
 5. **Concurrent Execution:** Up to `BLUEFIN_REVIEW_CONCURRENT_LANDINGS`
