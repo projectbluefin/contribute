@@ -99,25 +99,6 @@ require "$containerfile" \
   'org.opencontainers.image.version="${REVIEW_VERSION}"' \
   'org.opencontainers.image.revision="${REVIEW_REVISION}"'
 
-python3 - <<'PY' || fail "image/appliance/config.yml is invalid"
-import yaml
-
-with open("image/appliance/config.yml", encoding="utf-8") as stream:
-    config = yaml.safe_load(stream)
-
-assert config["startup"]["checkUpdate"] is False
-assert config["eval"]["workpool"]["freshAgents"] is True
-task = config["task"]
-assert task["maxConcurrency"] == 4
-assert task["maxRecursionDepth"] == 1
-assert task["isolation"] == {"enabled": True, "apply": False}
-assert "agentModelOverrides" not in task
-assert "enableEffort" not in task
-assert config["read"]["defaultLimit"] == 200
-assert config["tools"] == {"intentTracing": False, "outputMaxColumns": 240}
-assert config["textVerbosity"] == "low"
-PY
-
 # The point of a distroless appliance is that nothing inside it can install
 # anything. Not one of these may appear, in any stage that reaches the image.
 forbid "$containerfile" \

@@ -1,6 +1,6 @@
 ---
 name: launcher
-version: "5.0"
+version: "5.1"
 last_updated: 2026-09-14
 id: launcher
 one_line_purpose: Change review just recipes without breaking the launch contract.
@@ -67,9 +67,14 @@ Kubernetes worker deployment.
   targets, or committed files.
 - Preserve `--userns keep-id` for the `0600` contributor registration.
 - The OMP appliance receives GitHub/provider credentials by inherited name.
+- Apptainer's contained environment receives only the explicit credential and
+  runtime allowlist through `APPTAINERENV_` variables. Keep `--no-eval` so
+  credential and argument values remain literal inside the container.
 - The contributor worker receives exactly one selected Hive registration.
-- Remote Podman staging remains contributor-only and deletes only its validated
-  private staging directory.
+- The checkout contributor recipe stages remote Podman registrations privately
+  and deletes only its validated staging directory. The packaged `bluefin`
+  launcher uses local Apptainer when Podman selects a remote engine; it never
+  sends client-side credential bind paths to that engine.
 
 ## Arguments
 

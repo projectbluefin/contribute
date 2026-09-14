@@ -105,11 +105,16 @@ jobs:
           # The appliance is the image named 'review'; the README teaches it.
           grep -Fq 'ghcr.io/projectbluefin/review:stable' README.md
 
-      - name: Build and execute contribute image
+      - name: Build and execute both images
         run: |
           set -euo pipefail
-          podman build --format oci -f image/appliance/Containerfile -t review:test .
+          review_version="$(bash scripts/review-appliance-version.sh)"
+          podman build --format oci \
+            --build-arg REVIEW_VERSION="$review_version" \
+            --build-arg REVIEW_REVISION="$GITHUB_SHA" \
+            -f image/appliance/Containerfile -t review:test .
           podman build --format oci -f image/contribute/Containerfile -t contribute:test .
+          bash tests/appliance-contract.sh --image review:test --expect-version "$review_version"
           bash tests/contribute-contract.sh --image contribute:test
 
       # Interactive launchers prefer KVM and fall back to Apptainer. CI builds

@@ -92,6 +92,9 @@ for case in "${test_cases[@]}"; do
   actual="${PARSED_REVIEW_ARGS[*]:-}"
   assert_eq "$actual" "$expected" "parse_review_args '$input'"
 done
+parse_review_args "--extension=/tmp/review extension"
+assert_eq "${#PARSED_REVIEW_ARGS[@]}" "1" "single argument with whitespace"
+assert_eq "${PARSED_REVIEW_ARGS[0]}" "--extension=/tmp/review extension" "literal extension path"
 
 # Verify standalone execution of parse-review-args.sh
 standalone_out="$("${repo_root}/scripts/parse-review-args.sh" projectbluefin/review#463 --issues | tr '\n' ' ' | sed 's/ $//')"
@@ -110,6 +113,10 @@ chmod 0666 "$kvm"
 cat >"$scratch/bin/podman" <<EOF
 #!/usr/bin/env bash
 [[ "\${1:-}" == info ]] && exit 0
+if [[ "\${1:-} \${2:-} \${3:-}" == "system connection list" ]]; then
+  [[ "\${FAKE_REMOTE_DEFAULT:-}" != 1 ]] || printf 'remote\tssh://engine.example.test/run/podman.sock\ttrue\n'
+  exit 0
+fi
 printf '%s\n' "\$*" >>"$mock_podman_log"
 [[ -z "\${FAKE_PODMAN_DELAY:-}" ]] || sleep "\$FAKE_PODMAN_DELAY"
 exit 0
@@ -123,6 +130,24 @@ mock_apptainer_log="$scratch/apptainer.log"
 cat >"$scratch/bin/apptainer" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$mock_apptainer_log"
+previous=""
+for arg in "\$@"; do
+  [[ "\$previous" != --home ]] || runtime_home="\${arg%%:*}"
+  if [[ "\$previous" == --pwd && "\$arg" == /home/bluefin/workspace ]]; then
+    [[ -d "\$runtime_home/workspace" ]] || exit 19
+  fi
+  previous="\$arg"
+done
+if [[ "\${EXPECT_APPTAINER_CREDENTIALS:-}" == 1 ]]; then
+  injected=()
+  for name in GH_TOKEN OPENAI_API_KEY; do
+    source_name="APPTAINERENV_\${name}"
+    [[ -v "\$source_name" ]] && injected+=("\$name=\${!source_name}")
+  done
+  env -i "\${injected[@]}" /bin/bash -c '
+    [[ "\$GH_TOKEN" == mock-token && "\$OPENAI_API_KEY" == test-provider-token ]]
+  ' || exit 19
+fi
 exit 0
 EOF
 chmod +x "$scratch/bin/apptainer"
@@ -141,6 +166,8 @@ chmod +x "$scratch/bin/gh"
 export PATH="$scratch/bin:$PATH"
 export HOME="$scratch/home"
 export REVIEW_TEST_KVM_DEVICE="$kvm"
+export GH_TOKEN=mock-token GITHUB_TOKEN=mock-token
+unset HIVE_HUB
 
 assert_bluefin_review() {
   local input="$1"
@@ -168,12 +195,19 @@ assert_bluefin_review() {
 
 mv "$scratch/bin/krun" "$scratch/krun"
 : >"$mock_apptainer_log"
-fallback_output="$(REVIEW_TEST_KVM_DEVICE="$scratch/missing-kvm" "${repo_root}/bin/bluefin" review projectbluefin/review 2>&1)" || fail "review Apptainer fallback failed"
+fallback_output="$(EXPECT_APPTAINER_CREDENTIALS=1 OPENAI_API_KEY=test-provider-token REVIEW_TEST_KVM_DEVICE="$scratch/missing-kvm" "${repo_root}/bin/bluefin" review projectbluefin/review 2>&1)" || fail "review Apptainer fallback lost credentials"
 [[ "$fallback_output" == *"using the isolated Apptainer fallback"* ]] || fail "review fallback warning is missing"
 fallback_call="$(cat "$mock_apptainer_log")"
 [[ "$fallback_call" == *"run --containall"* ]] || fail "review fallback did not use Apptainer containment"
 [[ "$fallback_call" == *"docker://ghcr.io/projectbluefin/review:stable --repo projectbluefin/review"* ]] || fail "review fallback used the wrong image or scope"
+[[ "$fallback_call" != *mock-token* && "$fallback_call" != *test-provider-token* ]] || fail "fallback leaked credentials into argv"
 mv "$scratch/krun" "$scratch/bin/krun"
+: >"$mock_podman_log"
+: >"$mock_apptainer_log"
+fallback_output="$(FAKE_REMOTE_DEFAULT=1 "${repo_root}/bin/bluefin" review projectbluefin/review 2>&1)" || fail "default remote connection fallback failed"
+[[ "$fallback_output" == *"remote Podman engines are unsupported"* ]] || fail "default remote engine was not diagnosed"
+[[ ! -s "$mock_podman_log" ]] || fail "packaged launcher sent host bind mounts to a remote engine"
+[[ -s "$mock_apptainer_log" ]] || fail "default remote connection did not use local fallback"
 
 : >"$mock_podman_log"
 FAKE_PODMAN_DELAY=0.1 "${repo_root}/bin/bluefin" review projectbluefin/review >/dev/null 2>&1 &
@@ -261,7 +295,7 @@ second_contribute_call="${concurrent_contribute_calls[1]}"
 
 mv "$scratch/bin/krun" "$scratch/krun"
 : >"$mock_apptainer_log"
-fallback_output="$("${repo_root}/bin/bluefin" contribute owner/repo 2>&1)" || fail "contributor Apptainer fallback failed"
+fallback_output="$(EXPECT_APPTAINER_CREDENTIALS=1 OPENAI_API_KEY=test-provider-token "${repo_root}/bin/bluefin" contribute owner/repo 2>&1)" || fail "contributor Apptainer fallback lost credentials"
 [[ "$fallback_output" == *"using the isolated Apptainer fallback"* ]] || fail "contributor fallback warning is missing"
 fallback_call="$(cat "$mock_apptainer_log")"
 [[ "$fallback_call" == *"run --containall"* ]] || fail "contributor fallback did not use Apptainer containment"

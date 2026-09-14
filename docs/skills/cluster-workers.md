@@ -1,6 +1,6 @@
 ---
 name: cluster-workers
-version: "2.0"
+version: "2.1"
 last_updated: 2026-09-14
 id: cluster-workers
 one_line_purpose: Scale OMP contributor workers across Kubernetes clusters.
@@ -40,7 +40,9 @@ just review-doctor                  # check cluster deployment health
 ## Architecture & Lifecycle
 
 1. **Namespace & Secret Sync:** `scale_contribute` ensures `bluefin-system`
-   exists and synchronizes `contribute-secret`.
+   exists and synchronizes `contribute-secret`. The deployment exposes the
+   selected Copilot, Anthropic, OpenAI, or Gemini credential to OMP through
+   optional secret-backed environment variables.
 2. **Plaintext Protection:** Token values enter `kubectl create secret`
    via process substitution file descriptors (`--from-file=KEY=<(...)`), preventing exposure in `ps` argv.
    Server-side apply is used and legacy annotations are stripped.

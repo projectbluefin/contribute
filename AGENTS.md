@@ -148,7 +148,7 @@ labels. Never add a local workaround for an accepted upstream gap. See
 - `justfile` is the only shipped launcher artifact. Its public recipes and
   private helpers intentionally live together; `just --list` is the list.
 - `image/appliance/` builds the distroless Bluefin Review appliance image
-  carrying OMP, Pi, GitHub CLI, shell, and the review extension.
+  carrying OMP, GitHub CLI, shell, and the review extension.
 - `image/extension/bluefin-review/` is the TypeScript OMP workbench extension,
   providing the queue, pipeline trace, companion agents, and tools.
 - `image/contribute/` builds the OMP-only Hive contributor image. Both

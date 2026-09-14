@@ -16,7 +16,7 @@
         "workers"
       ],
       "description": "Manages OMP contributor workers in bluefin-system and secret synchronization.",
-      "version": "2.0",
+      "version": "2.1",
       "last_updated": "2026-09-14",
       "doc_type": "procedure"
     },
@@ -133,7 +133,7 @@
         "hive"
       ],
       "description": "Maintains the OMP appliance and Hive contributor launcher recipes without crossing their credential or authority boundaries.",
-      "version": "5.0",
+      "version": "5.1",
       "last_updated": "2026-09-14",
       "doc_type": "runbook"
     },
@@ -210,7 +210,7 @@
         "workflowz"
       ],
       "description": "Maintains the OMP review workbench in image/extension/bluefin-review/. Use when editing review UI, queue projection, workflowz dispatch, or action seams.",
-      "version": "4.0",
+      "version": "4.1",
       "last_updated": "2026-09-14",
       "doc_type": "runbook"
     },

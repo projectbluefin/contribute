@@ -111,7 +111,7 @@ interface CtxLike {
 	getAsyncJobSnapshot?(): {
 		running: Array<{ id: string; status: string; startTime: number }>;
 		recent: Array<{ id: string; status: string; startTime: number }>;
-	};
+	} | null;
 }
 
 /** The slice of omp's `ExtensionAPI` this mode uses. */
@@ -207,15 +207,18 @@ export function actionPrompt(action: DashboardAction, priority?: Priority): stri
 	}
 
 	const item = selected[0]!;
+	const workflow = action.kind === "fix"
+		? "Use workflowz with one fresh isolated agent() handle for this item."
+		: "Use workflowz with one fresh workpool item for this item.";
 	switch (action.kind) {
 		case "review":
-			return `Review ${cite(item)}. Use hive_workbench_diff and hive_workbench_trace, then report findings by severity with file:line evidence. ${authority} ${finish}`;
+			return `Review ${cite(item)}. Use hive_workbench_diff and hive_workbench_trace, then report findings by severity with file:line evidence. ${workflow} ${authority} ${finish}`;
 		case "diff":
-			return `Call hive_workbench_diff for ${cite(item)} and summarize the changed files and concrete risks. ${authority} ${finish}`;
+			return `Call hive_workbench_diff for ${cite(item)} and summarize the changed files and concrete risks. ${workflow} ${authority} ${finish}`;
 		case "fix":
 			return item.type === "issue"
-				? `Implement ${cite(item)} in an isolated workspace. Diagnose the root cause, make the smallest complete change, run focused verification, and open a review-ready pull request whose body contains \`Closes ${item.repo}#${item.id}\`. ${authority} ${finish}`
-				: `Fix ${cite(item)} in an isolated workspace. Re-read the live diff and failing checks, diagnose each root cause, run focused verification, and push one clean commit for independent review. ${authority} ${finish}`;
+				? `Implement ${cite(item)} in an isolated workspace. Diagnose the root cause, make the smallest complete change, run focused verification, and open a review-ready pull request whose body contains \`Closes ${item.repo}#${item.id}\`. ${workflow} ${authority} ${finish}`
+				: `Fix ${cite(item)} in an isolated workspace. Re-read the live diff and failing checks, diagnose each root cause, run focused verification, and push one clean commit for independent review. ${workflow} ${authority} ${finish}`;
 	}
 }
 
@@ -497,6 +500,7 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			}
 			commentInFlight = true;
 			let commentPlan: CommentActionPlan | undefined;
+			const receipts: string[] = [];
 			try {
 				const body = await ctx.ui.editor("Comment on selected work", "");
 				if (body === undefined || !body.trim()) return;
@@ -530,20 +534,38 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 				if (!validation.valid) throw new Error(validation.errors.join("; "));
 				pi.appendEntry(COMMENT_ENTRY, { version: 1, state: "confirmed", plan: commentPlan } satisfies PersistedCommentResult);
 
-				const receipts: string[] = [];
 				for (const target of commentPlan.targets) {
+					if (receipts.length > 0) {
+						const current = await fetchItemsByKey(
+							[`${target.repo}#${target.number}`],
+							target.type === "pull_request" ? "prs" : "issues",
+							mode.tokenOptions(),
+						);
+						if (current.error) throw new Error(`live revalidation failed: ${current.error}`);
+						const validation = validateCommentActionPlan(
+							{ ...commentPlan, targets: [target] },
+							current.items.map((item) => ({
+								repo: item.repo,
+								number: item.id,
+								type: item.type === "pr" ? "pull_request" : "issue",
+								headSha: item.headSha,
+							})),
+						);
+						if (!validation.valid) throw new Error(validation.errors.join("; "));
+					}
 					const invocation = commentInvocation(target, commentPlan.body);
 					const result = await pi.exec(invocation.command, [...invocation.args], { timeout: 30_000 });
 					if (result.code !== 0 || result.killed) {
 						throw new Error(result.stderr.trim() || `gh comment exited ${result.code}`);
 					}
 					receipts.push(result.stdout.trim() || `${target.repo}#${target.number}`);
+					pi.appendEntry(COMMENT_ENTRY, { version: 1, state: "confirmed", plan: commentPlan, receipts: [...receipts] } satisfies PersistedCommentResult);
 				}
 				pi.appendEntry(COMMENT_ENTRY, { version: 1, state: "complete", plan: commentPlan, receipts } satisfies PersistedCommentResult);
 				ctx.ui.notify(`Posted ${receipts.length} GitHub-confirmed comment${receipts.length === 1 ? "" : "s"}`, "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				if (commentPlan) pi.appendEntry(COMMENT_ENTRY, { version: 1, state: "failed", plan: commentPlan, error: message } satisfies PersistedCommentResult);
+				if (commentPlan) pi.appendEntry(COMMENT_ENTRY, { version: 1, state: "failed", plan: commentPlan, receipts, error: message } satisfies PersistedCommentResult);
 				ctx.ui.notify(`Comment action stopped: ${message}`, "error");
 			} finally {
 				commentInFlight = false;
@@ -641,11 +663,12 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		const wave = activeBatch.waves[activeBatch.currentWave];
 		if (!wave) return;
 		const jobs = ctx.getAsyncJobSnapshot?.();
+		if (jobs?.running.some((job) => job.startTime >= activeBatch!.waveStartedAt)) return;
 		const recent = jobs?.recent.filter((job) => job.startTime >= activeBatch!.waveStartedAt) ?? [];
-		const failed = recent.filter((job) => job.status === "failed");
-		if (failed.length > 0 || (ctx.getAsyncJobSnapshot && recent.length === 0)) {
+		const failed = recent.filter((job) => job.status !== "completed");
+		if (failed.length > 0 || recent.length === 0) {
 			const error = failed.length > 0
-				? `${failed.length} workflowz job${failed.length === 1 ? "" : "s"} failed`
+				? `${failed.length} workflowz job${failed.length === 1 ? "" : "s"} failed or were cancelled`
 				: "workflowz produced no observable jobs for the repository wave";
 			persistBatch(ctx, { ...activeBatch, state: "blocked", error });
 			ctx.ui.notify(`Repository wave stopped: ${error}`, "error");
@@ -771,7 +794,8 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		if (ctxToUse) syncBatchProgress(ctxToUse);
 		repaint();
 	});
-	pi.on("agent_settled", async (_event, eventCtx) => {
+	pi.on("agent_end", async (event, eventCtx) => {
+		if (event && typeof event === "object" && "willContinue" in event && event.willContinue === true) return;
 		const ctxToUse = (eventCtx as CtxLike | undefined) ?? activeCtx;
 		if (ctxToUse) await advanceRepositoryBatch(ctxToUse);
 	});

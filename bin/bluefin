@@ -18,10 +18,30 @@ kvm_runtime_ready() {
   local device="${REVIEW_TEST_KVM_DEVICE:-/dev/kvm}"
   if ! command -v "$engine" >/dev/null 2>&1; then KVM_FAILURE="Podman is unavailable"; return 1; fi
   if ! "$engine" info >/dev/null 2>&1; then KVM_FAILURE="Podman is not reachable"; return 1; fi
-  if [[ "${CONTAINER_HOST:-}" != ssh://* && -z "${CONTAINER_CONNECTION:-}" ]]; then
-    if ! command -v krun >/dev/null 2>&1; then KVM_FAILURE="the krun OCI runtime is unavailable"; return 1; fi
-    if [[ ! -r "$device" || ! -w "$device" ]]; then KVM_FAILURE="${device} is not readable and writable"; return 1; fi
+  local selected="${CONTAINER_HOST:-}" connections name uri is_default
+  if [[ -z "$selected" ]]; then
+    connections="$("$engine" system connection list --format '{{.Name}}\t{{.URI}}\t{{.Default}}' 2>/dev/null)" || {
+      KVM_FAILURE="Podman connections could not be resolved"
+      return 1
+    }
+    while IFS=$'\t' read -r name uri is_default; do
+      if [[ -n "${CONTAINER_CONNECTION:-}" && "$name" == "$CONTAINER_CONNECTION" ]] ||
+        [[ -z "${CONTAINER_CONNECTION:-}" && "$is_default" == true ]]; then
+        selected="$uri"
+        break
+      fi
+    done <<<"$connections"
+    if [[ -n "${CONTAINER_CONNECTION:-}" && -z "$selected" ]]; then
+      KVM_FAILURE="the selected Podman connection could not be resolved"
+      return 1
+    fi
   fi
+  if [[ -n "$selected" && "$selected" != unix://* ]]; then
+    KVM_FAILURE="remote Podman engines are unsupported by the packaged launcher"
+    return 1
+  fi
+  if ! command -v krun >/dev/null 2>&1; then KVM_FAILURE="the krun OCI runtime is unavailable"; return 1; fi
+  if [[ ! -r "$device" || ! -w "$device" ]]; then KVM_FAILURE="${device} is not readable and writable"; return 1; fi
   return 0
 }
 
@@ -29,6 +49,14 @@ require_fallback() {
   command -v apptainer >/dev/null 2>&1 || fail "${KVM_FAILURE}; Apptainer fallback is unavailable. Install Apptainer or configure Podman with krun."
   echo "WARNING: ${KVM_FAILURE}; using the isolated Apptainer fallback without a KVM boundary." >&2
 }
+prepare_apptainer_environment() {
+  local name
+  for name in GH_TOKEN GITHUB_TOKEN COPILOT_GITHUB_TOKEN GITHUB_COPILOT_TOKEN ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN OPENAI_API_KEY GEMINI_API_KEY HIVE_HUB BLUEFIN_REVIEW_ORG TERM COLORTERM; do
+    [[ -v "$name" ]] && export "APPTAINERENV_${name}=${!name}"
+  done
+  return 0
+}
+
 
 slugify() {
   local value="$1" slug digest
@@ -152,7 +180,8 @@ run_review() {
   require_fallback
   local apptainer_image="$image"
   [[ "$apptainer_image" == *://* ]] || apptainer_image="docker://${apptainer_image}"
-  exec apptainer run --containall \
+  prepare_apptainer_environment
+  exec apptainer run --containall --no-eval \
     --home "${home}:/home/bluefin" \
     --pwd /workspace \
     --bind "${workspace}:/workspace" \
@@ -182,7 +211,7 @@ run_contribute() {
   home="${root}/home"
   name="bluefin-contribute-${key}-$(date +%s)-$$"
   image="${BLUEFIN_CONTRIBUTE_IMAGE:-ghcr.io/projectbluefin/contribute:stable}"
-  mkdir -p "$home"
+  mkdir -p "$home/workspace"
 
   if kvm_runtime_ready; then
     exec "$engine" run --runtime=krun --rm --interactive --tty \
@@ -203,7 +232,8 @@ run_contribute() {
   require_fallback
   local apptainer_image="$image"
   [[ "$apptainer_image" == *://* ]] || apptainer_image="docker://${apptainer_image}"
-  exec apptainer run --containall \
+  prepare_apptainer_environment
+  exec apptainer run --containall --no-eval \
     --home "${home}:/home/bluefin" \
     --pwd /home/bluefin/workspace \
     --bind "${registration}:/home/bluefin/.config/hive/contributor.env:ro" \

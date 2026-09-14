@@ -1,6 +1,6 @@
 ---
 name: review-dashboard
-version: "4.0"
+version: "4.1"
 last_updated: 2026-09-14
 id: review-dashboard
 one_line_purpose: Maintain the single-screen OMP review workbench.
@@ -72,11 +72,12 @@ palette and warm issue palette.
 
 ## Batch execution
 
-Preserve Hive order. Partition selected work by repository, then ask workflowz
-to execute one bounded workpool per repository. Never implement an extension-
-local worker pool, retry loop, task scheduler, or agent lifecycle. Later
-repository waves start only after the current repository settles. Pausing stops
-new waves; it does not pretend to suspend an agent already running.
+Preserve Hive order by partitioning contiguous repository runs; an interleaved
+repository returns in a later wave rather than jumping ahead. Ask workflowz to
+execute every wave, including a singleton. Never implement an extension-local
+worker pool, retry loop, task scheduler, or agent lifecycle. Advance on OMP's
+`agent_end` only when `willContinue` is false and the wave's jobs have settled.
+Pausing stops new waves; it does not pretend to suspend an agent already running.
 
 Persist batch intent, item identity, wave position, and terminal outcomes.
 Interrupted batches remain blocked after restart and require an explicit new

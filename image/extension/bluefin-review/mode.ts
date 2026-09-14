@@ -357,21 +357,18 @@ export class ReviewMode {
 	}
 
 	/**
-	 * Partition items into repository waves, preserving first repository occurrence
-	 * and original item order.
+	 * Partition items into contiguous repository waves without moving any item
+	 * ahead of work Hive ranked before it.
 	 */
 	repositoryWaves(items: readonly QueueItem[] = this.chosenItems()): RepositoryWave[] {
-		const waves: RepositoryWave[] = [];
-		const wavesByRepo = new Map<string, QueueItem[]>();
+		const waves: Array<{ repo: string; items: QueueItem[] }> = [];
 		for (const item of items) {
-			const existing = wavesByRepo.get(item.repo);
-			if (existing) {
-				existing.push(item);
+			const previous = waves.at(-1);
+			if (previous?.repo === item.repo) {
+				previous.items.push(item);
 				continue;
 			}
-			const waveItems = [item];
-			wavesByRepo.set(item.repo, waveItems);
-			waves.push({ repo: item.repo, items: waveItems });
+			waves.push({ repo: item.repo, items: [item] });
 		}
 		return waves;
 	}

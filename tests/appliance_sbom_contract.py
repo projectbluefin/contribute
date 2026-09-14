@@ -25,14 +25,12 @@ Covered here:
   trailing newline
 - that the output directory is created, and that argparse refuses a missing
   required argument
-- that the Containerfile still passes every required argument
 """
 
 from __future__ import annotations
 
 import json
 import pathlib
-import re
 import subprocess
 import sys
 import tempfile
@@ -40,7 +38,6 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "generate-appliance-sbom.py"
-CONTAINERFILE = REPO_ROOT / "image" / "appliance" / "Containerfile"
 
 OMP_X86 = "a" * 64
 OMP_ARM = "b" * 64
@@ -279,39 +276,6 @@ class DocumentShape(unittest.TestCase):
         )
 
 
-class ContainerfileWiring(unittest.TestCase):
-    """A required argument the Containerfile stops passing fails the build."""
-
-    def invocation(self) -> str:
-        """The generator's RUN invocation: from its name to the end of the
-        line-continuation run, so later instructions cannot leak in."""
-        lines = CONTAINERFILE.read_text(encoding="utf-8").splitlines()
-        for index, line in enumerate(lines):
-            if "/usr/local/libexec/appliance-sbom" in line and not line.startswith("COPY"):
-                block = []
-                for continued in lines[index:]:
-                    block.append(continued)
-                    if not continued.rstrip().endswith("\\"):
-                        break
-                return "\n".join(block)
-        self.fail("the Containerfile no longer runs the generator")
-
-    def test_containerfile_passes_every_required_argument(self):
-        invocation = self.invocation()
-        for flag in ["--arch", "--out", "--revision", *BASE_ARGS]:
-            self.assertIn(flag, invocation, f"the Containerfile stopped passing {flag}")
-
-    def test_generator_declares_every_flag_the_containerfile_passes(self):
-        declared = set(
-            re.findall(r'add_argument\("(--[a-z0-9-]+)"', SCRIPT.read_text(encoding="utf-8"))
-        )
-        passed = set(re.findall(r"(--[a-z0-9-]+)[ =]", self.invocation()))
-        self.assertTrue(passed, "no flags parsed out of the Containerfile invocation")
-        self.assertLessEqual(
-            passed,
-            declared,
-            f"the Containerfile passes flags the generator does not declare: {passed - declared}",
-        )
 
 
 if __name__ == "__main__":

@@ -59,6 +59,9 @@ export function createCommentActionPlan(
 		if (target.type !== "pull_request" && target.type !== "issue") {
 			throw new Error(`Invalid target type: ${(target as CommentTargetSnapshot).type}`);
 		}
+		if (target.type === "pull_request" && !target.headSha?.trim()) {
+			throw new Error(`Missing pull request head for ${target.repo}#${target.number}`);
+		}
 		const key = `${target.repo}#${target.number}`;
 		if (seen.has(key)) {
 			throw new Error(`Duplicate comment target: ${key}`);
@@ -124,7 +127,10 @@ export function validateCommentActionPlan(
 				`Type mismatch for ${key}: plan expected ${target.type}, live target is ${live.type}`,
 			);
 		}
-		if (target.type === "pull_request" && target.headSha) {
+		if (target.type === "pull_request") {
+			if (!target.headSha?.trim()) {
+				errors.push(`No plan head for ${key}; cannot revalidate pull request`);
+			}
 			if (!live.headSha) {
 				errors.push(`No live head for ${key}; cannot revalidate plan snapshot ${target.headSha}`);
 			} else if (target.headSha !== live.headSha) {

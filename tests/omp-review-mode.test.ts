@@ -947,7 +947,7 @@ test("workbench Tab switches entity mode and Alt+B selects one repository group"
 	assert.match(dashboard.render(120).join("\n"), /HIVE WORKBENCH/);
 });
 
-test("repository waves preserve Hive order and pause survives session persistence", () => {
+test("repository waves preserve interleaved Hive order and pause survives session persistence", () => {
 	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.items = [
 		queueItem({ id: 1, repo: "projectbluefin/a" }),
@@ -958,7 +958,7 @@ test("repository waves preserve Hive order and pause survives session persistenc
 	for (const item of mode.items) mode.selectedKeys.add(`${item.repo}#${item.id}`);
 	assert.deepEqual(
 		mode.repositoryWaves().map((wave) => [wave.repo, wave.items.map((item) => item.id)]),
-		[["projectbluefin/a", [1, 2]], ["projectbluefin/b", [3]]],
+		[["projectbluefin/a", [1]], ["projectbluefin/b", [3]], ["projectbluefin/a", [2]]],
 	);
 	assert.equal(mode.togglePaused(), true);
 	const persisted = mode.toPersisted();
@@ -987,6 +987,14 @@ test("comment plans bind ordered targets and fail closed on live drift", () => {
 		args: ["issue", "comment", "43", "--repo", "projectbluefin/review", "--body", "Evidence-backed comment"],
 	});
 	assert.throws(() => createCommentActionPlan(targets, "   "), /comment body/i);
+});
+
+test("comment plans reject pull requests without a preview head", () => {
+	const target = { repo: "projectbluefin/review", number: 42, type: "pull_request" as const };
+	assert.throws(() => createCommentActionPlan([target], "Review evidence"), /Missing pull request head/);
+	const plan = createCommentActionPlan([{ ...target, headSha: "a".repeat(40) }], "Review evidence");
+	assert.equal(validateCommentActionPlan(plan, [target]).valid, false);
+	assert.equal(validateCommentActionPlan({ ...plan, targets: [target] }, [target]).valid, false);
 });
 test("dashboard supports multi-selection with space, x to clear, and batch action dispatch", (t) => {
 	const root = mkdtempSync(join(tmpdir(), "workbench-test-"));
@@ -1457,13 +1465,47 @@ test("comment action previews once, revalidates live state, executes argv, and p
 		command: "gh",
 		args: ["pr", "comment", "42", "--repo", "projectbluefin/review", "--body", "Evidence-backed comment"],
 	}]);
-	assert.deepEqual(
-		pi.entries.filter((entry) => entry.customType === COMMENT_ENTRY).map((entry) => entry.data.state),
-		["previewed", "confirmed", "complete"],
-	);
+	const receipt = pi.entries.filter((entry) => entry.customType === COMMENT_ENTRY).at(-1).data;
+	assert.equal(receipt.state, "complete");
+	assert.deepEqual(receipt.receipts, [pi.execResult.stdout.trim()]);
 });
 
-test("repository waves run in Hive order, pause between repositories, and recover progress", async () => {
+test("comment batches revalidate later heads and retain partial receipts", async () => {
+	const items = [
+		{ id: 42, repo: "projectbluefin/review", title: "first target", headSha: "a".repeat(40) },
+		{ id: 43, repo: "projectbluefin/review", title: "later target", headSha: "b".repeat(40) },
+	];
+	const pi = fakeHost();
+	const execute = pi.exec.bind(pi);
+	pi.exec = async (command, args) => {
+		const result = await execute(command, args);
+		items[1].headSha = "c".repeat(40);
+		return result;
+	};
+	const ctx = fakeCtx();
+	ctx.editorResponses.push("Review evidence");
+	const review = createReviewExtension(pi, {
+		org: "projectbluefin",
+		fetchImpl: (url, init) => hiveBackedFetch(items)(url, init),
+		env: { ...ISOLATED_ENV, HIVE_HUB: "wss://hive.example/contribute" },
+	});
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+	ctx.overlays[0].handleInput("A");
+	ctx.overlays[0].handleInput("c");
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	await promise;
+
+	assert.equal(pi.execCalls.length, 1, "a changed second head must not receive the stale comment");
+	assert.equal(pi.execCalls[0].args[2], "42");
+	const receipt = pi.entries.filter((entry) => entry.customType === COMMENT_ENTRY).at(-1).data;
+	assert.equal(receipt.state, "failed");
+	assert.match(receipt.error, /PR head changed/);
+	assert.deepEqual(receipt.receipts, [pi.execResult.stdout.trim()]);
+});
+
+test("pinned OMP agent_end advances repository waves only after final settlement", async () => {
 	const items = [
 		{ id: 1, repo: "projectbluefin/a", title: "a one", headSha: "1".repeat(40) },
 		{ id: 2, repo: "projectbluefin/a", title: "a two", headSha: "2".repeat(40) },
@@ -1490,9 +1532,17 @@ test("repository waves run in Hive order, pause between repositories, and recove
 	assert.match(pi.messages[0], /projectbluefin\/a/);
 	assert.doesNotMatch(pi.messages[0], /projectbluefin\/b/);
 
+	ctx.asyncJobs.recent = [{ id: "hive-wave", status: "completed", startTime: Date.now() + 1 }];
+	await pi.events.get("agent_end")({ willContinue: true }, ctx);
+	assert.equal(pi.messages.length, 1, "an OMP continuation must not admit another repository");
+	ctx.asyncJobs.running = [{ id: "still-running", status: "running", startTime: Date.now() + 1 }];
+	await pi.events.get("agent_end")({}, ctx);
+	assert.equal(pi.messages.length, 1, "unfinished workers must settle before another repository starts");
+	ctx.asyncJobs.running = [];
+
 	dashboard.handleInput("p");
 	ctx.asyncJobs.recent = [{ id: "hive-wave", status: "completed", startTime: Date.now() + 1 }];
-	await pi.events.get("agent_settled")({}, ctx);
+	await pi.events.get("agent_end")({}, ctx);
 	assert.equal(pi.messages.length, 1, "pause prevents the next repository from starting");
 	dashboard.handleInput("p");
 	await new Promise((resolve) => setImmediate(resolve));
@@ -1501,7 +1551,7 @@ test("repository waves run in Hive order, pause between repositories, and recove
 	assert.doesNotMatch(pi.messages[1], /projectbluefin\/a/);
 
 	ctx.asyncJobs.recent = [{ id: "hive-wave-2", status: "completed", startTime: Date.now() + 1 }];
-	await pi.events.get("agent_settled")({}, ctx);
+	await pi.events.get("agent_end")({}, ctx);
 	const batches = pi.entries.filter((entry) => entry.customType === BATCH_ENTRY).map((entry) => entry.data);
 	assert.equal(batches.at(-1).state, "complete");
 	assert.equal(batches.at(-1).completedItems, 3);
@@ -1531,7 +1581,7 @@ test("a failed workflowz job blocks later repository waves", async () => {
 	dashboard.handleInput("b");
 	await new Promise((resolve) => setImmediate(resolve));
 	ctx.asyncJobs.recent = [{ id: "failed-worker", status: "failed", startTime: Date.now() + 1 }];
-	await pi.events.get("agent_settled")({}, ctx);
+	await pi.events.get("agent_end")({}, ctx);
 
 	assert.equal(pi.messages.length, 1, "a failed wave never advances to the next repository");
 	const batch = pi.entries.filter((entry) => entry.customType === BATCH_ENTRY).at(-1).data;

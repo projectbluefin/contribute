@@ -107,27 +107,11 @@ Its FSDK closure contains only the tools required by OMP and Hive's interactive
 relay. The generic upstream helper files needed by that relay are implementation
 dependencies, not alternate agent surfaces. No dashboard, review extension,
 scheduler, Codex, Pi, or provider state belongs in the image.
-The human Maintainer Reviewer is the decision point. A Factory Worker,
-Managed Reviewer Client, Portable Reviewer Prompt, Review Evidence view, or
-Bluefin PR Queue must never claim approval, queue-management, or
-task-selection authority. The merge decision is the human's: the Managed
-Reviewer
-Client's merge keys exist to execute the human's typed, per-number-confirmed
-decision, nothing more. That decision has two shapes, and the distinction is
-the point. Queueing applies `lgtm`, which is an explicit opt-in to automation:
-it hands the pull request to Hive's governor sweep, which re-verifies and
-merges on green CI. Merging directly performs the same squash immediately,
-without arming anything. `lgtm` is therefore a choice to automate, never a
-toll a maintainer must pay to land a change. The direct path is a maintainer
-power — gated on GitHub's `push` permission, read from GitHub per repository
-rather than assumed — and it never overrides branch protection, so a
-repository that requires review or green checks still refuses.
-
-Recording a verdict is a third, smaller thing, and it is neither of those: a
-Maintainer Reviewer may leave an ordinary GitHub review — approve, request
-changes, or comment — which merges nothing and arms nothing. A review that can
-only be given by also queueing or merging is not a review, and the verdict a
-reviewer most needs to give is the one that says no.
+The human Maintainer Reviewer owns approval, queueing, and merge decisions.
+The workbench previews and confirms comments against a freshly revalidated
+target, and dispatches reviews or fixes through OMP. It has no approval,
+`lgtm` queueing, or merge control; dispatched agents must not approve or merge.
+A clean review is evidence for the maintainer, never permission to land.
 
 The pinned FSDK base owns the contributor toolchain. `review` consumes the
 tools the image ships and does not reimplement them: a missing utility is

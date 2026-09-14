@@ -16,13 +16,8 @@
 set -euo pipefail
 
 parse_review_args() {
-  local -a in_args
+  local -a in_args=("$@")
   local -a out_args=()
-  if [[ $# -eq 1 && "$1" == *" "* ]]; then
-    read -r -a in_args <<<"$1"
-  else
-    in_args=("$@")
-  fi
   local i=0
   local len=${#in_args[@]}
 

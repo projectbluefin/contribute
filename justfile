@@ -86,7 +86,10 @@ kvm_runtime_ready() {
   local device="${REVIEW_TEST_KVM_DEVICE:-/dev/kvm}"
   command -v podman &>/dev/null || { KVM_FAILURE="Podman is unavailable"; return 1; }
   podman info &>/dev/null || { KVM_FAILURE="Podman is not reachable"; return 1; }
-  if [[ "${CONTAINER_HOST:-}" != ssh://* && -z "${CONTAINER_CONNECTION:-}" ]]; then
+  local selected uri
+  selected="$(podman_selected_connection)" || { KVM_FAILURE="Podman connections could not be resolved"; return 1; }
+  IFS=$'\t' read -r uri _ <<<"$selected"
+  if [[ -z "$uri" || "$uri" == unix://* ]]; then
     command -v krun &>/dev/null || { KVM_FAILURE="the krun OCI runtime is unavailable"; return 1; }
     kvm_device_ready || { KVM_FAILURE="${device} is not readable and writable"; return 1; }
   fi
@@ -95,6 +98,13 @@ kvm_runtime_ready() {
 require_apptainer_fallback() {
   command -v apptainer &>/dev/null || { echo "ERROR: ${KVM_FAILURE}; Apptainer fallback is unavailable. Install Apptainer or configure Podman with krun." >&2; return 1; }
   echo "WARNING: ${KVM_FAILURE}; using the isolated Apptainer fallback without a KVM boundary." >&2
+}
+prepare_apptainer_environment() {
+  local name
+  for name in GH_TOKEN GITHUB_TOKEN COPILOT_GITHUB_TOKEN GITHUB_COPILOT_TOKEN ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN OPENAI_API_KEY GEMINI_API_KEY HIVE_HUB BLUEFIN_REVIEW_ORG TERM COLORTERM; do
+    [[ -v "$name" ]] && export "APPTAINERENV_${name}=${!name}"
+  done
+  return 0
 }
 instance_key() {
   local value="$1" slug digest
@@ -554,7 +564,7 @@ scale_contribute() {
   kubectl create secret generic contribute-secret -n bluefin-system \
     --from-file=contributor.env="${HIVE_CONTRIBUTOR_ENV}" \
     --from-file=GH_TOKEN=<(printf '%s' "$GH_TOKEN_VALUE") \
-    --from-file=GITHUB_COPILOT_TOKEN=<(printf '%s' "${GITHUB_COPILOT_TOKEN:-}") \
+    --from-file=GITHUB_COPILOT_TOKEN=<(printf '%s' "${GITHUB_COPILOT_TOKEN:-${COPILOT_GITHUB_TOKEN:-}}") \
     --from-file=ANTHROPIC_API_KEY=<(printf '%s' "${ANTHROPIC_API_KEY:-}") \
     --from-file=ANTHROPIC_OAUTH_TOKEN=<(printf '%s' "${ANTHROPIC_OAUTH_TOKEN:-}") \
     --from-file=OPENAI_API_KEY=<(printf '%s' "${OPENAI_API_KEY:-}") \
@@ -589,8 +599,8 @@ contribute mode="" count="":
     #!/usr/bin/env bash
     set -euo pipefail
     {{shared_functions}}
-    if [[ "{{mode}}" == cluster ]]; then
-      replicas="{{count}}"; replicas="${replicas:-2}"
+    if [[ {{quote(mode)}} == cluster ]]; then
+      replicas={{quote(count)}}; replicas="${replicas:-2}"
       [[ "$replicas" =~ ^[0-9]+$ ]] || { echo "ERROR: contribute cluster expects a replica count." >&2; exit 1; }
       STATE_DIR="${HOME}/.local/state/review"; HIVE_SRC_DIR="${STATE_DIR}/hive-src"; HIVE_REPO_URL="{{hive_repo_url}}"
       HIVE_COMMIT="${REVIEW_HIVE_COMMIT:-{{hive_commit}}}"; HIVE_COMMIT="${HIVE_COMMIT,,}"; mkdir -p "$STATE_DIR"
@@ -598,8 +608,8 @@ contribute mode="" count="":
       scale_contribute "$replicas"
       exit $?
     fi
-    [[ -z "{{count}}" ]] || { echo "ERROR: contribute accepts one instance name outside cluster mode." >&2; exit 1; }
-    INSTANCE_HINT="{{mode}}"
+    [[ -z {{quote(count)}} ]] || { echo "ERROR: contribute accepts one instance name outside cluster mode." >&2; exit 1; }
+    INSTANCE_HINT={{quote(mode)}}
     if [[ -n "$INSTANCE_HINT" ]]; then
       [[ "$INSTANCE_HINT" =~ ^[a-zA-Z0-9._-]+(/[a-zA-Z0-9._-]+)?$ ]] || { echo "ERROR: invalid contributor instance '${INSTANCE_HINT}'." >&2; exit 1; }
       export REVIEW_HIVE="${REVIEW_HIVE:-${INSTANCE_HINT//\//-}}"
@@ -618,7 +628,7 @@ contribute mode="" count="":
     INSTANCE_KEY="$(instance_key "${BLUEFIN_INSTANCE:-contribute-${INSTANCE_HINT:-${HIVE_REGISTRATION_NAME:-default}}}")"
     INSTANCE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/bluefin/instances/${INSTANCE_KEY}"
     INSTANCE_HOME="${INSTANCE_ROOT}/home"
-    mkdir -p "$INSTANCE_HOME"
+    mkdir -p "$INSTANCE_HOME/workspace"
     CONTAINER_NAME="bluefin-contribute-${INSTANCE_KEY}-$(date +%s)-$$"
     CONTRIBUTOR_VOLUME="${BLUEFIN_CONTRIBUTE_VOLUME:-bluefin-contribute-${INSTANCE_KEY}-home}"
     CONTRIBUTOR_IMAGE="{{contribute_image}}"
@@ -647,7 +657,8 @@ contribute mode="" count="":
     [[ "$CONTRIBUTOR_IMAGE" != localhost/* ]] || { echo "ERROR: Apptainer cannot resolve local Podman image ${CONTRIBUTOR_IMAGE}." >&2; exit 1; }
     APPTAINER_IMAGE="$CONTRIBUTOR_IMAGE"; [[ "$APPTAINER_IMAGE" == *://* ]] || APPTAINER_IMAGE="docker://${APPTAINER_IMAGE}"
     echo "✓ starting isolated Apptainer contributor ${INSTANCE_KEY}. Choose model and effort in OMP."
-    exec apptainer run --containall --home "${INSTANCE_HOME}:/home/bluefin" --pwd /home/bluefin/workspace \
+    prepare_apptainer_environment
+    exec apptainer run --containall --no-eval --home "${INSTANCE_HOME}:/home/bluefin" --pwd /home/bluefin/workspace \
       --bind "${HIVE_CONTRIBUTOR_ENV}:/home/bluefin/.config/hive/contributor.env:ro" "$APPTAINER_IMAGE"
 
 # Stop cluster contributor workers. Local appliances belong to their foreground
@@ -663,13 +674,13 @@ review-stop target="cluster":
 # Maintainer convenience name for the OMP appliance. Keep this as delegation,
 # not a second launch path: review-queue and review-appliance must execute the
 # same image, entrypoint, configuration, and workbench.
-[doc("Open the OMP review workbench.")]
-review-queue *queue_args: (review-appliance queue_args)
+alias review-queue := review-appliance
 
 # The review appliance prefers one foreground libkrun microVM per invocation.
 # Target-specific state and workspace directories also keep the Apptainer
 # fallback independent when KVM is unavailable.
 [doc("Run the distroless Bluefin Review appliance container.")]
+[positional-arguments]
 review-appliance *appliance_args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -688,7 +699,7 @@ review-appliance *appliance_args:
     fi
 
     source scripts/parse-review-args.sh
-    parse_review_args {{quote(appliance_args)}}
+    parse_review_args "$@"
     APPLIANCE_ARGS=("${PARSED_REVIEW_ARGS[@]}")
     SCOPE=projectbluefin
     PREVIOUS=""
@@ -707,8 +718,8 @@ review-appliance *appliance_args:
       ARGS=(run --runtime=krun --rm --interactive --tty --name "$CONTAINER_NAME")
       ARGS+=(--userns "keep-id:uid=65532,gid=65532")
       ARGS+=(
-        --volume "${INSTANCE_HOME}:/home/bluefin:rw,z"
-        --volume "${INSTANCE_WORKSPACE}:/workspace:rw,z"
+        --volume "bluefin-review-${INSTANCE_KEY}-home:/home/bluefin:rw"
+        --volume "bluefin-review-${INSTANCE_KEY}-workspace:/workspace:rw"
         --env GH_TOKEN --env GITHUB_TOKEN --env COPILOT_GITHUB_TOKEN --env GITHUB_COPILOT_TOKEN
         --env ANTHROPIC_API_KEY --env ANTHROPIC_OAUTH_TOKEN --env OPENAI_API_KEY --env GEMINI_API_KEY
         --env HIVE_HUB --env BLUEFIN_REVIEW_ORG
@@ -720,7 +731,8 @@ review-appliance *appliance_args:
     require_apptainer_fallback
     [[ "$IMAGE" != localhost/* ]] || { echo "ERROR: Apptainer cannot resolve local Podman image ${IMAGE}." >&2; exit 1; }
     APPTAINER_IMAGE="$IMAGE"; [[ "$APPTAINER_IMAGE" == *://* ]] || APPTAINER_IMAGE="docker://${APPTAINER_IMAGE}"
-    exec apptainer run --containall --home "${INSTANCE_HOME}:/home/bluefin" --pwd /workspace \
+    prepare_apptainer_environment
+    exec apptainer run --containall --no-eval --home "${INSTANCE_HOME}:/home/bluefin" --pwd /workspace \
       --bind "${INSTANCE_WORKSPACE}:/workspace" "$APPTAINER_IMAGE" ${APPLIANCE_ARGS[@]+"${APPLIANCE_ARGS[@]}"}
 
 # Build the appliance from this checkout and hold it to its contract. The
