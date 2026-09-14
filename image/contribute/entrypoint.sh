@@ -33,7 +33,6 @@ fi
 
 agent_pid=
 attach_pid=
-status_pid=
 # Podman/Apptainer send SIGTERM and wait before SIGKILL, so teardown has to be
 # BOUNDED: an unbounded wait on a stuck agent stalls until that deadline and
 # dies by SIGKILL, which is the "Ctrl-C stops it" promise failing in the only
@@ -56,9 +55,6 @@ cleanup() {
   # A second signal during teardown would re-enter this handler and restart
   # the escalation, stretching a bounded teardown past the runtime's deadline.
   trap '' HUP INT TERM
-  if [ -n "$status_pid" ] && kill -0 "$status_pid" 2>/dev/null; then
-    kill "$status_pid" 2>/dev/null || true
-  fi
   if [ -n "$attach_pid" ] && kill -0 "$attach_pid" 2>/dev/null; then
     kill "$attach_pid" 2>/dev/null || true
   fi
@@ -96,88 +92,6 @@ while ! tmux has-session -t contributor 2>/dev/null; do
   fi
   sleep 0.1
 done
-
-# Lower third live status updater (blue styling: tracks Hive governor, issue/PR counts, and task state)
-(
-  update_status() {
-    # shellcheck disable=SC2016
-    node -e '
-const fs = require("fs");
-const https = require("https");
-const http = require("http");
-
-let token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
-let hub = process.env.HIVE_HUB || "";
-let taskFile = process.env.HIVE_TASK_FILE || "/tmp/contributor-task.json";
-
-let activeTaskStr = "";
-let activeTaskTitle = "";
-if (fs.existsSync(taskFile)) {
-  try {
-    const t = JSON.parse(fs.readFileSync(taskFile, "utf8"));
-    if (t && (t.number || t.title)) {
-      const repo = t.repo ? t.repo.split("/").pop() : "";
-      const kind = t.kind === "pull_request" ? "PR" : (t.kind ? t.kind.toUpperCase() : "TASK");
-      activeTaskStr = `#[fg=#60a5fa]Task: #[bold,fg=#ffffff]${kind} #${t.number}#[nobold,fg=#93c5fd] (${repo}) #[fg=#3b82f6]| `;
-      activeTaskTitle = `${kind} #${t.number} (${repo})${t.title ? " " + String(t.title).replace(/["`$\\]/g, "") : ""}`;
-    }
-  } catch (_) {}
-}
-
-let statusUrl = "";
-if (hub) {
-  const clean = hub.replace(/^wss:\/\//, "https://").replace(/^ws:\/\//, "http://").replace(/\/contribute$/, "");
-  statusUrl = `${clean}/api/status`;
-}
-
-if (!statusUrl) {
-  process.exit(0);
-}
-
-const reqMod = statusUrl.startsWith("https") ? https : http;
-const headers = token ? { "Authorization": `Bearer ${token}` } : {};
-
-const req = reqMod.get(statusUrl, { headers, timeout: 5000 }, (res) => {
-  let body = "";
-  res.on("data", (chunk) => body += chunk);
-  res.on("end", () => {
-    try {
-      const data = JSON.parse(body);
-      const gov = data.governor || {};
-      const mode = (gov.mode || "active").toUpperCase();
-      const issues = gov.issues !== undefined ? gov.issues : "-";
-      const prs = gov.prs !== undefined ? gov.prs : "-";
-      const agents = data.agents || [];
-      const busyCount = agents.filter(a => a.busy).length;
-      const pool = data.contributorPool || {};
-      const workers = pool.active !== undefined ? `${pool.active}/${pool.registered || 0}` : "";
-
-      const left = `#[bg=#1d4ed8,fg=#ffffff,bold] 🦖 BLUEFIN #[bg=#2563eb,fg=#ffffff,nobold] contribute #[bg=#1e40af,fg=#bfdbfe] 🐝 ${mode} #[default] `;
-      let right = `${activeTaskStr}#[fg=#93c5fd]Issues: #[bold,fg=#ffffff]${issues}#[nobold,fg=#93c5fd] #[fg=#3b82f6]| #[fg=#93c5fd]PRs: #[bold,fg=#ffffff]${prs}#[nobold,fg=#93c5fd]`;
-      if (workers) {
-        right += ` #[fg=#3b82f6]| #[fg=#93c5fd]Workers: #[bold,fg=#ffffff]${workers}#[nobold,fg=#93c5fd]`;
-        const reviewers = `${pool.active !== undefined ? pool.active : 0}/${pool.registered || 0}`;
-        right += ` #[fg=#3b82f6]| #[fg=#93c5fd]Reviewers: #[bold,fg=#ffffff]${reviewers}#[nobold,fg=#93c5fd]`;
-      }
-      right += ` #[fg=#3b82f6]| #[fg=#bfdbfe]%H:%M #[default]`;
-
-      const { execSync } = require("child_process");
-      const termTitle = activeTaskTitle ? `contribute · ${activeTaskTitle}` : "contribute · idle";
-      execSync(`tmux set-option -t contributor status on && tmux set-option -t contributor status-style "bg=#1e293b,fg=#93c5fd" && tmux set-option -t contributor status-left-length 70 && tmux set-option -t contributor status-left "${left}" && tmux set-option -t contributor status-right-length 140 && tmux set-option -t contributor status-right "${right}" && tmux set-option -t contributor set-titles on && tmux set-option -t contributor set-titles-string "${termTitle}"`, { stdio: "ignore" });
-    } catch (_) {}
-  });
-});
-req.on("error", () => {});
-req.on("timeout", () => req.destroy());
-' 2>/dev/null || true
-  }
-
-  while tmux has-session -t contributor 2>/dev/null; do
-    update_status
-    sleep 10
-  done
-) &
-status_pid=$!
 
 # Attach only when there is a terminal. Without this an unattended run would
 # fail on `tmux attach`, which refuses to run without a tty.

@@ -3,3 +3,26 @@
 # in-place update that cannot survive appliance replacement.
 startup:
   checkUpdate: false
+
+eval:
+  workpool:
+    freshAgents: true
+
+task:
+  maxConcurrency: 4
+  maxRecursionDepth: 1
+  maxRuntimeMs: 3600000
+  softRequestBudget: 90
+  agentIdleTtlMs: 300000
+  isolation:
+    enabled: true
+    apply: false
+
+read:
+  defaultLimit: 200
+
+tools:
+  intentTracing: false
+  outputMaxColumns: 240
+
+textVerbosity: low

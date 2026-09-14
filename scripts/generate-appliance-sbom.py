@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Write the SPDX manifest for the review appliance's fetched components.
 
-Everything in the appliance arrives as a release archive: the omp binary, the
-node runtime, the pi npm tarball, and the GitHub CLI. syft only inventories
-package-manager metadata, so without this document the attested SBOM of
-``projectbluefin/review`` would describe an image whose four load-bearing
-components are invisible.
+The appliance fetches the omp binary and GitHub CLI directly. syft only
+inventories package-manager metadata, so without this document those two
+load-bearing components would be invisible.
 
 This runs inside the build, where every pin is a resolved build argument, and
 writes SPDX 2.3 JSON to ``/usr/share/bluefin/review/sbom.spdx.json``. The publish
@@ -13,10 +11,8 @@ workflow's syft run ingests it through the sbom-cataloger, so each component
 reaches the attestation with its pinned version, its versioned download URL, and
 the SHA-256 the build actually verified before executing it.
 
-It deliberately shares no code with ``generate-sbom-manifest.py``: each script is
-copied alone into a build stage, and a common module would have to be threaded
-through two ``.dockerignore`` allowlists and two ``COPY`` lines to save a page of
-SPDX boilerplate.
+This generator is intentionally self-contained because it is copied alone into
+the image build stage.
 """
 
 from __future__ import annotations
@@ -32,7 +28,6 @@ SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
 # Each publisher names architectures differently in its release assets.
 OMP_ARCH = {"x86_64": "linux-x64", "aarch64": "linux-arm64"}
-NODE_ARCH = {"x86_64": "x64", "aarch64": "arm64"}
 GH_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}
 
 
@@ -89,12 +84,9 @@ def per_arch(args: argparse.Namespace, prefix: str, arch: str) -> str:
 
 def build_packages(args: argparse.Namespace, arch: str) -> list[dict]:
     omp_version = require_non_empty(args.omp_version, "omp version")
-    pi_version = require_non_empty(args.pi_version, "pi version")
-    node_version = require_non_empty(args.node_version, "node version")
     gh_version = require_non_empty(args.gh_version, "gh version")
 
     omp_sha = per_arch(args, "omp_sha256", arch)
-    node_sha = per_arch(args, "node_sha256", arch)
     gh_sha = per_arch(args, "gh_sha256", arch)
 
     return [
@@ -109,27 +101,6 @@ def build_packages(args: argparse.Namespace, arch: str) -> list[dict]:
             " verified against the release SHA256SUMS before the file is made"
             " executable. Installed to /usr/bin/omp.",
             omp_sha,
-        ),
-        package(
-            "@earendil-works/pi-coding-agent",
-            pi_version,
-            "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/"
-            f"pi-coding-agent-{pi_version}.tgz",
-            f"pkg:npm/%40earendil-works/pi-coding-agent@{pi_version}",
-            "The pi coding agent CLI, installed from the npm registry with"
-            " lifecycle scripts disabled and development dependencies omitted."
-            " Runs on the node below; exposed as /usr/bin/pi.",
-        ),
-        package(
-            "node",
-            node_version,
-            f"https://nodejs.org/dist/v{node_version}/node-v{node_version}-linux-{NODE_ARCH[arch]}.tar.xz",
-            f"pkg:generic/node@{node_version}",
-            "Node.js runtime. Present only to execute pi: omp embeds its own"
-            " runtime and does not use it. Only the interpreter is kept, without"
-            " npm, headers, or the rest of the distribution."
-            " Installed to /usr/bin/node.",
-            node_sha,
         ),
         package(
             "gh",
@@ -163,10 +134,6 @@ def main() -> int:
     parser.add_argument("--omp-version", required=True)
     parser.add_argument("--omp-sha256-x86-64", required=True)
     parser.add_argument("--omp-sha256-aarch64", required=True)
-    parser.add_argument("--pi-version", required=True)
-    parser.add_argument("--node-version", required=True)
-    parser.add_argument("--node-sha256-x86-64", required=True)
-    parser.add_argument("--node-sha256-aarch64", required=True)
     parser.add_argument("--gh-version", required=True)
     parser.add_argument("--gh-sha256-x86-64", required=True)
     parser.add_argument("--gh-sha256-aarch64", required=True)

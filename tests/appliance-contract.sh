@@ -21,9 +21,8 @@ containerfile="image/appliance/Containerfile"
 image=""
 expect_arch=""
 expect_version=""
-# An image that has grown past this is carrying something nobody chose: the
-# first draft shipped 284 MiB of esbuild binaries for platforms it cannot run.
-size_ceiling_bytes=$((700 * 1024 * 1024))
+# The appliance carries OMP and review tools, not an alternate agent runtime.
+size_ceiling_bytes=$((500 * 1024 * 1024))
 
 while (($#)); do
   case "$1" in
@@ -81,8 +80,7 @@ grep -qE '^ARG FSDK_BUILDER_IMAGE=ghcr\.io/projectbluefin/lab-runner:[^@[:space:
 
 # Every fetched artifact carries a per-architecture digest. A download this
 # build cannot verify is a download it must not execute.
-for pin in OMP_X86_64_SHA256 OMP_AARCH64_SHA256 NODE_X86_64_SHA256 NODE_AARCH64_SHA256 \
-  GH_X86_64_SHA256 GH_AARCH64_SHA256; do
+for pin in OMP_X86_64_SHA256 OMP_AARCH64_SHA256 GH_X86_64_SHA256 GH_AARCH64_SHA256; do
   grep -qE "^ARG ${pin}=[0-9a-f]{64}$" "$containerfile" ||
     fail "ARG ${pin} must be a lowercase sha256 digest"
 done
@@ -110,6 +108,7 @@ forbid "$containerfile" \
   'pip install' \
   'RUN curl | ' \
   'curl -sL |'
+forbid "$containerfile" 'PI_VERSION' 'NODE_VERSION' 'pi-coding-agent' '/usr/bin/pi' '/usr/bin/node'
 
 # `SHELL` is silently ignored for the OCI image format; a RUN that relies on it
 # for `set -e` is a RUN whose failures are invisible.
@@ -234,14 +233,10 @@ omp_label="$(inspect '{{index .Labels "io.projectbluefin.review.omp.version"}}')
 omp_version="$(run 'omp --version')"
 test "$omp_version" = "omp/${omp_label}" ||
   fail "the omp binary reports '${omp_version}', but this image claims to ship ${omp_label}"
-pi_version="$(run 'pi --version')"
-test "$pi_version" = "$(inspect '{{index .Labels "io.projectbluefin.review.pi.version"}}')" ||
-  fail "the pi CLI does not match the version this image claims to ship"
 
 # shellcheck disable=SC2016 # Expanded by the container's shell, not this one.
 run '
   set -eu
-  node --version >/dev/null
   gh --version >/dev/null
   git --version >/dev/null
   python3 --version >/dev/null
@@ -299,7 +294,7 @@ import json,sys
 document = json.load(sys.stdin)
 print(" ".join(sorted(package["name"] for package in document["packages"])))
 ')"
-for component in omp gh node bluefin-review-mode "@earendil-works/pi-coding-agent"; do
+for component in omp gh bluefin-review-mode; do
   grep -qF -- "$component" <<<"$sbom_packages" ||
     fail "the in-image SBOM does not record ${component}"
 done
@@ -322,4 +317,4 @@ grep -q 'Replace it to update' <<<"$help_output" ||
 grep -q 'BLUEFIN_REVIEW_INHERIT_OMP_CONFIG=1' <<<"$help_output" ||
   fail "appliance help does not expose the explicit host-config opt-in"
 
-echo "appliance-contract: runtime contract holds ($((size / 1024 / 1024)) MiB, omp ${omp_version}, pi ${pi_version})"
+echo "appliance-contract: runtime contract holds ($((size / 1024 / 1024)) MiB, omp ${omp_version})"
