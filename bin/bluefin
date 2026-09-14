@@ -73,7 +73,8 @@ case "$command_name" in
     if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" ]] && command -v python3 >/dev/null 2>&1; then
       resolved_omp_token="$(python3 -c '
 import sqlite3, os, json
-db_path = os.path.expanduser(os.path.join(os.environ.get("HOME", "~"), ".omp/agent/agent.db"))
+state_dir = os.environ.get("BLUEFIN_OMP_STATE") or os.path.expanduser("~/.omp")
+db_path = os.path.join(state_dir, "agent/agent.db")
 if os.path.exists(db_path):
     try:
         conn = sqlite3.connect(db_path)

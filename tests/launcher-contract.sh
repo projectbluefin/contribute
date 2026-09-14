@@ -196,4 +196,60 @@ for case in "${test_cases[@]}"; do
   assert_omp_review "$input" "$expected"
 done
 
+# --- 5. Credential-resolution parity across every host-side launcher ----------
+#
+# The four bin/ launchers are shipped standalone by the Homebrew tap without
+# scripts/, so they cannot source a shared helper: each carries its own copy of
+# the omp-keyring reader and the token cross-fill. Copies drift silently (see
+# 2a1fbe1, where COPILOT_INTEGRATION_ID had to be threaded through by hand and
+# one launcher was missed), so text identity is the enforceable form of single
+# source of truth here. Divergence in these blocks is a build failure.
+
+launchers=(bluefin bluefin-review bluefin-contribute omp-review)
+
+# The embedded python program that reads the omp agent credential store. Every
+# launcher must resolve the same store, including the BLUEFIN_OMP_STATE override.
+extract_keyring_reader() {
+  awk '/^import sqlite3, os, json$/,/^'"'"' 2>\/dev\/null/' "$1" |
+    sed -e '$d' -e 's/[[:space:]]*$//'
+}
+
+keyring_reference=""
+for name in "${launchers[@]}"; do
+  block="$(extract_keyring_reader "${repo_root}/bin/${name}")"
+  [[ -n "$block" ]] || fail "bin/${name}: no omp-keyring reader found"
+  grep -qF 'BLUEFIN_OMP_STATE' <<<"$block" ||
+    fail "bin/${name}: omp-keyring reader ignores the BLUEFIN_OMP_STATE override"
+  if [[ -z "$keyring_reference" ]]; then
+    keyring_reference="$block"
+    keyring_owner="$name"
+  elif [[ "$block" != "$keyring_reference" ]]; then
+    diff <(printf '%s\n' "$keyring_reference") <(printf '%s\n' "$block") >&2 || true
+    fail "bin/${name}: omp-keyring reader diverges from bin/${keyring_owner}"
+  fi
+done
+
+# The token cross-fill. Each launcher must derive all four token names from
+# whichever one the host actually supplied, in the same order.
+expected_crossfill='export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+export GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+export COPILOT_GITHUB_TOKEN="${COPILOT_GITHUB_TOKEN:-${GH_TOKEN:-}}"
+export GITHUB_COPILOT_TOKEN="${GITHUB_COPILOT_TOKEN:-${COPILOT_GITHUB_TOKEN:-}}"'
+
+for name in "${launchers[@]}"; do
+  actual="$(sed -e 's/^[[:space:]]*//' "${repo_root}/bin/${name}" |
+    grep -E '^export (GH_TOKEN|GITHUB_TOKEN|COPILOT_GITHUB_TOKEN|GITHUB_COPILOT_TOKEN)="\$\{' || true)"
+  if [[ "$actual" != "$expected_crossfill" ]]; then
+    diff <(printf '%s\n' "$expected_crossfill") <(printf '%s\n' "$actual") >&2 || true
+    fail "bin/${name}: token cross-fill diverges from the canonical form"
+  fi
+  # docs/skills/launcher.md: dropping this header 400s /models and empties the
+  # model picker, so every launcher pins it rather than only forwarding it.
+  grep -qE '^[[:space:]]*export COPILOT_INTEGRATION_ID="\$\{COPILOT_INTEGRATION_ID:-copilot-developer-cli\}"$' \
+    "${repo_root}/bin/${name}" ||
+    fail "bin/${name}: does not pin COPILOT_INTEGRATION_ID=copilot-developer-cli"
+done
+
+echo "launcher-contract: credential resolution identical across ${#launchers[@]} launchers"
+
 echo "launcher-contract: all shorthand forms and launcher parity assertions passed"
