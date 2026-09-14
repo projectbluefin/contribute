@@ -6,15 +6,11 @@
 !image/**
 !package.json
 !package-lock.json
-!bin/dinosay
 # The skills generator runs at build time to project the org's docs/skills
 # manifest into Agent Skills layout.
 !scripts/generate-skills.py
-# The SBOM manifest generator runs at build time to record archive-installed
-# components as an SPDX document inside the image.
-!scripts/generate-sbom-manifest.py
-# The appliance build stage generates its own SPDX document for the four
-# archives it fetches (omp, node, pi, gh) plus the review mode itself.
+# The appliance build stage generates its own SPDX document for the two
+# archives it fetches (`omp` and `gh`) plus the review mode itself.
 !scripts/generate-appliance-sbom.py
 # The isolated contributor image writes its own minimal component manifest.
 !scripts/generate-contribute-sbom.py

@@ -12,42 +12,24 @@
 #
 # Public commands:
 #   review-container  Run the contributor container: the Hive queue
-#                     worker that receives assigned tasks and donates
-#                     inference. Takes an optional model profile and
-#                     thinking effort, e.g. 'just review-container sol
-#                     medium'. Contributor containers run in the
-#                     foreground; Ctrl-C stops them.
-#   review-stop       Stop cluster contributor workers. Refuses attended
-#                     runs and containers this launcher did not start.
+#                     OMP worker that receives Hive-assigned tasks.
+#                     Model and effort are chosen inside OMP. Contributor
+#                     containers run in the foreground; Ctrl-C stops them.
+#   review-stop       Stop cluster contributor workers. Local appliances stop
+#                     with Ctrl-C in their owning terminal.
 #   review-doctor     Preflight diagnostics. Starts no agent and mounts no
 #                     credential.
-#   review-queue      The interactive maintainer review surface: a
-#                     full-screen dashboard over the Bluefin PR queue,
-#                     running in the contributor container — no Hive
-#                     registration required. q or Ctrl-C stops.
-#                     Takes the same model profile and effort as
-#                     review-container, then passes the rest through to
-#                     the dashboard, e.g.
-#                     'just review-queue k3 high --repo bluefin'.
+#   review-queue      Convenience alias for the OMP review appliance. It opens
+#                     the same single-screen workbench as review-appliance and
+#                     forwards repository, issue, and pull-request arguments.
 #
 # ─────────────────────────────────────────────────────────────────────────
 # LIFECYCLE
 #
-# Contributor and maintainer container runs execute in the foreground of the
-# terminal that launched them: a maintainer steers the session, and Ctrl-C
-# stops it. Detached contributor containers are not supported; cleanup of
-# interactive runs is a startup concern, so a launch reclaims whatever an
-# interrupted previous run left behind.
-#
-# Cluster workers run in Kubernetes and are stopped with 'just review-stop'
-# (or 'just review-stop cluster').
-#
-# '--replace' is how interactive reclaim works: --rm removes the container
-# when it exits cleanly, but a hard-killed terminal, an OOM kill or a podman
-# restart can leave the fixed name behind, and the next launch would
-# otherwise die with 'the container name ... is already in use'. --replace
-# takes the name back at launch time instead of asking the user to run a
-# lifecycle command.
+# Contributor and maintainer runs stay in the foreground. The preferred krun
+# path gives each invocation a unique container name; target-specific state
+# also keeps Apptainer fallback sessions independent. Ctrl-C stops only the
+# calling terminal's appliance.
 #
 # Every interactive launch path ends in an 'exec' or a final foreground
 # command whose exit status propagates verbatim; tests/just-onboarding.sh
@@ -63,14 +45,8 @@
 # from the repository root. Persistent state is limited to launcher
 # configuration; the container receives credentials by environment and the
 # read-only ~/.config/hive mount, never a workspace or host home mount.
-# Codex is the default agent backend. Hive remains the sole assignment authority and there is no local
-# inference, model catalogue, or multi-CLI auto-detection.
-#
-# TOOL is read from the environment so 'TOOL=codex just review-container'
-# works as documented — 'just' recipe parameters are positional, not
-# KEY=VALUE, so it cannot be a plain recipe parameter. Unsupported values are
-# hard errors rather than silent fallbacks.
-tool_env := env("TOOL", "")
+# Hive remains the sole assignment authority. OMP owns provider, model, and
+# effort selection from the user's active configuration.
 hive_repo_url := "https://github.com/hivecommons/hive"
 # origin/v4 via `git ls-remote --heads https://github.com/hivecommons/hive v4`
 # on 2026-09-11, after kubestellar/hive#6637 (fix: key OMP readiness/busy/idle
@@ -82,25 +58,6 @@ hive_repo_url := "https://github.com/hivecommons/hive"
 # pane's last 3 lines instead of a 15-line tail a tip or a finished turn's
 # own prose could still land in).
 hive_commit := "d354baee807a7f1d83da92355f0f8c2d0b5df784"
-gemini_model := "gemini-3.8-flash"
-opus_model := "claude-opus-5"
-sol_model := "gpt-5.6-sol"
-k3_model := "kimi-k3"
-# The fsdk-derived contributor image, used by every recipe that starts a
-# container.
-#
-# ':stable' moves on every merge to main, so the default is always what the
-# repository currently says. That is the point: the people running this are
-# the people changing it, and nobody should be debugging a bug that was fixed
-# yesterday.
-#
-# ':latest' is deliberately absent from the registry — the workflow publishes
-# 'sha-<commit>' on every build, 'stable' on each main or release build, and
-# version tags on a 'v*.*.*' release. Asking for ':latest' dies on 'manifest
-# unknown'.
-# REVIEW_CONTRIBUTOR_IMAGE overrides this when you need a specific
-# 'sha-' tag or digest.
-contributor_image := env("REVIEW_CONTRIBUTOR_IMAGE", "ghcr.io/projectbluefin/review-contributor:stable")
 contribute_image := env("CONTRIBUTE_IMAGE", "ghcr.io/projectbluefin/contribute:stable")
 
 # Shared bash, 'eval''d at the top of every recipe script that needs it:
@@ -121,29 +78,41 @@ print_missing_hive_setup_guidance() {
   echo "ERROR: missing Hive setup at ${path}; ${reason}." >&2
   echo "  Re-run review from an interactive terminal, or pre-seed it yourself from hivecommons/hive @ ${commit} by running \`just contribute-setup ${tool}\` in an interactive checkout (set REVIEW_HIVE_COMMIT to another full commit if needed)" >&2
 }
-require_valid_tool() {
-  local requested="${1:-}"
-  [[ -z "$requested" || "$requested" == codex ]] && return 0
-  echo "ERROR: TOOL=${requested} is not supported — review supports Codex only." >&2
-  echo "  Unset TOOL, or pass TOOL=codex. For an OMP worker, use 'just contribute' instead." >&2
-  return 1
+kvm_device_ready() {
+  local device="${REVIEW_TEST_KVM_DEVICE:-/dev/kvm}"
+  [[ -r "$device" && -w "$device" ]]
 }
-codex_auth_configured() {
-  local codex_home="${CODEX_HOME:-${HOME}/.codex}"
-  local auth_file="${codex_home%/}/auth.json"
-  [[ -s "$auth_file" && -r "$auth_file" ]]
-}
-preflight_agent() {
-  local backend="${1:-omp}"
-  # Exactly one ERROR line per failure, each with the command that fixes it.
-  if [[ "$backend" == codex ]]; then
-    codex_auth_configured || {
-      echo "ERROR: Codex subscription login is unavailable for the selected backend." >&2
-      echo "  Run 'codex login' with file credential storage, then re-run TOOL=codex just review-container." >&2
-      return 1
-    }
+kvm_runtime_ready() {
+  local device="${REVIEW_TEST_KVM_DEVICE:-/dev/kvm}"
+  command -v podman &>/dev/null || { KVM_FAILURE="Podman is unavailable"; return 1; }
+  podman info &>/dev/null || { KVM_FAILURE="Podman is not reachable"; return 1; }
+  local selected uri
+  selected="$(podman_selected_connection)" || { KVM_FAILURE="Podman connections could not be resolved"; return 1; }
+  IFS=$'\t' read -r uri _ <<<"$selected"
+  if [[ -z "$uri" || "$uri" == unix://* ]]; then
+    command -v krun &>/dev/null || { KVM_FAILURE="the krun OCI runtime is unavailable"; return 1; }
+    kvm_device_ready || { KVM_FAILURE="${device} is not readable and writable"; return 1; }
   fi
-  preflight_github
+  return 0
+}
+require_apptainer_fallback() {
+  command -v apptainer &>/dev/null || { echo "ERROR: ${KVM_FAILURE}; Apptainer fallback is unavailable. Install Apptainer or configure Podman with krun." >&2; return 1; }
+  echo "WARNING: ${KVM_FAILURE}; using the isolated Apptainer fallback without a KVM boundary." >&2
+}
+prepare_apptainer_environment() {
+  local name
+  for name in GH_TOKEN GITHUB_TOKEN COPILOT_GITHUB_TOKEN GITHUB_COPILOT_TOKEN ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN OPENAI_API_KEY GEMINI_API_KEY HIVE_HUB BLUEFIN_REVIEW_ORG TERM COLORTERM; do
+    [[ -v "$name" ]] && export "APPTAINERENV_${name}=${!name}"
+  done
+  return 0
+}
+instance_key() {
+  local value="$1" slug digest
+  slug="$(printf '%s' "$value" | tr '[:upper:]/:' '[:lower:]--' | tr -cd 'a-z0-9_.-')"
+  slug="${slug:0:28}"
+  [[ -n "$slug" ]] || slug=default
+  digest="$(printf '%s' "$value" | sha256sum | cut -c1-8)"
+  printf '%s-%s\n' "$slug" "$digest"
 }
 preflight_github() {
   github_auth_ready || {
@@ -153,105 +122,17 @@ preflight_github() {
   }
 }
 contributor_image_available() {
-  # Locally present is enough; otherwise the tag has to exist in the
-  # registry. Both probes are read-only, so review-doctor can call
-  # this without starting anything.
   local ref="$1"
-  podman image exists "$ref" && return 0
-  # A 'localhost/' ref has no registry behind it, so a manifest probe can only
-  # dial localhost and fail slowly. Absent from local storage is the answer.
+  if command -v podman &>/dev/null && podman info &>/dev/null; then
+    podman image exists "$ref" &>/dev/null && return 0
+    case "$ref" in localhost/*) return 1 ;; esac
+    podman manifest inspect "$ref" &>/dev/null
+    return
+  fi
+  command -v apptainer &>/dev/null || return 1
   case "$ref" in localhost/*) return 1 ;; esac
-  podman manifest inspect "$ref" &>/dev/null
-}
-launcher_boot_id() {
-  # PIDs are only meaningful within a boot. Recording the boot alongside the
-  # owner PID keeps a recycled number from ever reading as a live owner.
-  cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown
-}
-container_owner_pid() {
-  # The owning client PID, printed only when that process is genuinely still
-  # the launcher run that started this container. Nothing otherwise.
-  #
-  # This has to be authoritative, because '--rm --interactive --tty' does NOT
-  # bind the container's lifetime to the client: conmon supervises the
-  # container, survives the client, and reparents to the user manager. A
-  # terminal that died hard -- or a 'podman start'/'podman restart' typed by
-  # hand -- therefore leaves a container that is fully RUNNING with no client
-  # and no terminal behind it. Inferring ownership from 'pgrep' for a 'podman
-  # run' command line cannot tell that apart from a live session, so the
-  # launcher records the answer itself instead of guessing.
-  local name="$1" marker owner_boot owner_pid
-  marker="$(podman inspect --format '{{index .Config.Labels "review.owner"}}' "$name" 2>/dev/null || true)"
-  [[ "$marker" == *:* ]] || return 0
-  owner_boot="${marker%%:*}"
-  owner_pid="${marker##*:}"
-  # A marker from a previous boot can only describe a process that no longer
-  # exists, whatever occupies that PID now.
-  [[ "$owner_boot" == "$(launcher_boot_id)" ]] || return 0
-  [[ "$owner_pid" =~ ^[0-9]+$ ]] || return 0
-  kill -0 "$owner_pid" 2>/dev/null || return 0
-  # PID reuse within one boot is rare but not impossible, and reclaiming a
-  # stranger's container would be unforgivable. Confirm the process still
-  # names this container.
-  tr '\0' ' ' <"/proc/${owner_pid}/cmdline" 2>/dev/null | grep -Fq -- "--name ${name}" || return 0
-  printf '%s\n' "$owner_pid"
-}
-container_owner_tty() {
-  # 'ps' prints '?' when a process has no controlling terminal -- which is
-  # exactly the case where telling somebody to press Ctrl-C is nonsense.
-  local pid="$1" tty
-  tty="$(ps -o tty= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
-  [[ -n "$tty" && "$tty" != "?" ]] || return 1
-  printf '%s\n' "$tty"
-}
-require_valid_container_name() {
-  # A name supplied through REVIEW_CONTAINER_NAME reaches 'podman run --name'
-  # and the ownership probe, so it is checked against podman's own rule
-  # rather than handed to podman as-is and left to fail late and cryptically.
-  local name="$1"
-  [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] && return 0
-  echo "ERROR: REVIEW_CONTAINER_NAME='${name}' is not a valid container name." >&2
-  echo "  Use [a-zA-Z0-9][a-zA-Z0-9_.-]*, e.g. REVIEW_CONTAINER_NAME=review-container-2." >&2
-  return 1
-}
-owner_run_label() {
-  # Stamped onto every launch so the NEXT launch can answer 'is anyone
-  # actually holding this?' without guessing. '--rm' clears it with the
-  # container, and a hand-typed 'podman start' cannot forge a live one: it
-  # reuses the original creation label, whose PID is long dead.
-  printf 'review.owner=%s:%s\n' "$(launcher_boot_id)" "$$"
-}
-require_no_running_instance() {
-  # 'Running' alone does not mean 'in use'. Distinguish two cases,
-  # because they deserve different treatment:
-  #
-  #   owned    -- somebody is working in that terminal right now. Never touch
-  #               it; hand over the attach command instead.
-  #   orphan   -- still running, but its terminal is gone, so no one can ever
-  #               reach it or Ctrl-C it again. Reclaim it silently.
-  #
-  # Telling a user to run 'podman rm -f' for the orphan case would smuggle
-  # an undocumented stop command back in; the launcher cleans up after itself
-  # instead.
-  local name="$1" owner_pid owner_tty
-  [[ "$(podman inspect --format '{{.State.Running}}' "$name" 2>/dev/null || echo false)" == "true" ]] || return 0
-  owner_pid="$(container_owner_pid "$name")"
-  if [[ -z "$owner_pid" ]]; then
-    cleanup_codex_auth_staging_dir "$(podman inspect --format '{{index .Config.Labels "review.codex-auth"}}' "$name" 2>/dev/null || true)"
-    echo "✓ reclaiming ${name} from a run whose terminal is gone."
-    return 0
-  fi
-  echo "ERROR: ${name} is already running in another terminal." >&2
-  echo "  Attach to the live session: podman exec -it ${name} tmux attach -t contributor" >&2
-  if owner_tty="$(container_owner_tty "$owner_pid")"; then
-    # Only ever name Ctrl-C when a terminal to press it in demonstrably
-    # exists. The old message advised it unconditionally, so an ownerless
-    # container told the user to act in a terminal that was already gone.
-    echo "  Or press Ctrl-C in the terminal that owns it (pid ${owner_pid} on ${owner_tty})." >&2
-  else
-    echo "  Its launcher (pid ${owner_pid}) has no terminal; end that process to stop it." >&2
-  fi
-  return 1
+  [[ "$ref" == *://* ]] || ref="docker://${ref}"
+  apptainer inspect "$ref" &>/dev/null
 }
 image_ref_is_moving() {
   # A digest is immutable and an 'sha-<commit>' tag is minted once per build,
@@ -299,116 +180,18 @@ ensure_contributor_image() {
   case "$ref" in
     localhost/*)
       echo "ERROR: ${ref} is a locally built image and it is not in local storage." >&2
-      echo "  Nothing can pull it: 'localhost/' is podman's local namespace, not a registry." >&2
-      echo "  Build it: podman build -f image/Containerfile -t ${ref#localhost/} ." >&2
-      echo "  Or drop the override to use the published default: unset REVIEW_CONTRIBUTOR_IMAGE" >&2
+      echo "  Build it: podman build -f image/contribute/Containerfile -t ${ref#localhost/} ." >&2
+      echo "  Or drop the override to use the published default: unset CONTRIBUTE_IMAGE" >&2
       return 1
       ;;
   esac
   podman pull "$ref" && return 0
-  echo "ERROR: cannot obtain the contributor image ${ref}." >&2
-  echo "  Published tags are 'stable', the version tags and 'sha-<commit>' — there is no ':latest'." >&2
-  echo "  Pick a published tag with REVIEW_CONTRIBUTOR_IMAGE=ghcr.io/projectbluefin/review-contributor:stable," >&2
-  echo "  or build the commit you have: ref=ghcr.io/projectbluefin/review-contributor:sha-\$(git rev-parse HEAD)" >&2
-  echo "    podman build -f image/Containerfile -t \"\$ref\" . && REVIEW_CONTRIBUTOR_IMAGE=\"\$ref\" just review-container" >&2
+  echo "ERROR: cannot obtain contributor image ${ref}." >&2
+  echo "  Set CONTRIBUTE_IMAGE to a published tag/digest or build image/contribute/Containerfile." >&2
   return 1
 }
 
-review_queue_kubernetes_available() {
-  command -v kubectl &>/dev/null || return 1
-  kubectl config current-context >/dev/null 2>&1 || return 1
-  kubectl get --raw='/readyz?verbose' --request-timeout=5s >/dev/null 2>&1 || return 1
-  kubectl get pvc review-queue-state -n bluefin-system --request-timeout=5s >/dev/null 2>&1 || {
-    echo "ERROR: Kubernetes dashboard state claim 'review-queue-state' cannot be read; it may be absent or access may be denied." >&2
-    return 2
-  }
-}
-cleanup_kubernetes_dashboard() {
-  [[ -n "${K8S_DASHBOARD_POD:-}" ]] ||
-    [[ -n "${K8S_DASHBOARD_SECRET:-}" ]] || return 0
-  kubectl delete pod "${K8S_DASHBOARD_POD:-}" -n bluefin-system \
-    --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  kubectl delete secret "${K8S_DASHBOARD_SECRET:-}" -n bluefin-system \
-    --ignore-not-found --wait=false >/dev/null 2>&1 || true
-}
-review_queue_kubernetes() {
-  local image="$1"
-  shift
-  local session_id env_names
-  local -a otlp_secret_args=()
-  session_id="$(date +%s)-$$"
-  K8S_DASHBOARD_POD="review-queue-${session_id}"
-  K8S_DASHBOARD_SECRET="review-session-${session_id}"
-  K8S_ENV_NAMES=(
-    GH_TOKEN GITHUB_COPILOT_TOKEN HIVE_HUB BLUEFIN_REVIEW_INSTANCE
-    AGENT_MODEL AGENT_REASONING_EFFORT
-    BLUEFIN_REVIEW_BACKEND
-  )
-  if [[ -n "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]]; then
-    K8S_ENV_NAMES+=(OTEL_EXPORTER_OTLP_ENDPOINT)
-    otlp_secret_args+=(
-      --from-file=OTEL_EXPORTER_OTLP_ENDPOINT=<(printf '%s' "$OTEL_EXPORTER_OTLP_ENDPOINT")
-    )
-    if [[ -n "${OTEL_EXPORTER_OTLP_HEADERS:-}" ]]; then
-      K8S_ENV_NAMES+=(OTEL_EXPORTER_OTLP_HEADERS)
-      otlp_secret_args+=(
-        --from-file=OTEL_EXPORTER_OTLP_HEADERS=<(printf '%s' "$OTEL_EXPORTER_OTLP_HEADERS")
-      )
-    fi
-  fi
-  env_names="$(IFS=,; echo "${K8S_ENV_NAMES[*]}")"
 
-  kubectl create secret generic "$K8S_DASHBOARD_SECRET" -n bluefin-system \
-    --from-file=GH_TOKEN=<(printf '%s' "$GH_TOKEN_VALUE") \
-    --from-file=GITHUB_COPILOT_TOKEN=<(printf '%s' "${COPILOT_TOKEN:-}") \
-    --from-file=HIVE_HUB=<(printf '%s' "$DASHBOARD_HIVE_HUB") \
-    --from-file=BLUEFIN_REVIEW_INSTANCE=<(printf '%s' "$K8S_DASHBOARD_POD") \
-    --from-file=AGENT_MODEL=<(printf '%s' "${AGENT_MODEL:-}") \
-    --from-file=AGENT_REASONING_EFFORT=<(printf '%s' "${AGENT_REASONING_EFFORT:-}") \
-    --from-file=BLUEFIN_REVIEW_BACKEND=<(printf '%s' "$REVIEW_BACKEND") \
-    "${otlp_secret_args[@]}" >/dev/null
-
-  python3 scripts/review-session-runtime.py "$session_id" "$image" \
-    "$K8S_DASHBOARD_SECRET" review-queue-state "$env_names" queue "$@" |
-    kubectl create -f -
-  kubectl wait --for=condition=Ready "pod/${K8S_DASHBOARD_POD}" -n bluefin-system --timeout=5m
-  kubectl attach --stdin --tty "$K8S_DASHBOARD_POD" -n bluefin-system
-}
-
-resolve_copilot_token() {
-  # OMP's github-copilot models need the long-lived OAuth token minted by
-  # the Copilot editor device flow (a "ghu_" user-to-server token). Without
-  # it the container starts a fresh device flow on every launch and the pane
-  # sits on "enter code XXXX-XXXX" until a human types one in.
-  #
-  # A `gh auth token` ("gho_") is NOT a substitute -- it is a different
-  # client with different scopes, and Copilot inference rejects it with
-  # "failed to get api info" when handed one. Verified against the
-  # contributor image.
-  COPILOT_TOKEN="${GITHUB_COPILOT_TOKEN:-}"
-  return 0
-}
-report_missing_copilot_credential() {
-  # Named so every caller tells the same story. A `gh auth token` is the
-  # tempting substitute and the reason this message exists: it looks like a
-  # GitHub credential, so a contributor reasonably assumes their gh login is
-  # enough — but Copilot inference rejects it, and a headless dispatch dies
-  # immediately without a usable model. Every dispatched review, fix, or
-  # landing agent dies at startup, surfacing only as opaque died-mid-batch
-  # failures.
-  echo "ERROR: no Copilot credential found; every dispatched agent would die at startup." >&2
-  echo "  A headless dispatch exits immediately without a usable model." >&2
-  echo "  A 'gh auth token' is NOT a substitute — Copilot inference rejects it." >&2
-  echo "  Export GITHUB_COPILOT_TOKEN before launching." >&2
-  return 0
-}
-hive_contributor_backend() {
-  # Reads AGENT_BACKEND out of Hive's own contributor.env. Read-only: the file
-  # belongs to upstream setup, so it is reported on, never rewritten.
-  local path="$1"
-  [[ -f "$path" ]] || return 0
-  awk -F= '$1 == "AGENT_BACKEND" {sub(/^[^=]*=/, ""); gsub(/["'"'"']/, ""); print; exit}' "$path"
-}
 resolve_gh_token() {
   # Hive's contributor model is fork + pull request under the contributor's
   # OWN GitHub identity: /usr/local/bin/gh injects the hub's App token only
@@ -421,8 +204,7 @@ resolve_gh_token() {
   # By value, never by mounting ~/.config/gh: the container gets exactly one
   # credential for exactly one host, and no view of any other account, of
   # ~/.config/gh/hosts.yml, or of an enterprise login that happens to sit
-  # beside it. Same reasoning as the Copilot token above.
-  #
+  # beside it.
   # REVIEW_GH_TOKEN comes first so a contributor can hand the agent a
   # purpose-made, narrowly scoped PAT instead of their desktop login, which
   # typically carries admin:org, workflow and delete:packages.
@@ -465,50 +247,6 @@ report_missing_gh_token() {
   echo "  Or export REVIEW_GH_TOKEN with a scoped PAT." >&2
   return 0
 }
-resolve_codex_auth_file() {
-  local codex_home="${CODEX_HOME:-${HOME}/.codex}"
-  CODEX_AUTH_SOURCE_FILE="${codex_home%/}/auth.json"
-  if [[ "$CODEX_AUTH_SOURCE_FILE" != /* || ! -f "$CODEX_AUTH_SOURCE_FILE" || ! -r "$CODEX_AUTH_SOURCE_FILE" ]]; then
-    CODEX_AUTH_SOURCE_FILE=""
-  fi
-  return 0
-}
-stage_codex_auth_file() {
-  CODEX_AUTH_FILE=""
-  CODEX_AUTH_STAGING_DIR=""
-  resolve_codex_auth_file
-  [[ -n "$CODEX_AUTH_SOURCE_FILE" ]] || return 0
-  umask 077
-  CODEX_AUTH_STAGING_DIR="$(mktemp -d /tmp/review-codex-auth.XXXXXX)"
-  CODEX_AUTH_FILE="${CODEX_AUTH_STAGING_DIR}/auth.json"
-  cp -- "$CODEX_AUTH_SOURCE_FILE" "$CODEX_AUTH_FILE"
-  chmod 0600 "$CODEX_AUTH_FILE"
-  return 0
-}
-cleanup_codex_auth_file() {
-  local staging_dir="${CODEX_AUTH_STAGING_DIR:-}"
-  [[ -n "$staging_dir" && "$staging_dir" == /* ]] || return 0
-  rm -f -- "${staging_dir}/auth.json"
-  rmdir -- "$staging_dir"
-  CODEX_AUTH_FILE=""
-  CODEX_AUTH_STAGING_DIR=""
-  return 0
-}
-cleanup_codex_auth_staging_dir() {
-  local staging_dir="${1:-}" invoking_uid
-  local stage_root=/tmp
-  invoking_uid="$(id -u)"
-  [[ "$staging_dir" =~ ^${stage_root%/}/review-codex-auth\.[[:alnum:]]{6}$ ]] || return 0
-  [[ -d "$staging_dir" && ! -L "$staging_dir" ]] || return 0
-  [[ -f "$staging_dir/auth.json" && ! -L "$staging_dir/auth.json" ]] || return 0
-  [[ "$(stat -c %u "$staging_dir")" == "$invoking_uid" ]] || return 0
-  [[ "$(stat -c %a "$staging_dir")" == 700 ]] || return 0
-  [[ "$(stat -c %u "$staging_dir/auth.json")" == "$invoking_uid" ]] || return 0
-  [[ "$(stat -c %a "$staging_dir/auth.json")" == 600 ]] || return 0
-  [[ "$(find "$staging_dir" -mindepth 1 -maxdepth 1 -print | wc -l)" == 1 ]] || return 0
-  rm -f -- "${staging_dir}/auth.json"
-  rmdir -- "$staging_dir" 2>/dev/null || true
-}
 podman_selected_connection() {
   # Podman resolves its target engine in this order: CONTAINER_HOST wins
   # outright, CONTAINER_CONNECTION names a saved connection, and otherwise
@@ -534,112 +272,6 @@ podman_selected_connection() {
     return 0
   fi
   awk -F'\t' '$4=="true"{printf "%s\t%s\n", $2, $3; exit}' <<<"$list"
-}
-podman_default_connection_uri() {
-  local selected uri
-  selected="$(podman_selected_connection)" || return 1
-  IFS=$'\t' read -r uri _ <<<"$selected"
-  printf '%s\n' "$uri"
-  return 0
-}
-podman_redacted_uri() {
-  local uri="$1" scheme rest
-  case "$uri" in
-    *://*)
-      scheme="${uri%%://*}"
-      rest="${uri#*://}"
-      rest="${rest#*@}"
-      printf '%s://%s\n' "$scheme" "$rest"
-      ;;
-    *) printf '%s\n' "$uri" ;;
-  esac
-}
-require_local_podman_engine() {
-  # review-queue binds its dashboard state (#281) from the client-side
-  # ${XDG_STATE_HOME:-$HOME/.local/state}/bluefin-review path and presents it
-  # as this host's durable record of landing batches. When podman's default
-  # connection is an ssh:// remote, that same-looking bind resolves on the
-  # ENGINE host instead: the dashboard silently reads and writes a directory
-  # that never existed on the launcher's filesystem, and landing batches
-  # appear to vanish while they are live somewhere nobody is looking (#400).
-  local engine_uri display_uri
-  if ! engine_uri="$(podman_default_connection_uri)"; then
-    return 1
-  fi
-  case "$engine_uri" in
-    ""|unix://*) return 0 ;;
-    *)
-      display_uri="$(podman_redacted_uri "$engine_uri")"
-      case "${REVIEW_QUEUE_ALLOW_REMOTE_STATE:-}" in
-        1)
-          echo "! podman's selected engine is remote (${display_uri}); the dashboard state directory binds on that engine host, not $(hostname)." >&2
-          return 0
-          ;;
-        ""|0)
-          echo "ERROR: podman's selected engine is remote (${display_uri})." >&2
-          ;;
-        *)
-          echo "ERROR: REVIEW_QUEUE_ALLOW_REMOTE_STATE must be exactly 1 for a remote engine (got '${REVIEW_QUEUE_ALLOW_REMOTE_STATE}')." >&2
-          ;;
-      esac
-      echo "  review-queue binds its dashboard state from \${XDG_STATE_HOME:-\$HOME/.local/state}/bluefin-review on THIS host, but podman would resolve that same-looking bind on the engine host instead -- landing batches would be written where nothing local, including the next 'just review-queue', can find them." >&2
-      echo "  Switch to a local connection:  podman system connection default <local-name>" >&2
-      echo "  Or, once you have confirmed the remote engine host's directory is the one you actually want, acknowledge it explicitly:  REVIEW_QUEUE_ALLOW_REMOTE_STATE=1 just review-queue" >&2
-      return 1
-      ;;
-  esac
-}
-resolve_review_backend() {
-  REVIEW_BACKEND="${BLUEFIN_REVIEW_BACKEND:-}"
-  case "$REVIEW_BACKEND" in
-    ""|codex|omp) return 0 ;;
-    *)
-      echo "ERROR: unsupported review backend '${REVIEW_BACKEND}'; expected codex or omp." >&2
-      return 1
-      ;;
-  esac
-}
-# Turn a short profile name plus an optional thinking effort into AGENT_MODEL /
-# AGENT_REASONING_EFFORT. Four profiles, no picker: an empty profile is the
-# default one. Profiles are defaults, never overrides — an explicit
-# AGENT_* value in the environment still wins.
-resolve_model_profile() {
-  local profile="${1:-}" effort="${2:-}"
-  case "${profile,,}" in
-    ""|gemini|gemini-3.8|gemini38)
-      PROFILE_MODEL="${GEMINI_MODEL}"
-      PROFILE_EFFORT="max"
-      ;;
-    opus5)
-      PROFILE_MODEL="${OPUS_MODEL}"
-      PROFILE_EFFORT="high"
-      ;;
-    sol|gpt-sol|gptsol)
-      PROFILE_MODEL="${SOL_MODEL}"
-      PROFILE_EFFORT="medium"
-      ;;
-    k3|kimi)
-      PROFILE_MODEL="${K3_MODEL}"
-      PROFILE_EFFORT="max"
-      ;;
-    *)
-      echo "ERROR: unknown model profile '${profile}'." >&2
-      echo "  Known profiles: gemini (${GEMINI_MODEL}), sol (${SOL_MODEL}), opus5 (${OPUS_MODEL}), k3 (${K3_MODEL})." >&2
-      return 1
-      ;;
-  esac
-  case "${effort,,}" in
-    "") ;;
-    low|medium|high|max) PROFILE_EFFORT="${effort,,}" ;;
-    *)
-      echo "ERROR: unknown thinking effort '${effort}'; expected low, medium, high, or max." >&2
-      return 1
-      ;;
-  esac
-  AGENT_MODEL="${AGENT_MODEL:-${PROFILE_MODEL}}"
-  AGENT_REASONING_EFFORT="${AGENT_REASONING_EFFORT:-${PROFILE_EFFORT}}"
-  echo "✓ model ${AGENT_MODEL}, reasoning effort ${AGENT_REASONING_EFFORT}."
-  return 0
 }
 normalize_git_remote() {
   local value="$1"
@@ -728,7 +360,7 @@ register_named_hive() {
   # one; an exported HIVE_HUB is honored as-is.
   local target="$1" tmp
   if [[ "${REVIEW_NON_INTERACTIVE:-}" == "true" ]]; then
-    print_missing_hive_setup_guidance "$target" "non-interactive mode cannot answer the upstream prompts" "${HIVE_SETUP_BACKEND:-codex}" "$HIVE_COMMIT"
+    print_missing_hive_setup_guidance "$target" "non-interactive mode cannot answer the upstream prompts" "${HIVE_SETUP_BACKEND:-omp}" "$HIVE_COMMIT"
     return 1
   fi
   if ! can_run_attended_hive_setup; then
@@ -742,7 +374,7 @@ register_named_hive() {
   prepare_pinned_hive_checkout || return 1
   echo "Registering hive '${HIVE_REGISTRATION_NAME}': upstream contribute-setup with an isolated config_dir."
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/review-hive-setup.XXXXXX")"
-  HIVE_SKIP_VERSION_CHECK=true just --working-directory "$HIVE_SRC_DIR" --justfile "$HIVE_SRC_DIR/Justfile" config_dir="$tmp" contribute-setup "${HIVE_SETUP_BACKEND:-codex}" || {
+  HIVE_SKIP_VERSION_CHECK=true just --working-directory "$HIVE_SRC_DIR" --justfile "$HIVE_SRC_DIR/Justfile" config_dir="$tmp" contribute-setup "${HIVE_SETUP_BACKEND:-omp}" || {
     rm -rf "$tmp"
     echo "ERROR: upstream contribute-setup did not complete; nothing was registered." >&2
     return 1
@@ -777,11 +409,11 @@ ensure_hive_contributor_env() {
   fi
   [[ -f "$HIVE_CONTRIBUTOR_ENV" ]] && return 0
   if [[ "${REVIEW_NON_INTERACTIVE:-}" == "true" ]]; then
-    print_missing_hive_setup_guidance "$HIVE_CONTRIBUTOR_ENV" "non-interactive mode cannot answer the upstream prompts" "${HIVE_SETUP_BACKEND:-codex}" "$HIVE_COMMIT"
+    print_missing_hive_setup_guidance "$HIVE_CONTRIBUTOR_ENV" "non-interactive mode cannot answer the upstream prompts" "${HIVE_SETUP_BACKEND:-omp}" "$HIVE_COMMIT"
     return 1
   fi
   if ! can_run_attended_hive_setup; then
-    print_missing_hive_setup_guidance "$HIVE_CONTRIBUTOR_ENV" "stdin/stdout/stderr are not attached to a terminal" "${HIVE_SETUP_BACKEND:-codex}" "$HIVE_COMMIT"
+    print_missing_hive_setup_guidance "$HIVE_CONTRIBUTOR_ENV" "stdin/stdout/stderr are not attached to a terminal" "${HIVE_SETUP_BACKEND:-omp}" "$HIVE_COMMIT"
     return 1
   fi
   echo "Upstream contribute-setup hasn't run yet (no ${HIVE_CONTRIBUTOR_ENV})."
@@ -789,7 +421,7 @@ ensure_hive_contributor_env() {
     command -v "$cmd" &>/dev/null || { echo "ERROR: '${cmd}' is required to run contribute-setup." >&2; return 1; }
   done
   prepare_pinned_hive_checkout || return 1
-  echo "Running upstream pinned setup: just contribute-setup ${HIVE_SETUP_BACKEND:-codex}"
+  echo "Running upstream pinned setup: just contribute-setup ${HIVE_SETUP_BACKEND:-omp}"
   # HIVE_SKIP_VERSION_CHECK=true is upstream's own documented opt-out, not a
   # local workaround. Upstream's private 'check-version' recipe — a prerequisite
   # of 'contribute-setup' — compares HEAD against origin/v4 and aborts when they
@@ -801,7 +433,7 @@ ensure_hive_contributor_env() {
   # documents keeps Hive the authority; removing it would break setup without
   # unpinning, and unpinning would mean executing unreviewed upstream code.
   # Scoped to this one invocation so nothing else in the run inherits it.
-  HIVE_SKIP_VERSION_CHECK=true just --working-directory "$HIVE_SRC_DIR" --justfile "$HIVE_SRC_DIR/Justfile" contribute-setup "${HIVE_SETUP_BACKEND:-codex}"
+  HIVE_SKIP_VERSION_CHECK=true just --working-directory "$HIVE_SRC_DIR" --justfile "$HIVE_SRC_DIR/Justfile" contribute-setup "${HIVE_SETUP_BACKEND:-omp}"
   [[ -f "$HIVE_CONTRIBUTOR_ENV" ]] || { echo "ERROR: contribute-setup ran but ${HIVE_CONTRIBUTOR_ENV} still missing." >&2; return 1; }
   echo "✓ Upstream contribute-setup complete."
 }
@@ -918,542 +550,71 @@ valid_hive_hub() {
     [[ "$hub" =~ ^(wss|https)://[^/@?\#[:space:]]+([/?\#][^[:space:]]*)?$ ]]
 }
 
-# ── the optional lab (#379) ────────────────────────────────────────────────
-# This appliance owns no lab and depends on none, and none of that changes
-# here: what follows is a capability a maintainer can hand ONE dashboard
-# session, on their own machine, with their own cluster. Nothing requires it,
-# nothing waits for it, and nothing about a pull request's verdict may need
-# it — a missing lab only means the deliverable is verified from published
-# registry evidence instead.
-#
-# What crosses into the container is one Unix socket. Not the kubeconfig, not
-# a Kubernetes credential, not the host home, not host networking, not the
-# Podman socket, not a host binary. The broker on the other end holds all of
-# that and answers exactly three typed questions.
-REVIEW_LAB_SKILLS=(lab-test k3s-cluster-ops kubernetes-specialist live-dev-common)
 
-lab_broker_script() {
-  printf '%s' "${REVIEW_LAB_BROKER:-${PWD}/scripts/review-lab-broker.py}"
-}
-
-lab_probe_context() {
-  # Host capability, decided before anything is offered and without printing
-  # a credential, a kubeconfig path, or a server URL: the probe answers with
-  # the current context's NAME and whether nodes can be listed at all.
-  LAB_CONTEXT=""
-  local broker probe_json
-  broker="$(lab_broker_script)"
-  [[ -f "$broker" ]] || return 1
-  command -v python3 &>/dev/null || return 1
-  command -v kubectl &>/dev/null || return 1
-  probe_json="$(python3 "$broker" probe 2>/dev/null)" || return 1
-  LAB_CONTEXT="$(printf '%s' "$probe_json" | sed -n 's/.*"context":"\([^"]*\)".*/\1/p')"
-  [[ -n "$LAB_CONTEXT" ]]
-}
-
-lab_runtime_flags() {
-  # gVisor blocks host Unix domain sockets by default, so the one socket this
-  # session mounts needs runsc's host-uds=open — and ONLY under runsc: crun
-  # and runc reject the flag outright, so probing the configured runtime is
-  # what keeps the flag from breaking every other machine. review-container
-  # never reaches this function: it receives no lab capability at all.
-  local runtime
-  runtime="$(podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || true)"
-  if [[ "$runtime" == runsc ]]; then
-    printf '%s' "--runtime-flag=host-uds=open"
-  fi
-  return 0
-}
-
-start_lab_broker() {
-  # The broker lives exactly as long as this foreground session: it is
-  # started here, killed by the EXIT trap, and its socket directory removed
-  # with it. Nothing survives the terminal that launched it.
-  local broker runtime_dir waited
-  broker="$(lab_broker_script)"
-  runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-  if [[ ! -d "$runtime_dir" || ! -w "$runtime_dir" ]]; then
-    echo "! no writable XDG_RUNTIME_DIR; the dashboard starts without the lab." >&2
-    return 1
-  fi
-  LAB_SESSION="$(python3 -c 'import secrets; print(secrets.token_hex(8))')" || return 1
-  LAB_SOCKET_DIR="$(mktemp -d "${runtime_dir}/bluefin-review-lab.XXXXXX")" || return 1
-  chmod 700 "$LAB_SOCKET_DIR"
-  LAB_SOCKET="${LAB_SOCKET_DIR}/broker.sock"
-  python3 "$broker" serve --socket "$LAB_SOCKET" --session "$LAB_SESSION" \
-    >"${LAB_SOCKET_DIR}/broker.log" 2>&1 &
-  LAB_BROKER_PID=$!
-  for waited in $(seq 1 50); do
-    [[ -S "$LAB_SOCKET" ]] && break
-    kill -0 "$LAB_BROKER_PID" 2>/dev/null || break
-    sleep 0.1
-  done
-  if [[ ! -S "$LAB_SOCKET" ]]; then
-    echo "! the lab broker did not come up; the dashboard starts without the lab." >&2
-    cleanup_lab_broker
-    return 1
-  fi
-  return 0
-}
-
-cleanup_lab_broker() {
-  if [[ -n "${LAB_BROKER_PID:-}" ]]; then
-    kill "$LAB_BROKER_PID" 2>/dev/null || true
-    wait "$LAB_BROKER_PID" 2>/dev/null || true
-    LAB_BROKER_PID=""
-  fi
-  if [[ -n "${LAB_SOCKET_DIR:-}" && -d "$LAB_SOCKET_DIR" ]]; then
-    rm -rf "$LAB_SOCKET_DIR"
-    LAB_SOCKET_DIR=""
-  fi
-  LAB_SOCKET=""
-}
-
-offer_lab_session() {
-  # Asked once, per dashboard process, on the terminal that launched it.
-  # REVIEW_LAB=1/0 answers it without a prompt for an unattended launch;
-  # anything else, including no terminal at all, leaves the lab off.
-  LAB_SOCKET="" LAB_SESSION="" LAB_SOCKET_DIR="" LAB_BROKER_PID=""
-  local answer=""
-  [[ "${REVIEW_LAB:-}" == "0" ]] && return 0
-  lab_probe_context || return 0
-  if [[ "${REVIEW_LAB:-}" == "1" ]]; then
-    answer="y"
-  elif ( : </dev/tty && : >/dev/tty ) 2>/dev/null; then
-    printf '?  Kubernetes context %s is reachable. Use it for this session only? [y/N] ' \
-      "$LAB_CONTEXT" >/dev/tty
-    read -r answer </dev/tty || answer=""
-  else
-    return 0
-  fi
-  [[ "$answer" == [Yy]* ]] || return 0
-  start_lab_broker || return 0
-  echo "✓ lab enabled for this session (context ${LAB_CONTEXT}); one socket, no credentials."
-}
-
-add_lab_container_args() {
-  # Only the socket directory and two non-secret strings. The personal lab
-  # skills are read-only documents the review agent already knows how to
-  # read; common owns the shared lab skill, so only the maintainer's own
-  # ids are mounted here, never a second copy of the org inventory.
-  [[ -n "${LAB_SOCKET:-}" ]] || return 0
-  local flag skill_root skill
-  flag="$(lab_runtime_flags)"
-  if [[ -n "$flag" ]]; then
-    CONTAINER_ARGS+=("$flag")
-  fi
-  CONTAINER_ARGS+=(--volume "${LAB_SOCKET_DIR}:/run/bluefin-review-lab:rw,z")
-  CONTAINER_ARGS+=(--env "BLUEFIN_REVIEW_LAB_SOCKET=/run/bluefin-review-lab/broker.sock")
-  CONTAINER_ARGS+=(--env "BLUEFIN_REVIEW_LAB_SESSION=${LAB_SESSION}")
-  skill_root="${REVIEW_PERSONAL_SKILLS:-${HOME}/.copilot/skills}"
-  for skill in "${REVIEW_LAB_SKILLS[@]}"; do
-    [[ -d "${skill_root}/${skill}" ]] || continue
-    CONTAINER_ARGS+=(--volume "${skill_root}/${skill}:/home/dev/.agents/skills/${skill}:ro,z")
-  done
-}
-
-review_exec_broker_script() {
-  printf '%s' "${REVIEW_EXEC_BROKER:-${PWD}/scripts/review-exec-broker.py}"
-}
-
-review_exec_probe_context() {
-  REVIEW_EXEC_CONTEXT=""
-  local broker probe_json
-  broker="$(review_exec_broker_script)"
-  [[ -f "$broker" ]] || return 1
-  command -v python3 &>/dev/null || return 1
-  command -v kubectl &>/dev/null || return 1
-  probe_json="$(python3 "$broker" probe 2>/dev/null)" || return 1
-  REVIEW_EXEC_CONTEXT="$(printf '%s' "$probe_json" | sed -n 's/.*"context":"\([^"]*\)".*/\1/p')"
-  [[ -n "$REVIEW_EXEC_CONTEXT" ]]
-}
-
-review_exec_runtime_flags() {
-  local runtime
-  runtime="$(podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || true)"
-  if [[ "$runtime" == runsc ]]; then
-    printf '%s' "--runtime-flag=host-uds=open"
-  fi
-  return 0
-}
-
-start_review_exec_broker() {
-  local broker runtime_dir
-  broker="$(review_exec_broker_script)"
-  runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-  if [[ ! -d "$runtime_dir" || ! -w "$runtime_dir" ]]; then
-    return 1
-  fi
-  REVIEW_EXEC_SESSION="$(python3 -c 'import secrets; print(secrets.token_hex(8))')" || return 1
-  REVIEW_EXEC_SOCKET_DIR="$(mktemp -d "${runtime_dir}/bluefin-review-exec.XXXXXX")" || return 1
-  chmod 700 "$REVIEW_EXEC_SOCKET_DIR"
-  REVIEW_EXEC_SOCKET="${REVIEW_EXEC_SOCKET_DIR}/broker.sock"
-  python3 "$broker" serve \
-    --socket "$REVIEW_EXEC_SOCKET" \
-    --session "$REVIEW_EXEC_SESSION" \
-    --image "${CONTRIBUTOR_IMAGE:-ghcr.io/projectbluefin/review-contributor:stable}" \
-    >"${REVIEW_EXEC_SOCKET_DIR}/broker.log" 2>&1 &
-  REVIEW_EXEC_BROKER_PID=$!
-  for _ in $(seq 1 50); do
-    [[ -S "$REVIEW_EXEC_SOCKET" ]] && return 0
-    kill -0 "$REVIEW_EXEC_BROKER_PID" 2>/dev/null || break
-    sleep 0.1
-  done
-  cleanup_review_exec_broker
-  return 1
-}
-
-cleanup_review_exec_broker() {
-  if [[ -n "${REVIEW_EXEC_BROKER_PID:-}" ]]; then
-    kill "$REVIEW_EXEC_BROKER_PID" 2>/dev/null || true
-    wait "$REVIEW_EXEC_BROKER_PID" 2>/dev/null || true
-    REVIEW_EXEC_BROKER_PID=""
-  fi
-  if [[ -n "${REVIEW_EXEC_SOCKET_DIR:-}" && -d "$REVIEW_EXEC_SOCKET_DIR" ]]; then
-    rm -rf "$REVIEW_EXEC_SOCKET_DIR"
-    REVIEW_EXEC_SOCKET_DIR=""
-  fi
-  REVIEW_EXEC_SOCKET=""
-  REVIEW_EXEC_SESSION=""
-}
-
-offer_review_exec_session() {
-  REVIEW_EXEC_SOCKET="" REVIEW_EXEC_SESSION="" REVIEW_EXEC_SOCKET_DIR="" REVIEW_EXEC_BROKER_PID=""
-  [[ "${REVIEW_EXEC:-}" == "0" ]] && return 0
-  review_exec_probe_context || return 0
-  local answer=""
-  if [[ "${REVIEW_EXEC:-}" == "1" ]]; then
-    answer="y"
-  elif ( : </dev/tty && : >/dev/tty ) 2>/dev/null; then
-    printf '?  Kubernetes context %s is reachable. Offload batch reviews to %s for this session only? [y/N] ' \
-      "$REVIEW_EXEC_CONTEXT" "$REVIEW_EXEC_CONTEXT" >/dev/tty
-    read -r answer </dev/tty || answer=""
-  else
-    return 0
-  fi
-  [[ "$answer" == [Yy]* ]] || return 0
-  start_review_exec_broker || {
-    echo "! review-exec broker did not start; reviews remain local." >&2
-    return 0
-  }
-  echo "✓ review-exec enabled for this session (context ${REVIEW_EXEC_CONTEXT}); one socket, no credentials."
-}
-
-add_review_exec_container_args() {
-  if [[ -n "${REVIEW_EXEC_SOCKET:-}" ]]; then
-    local flag
-    flag="$(review_exec_runtime_flags)"
-    [[ -n "$flag" ]] && CONTAINER_ARGS+=("$flag")
-    CONTAINER_ARGS+=(--volume "${REVIEW_EXEC_SOCKET_DIR}:/run/bluefin-review-exec:rw,z")
-    CONTAINER_ARGS+=(--env "BLUEFIN_REVIEW_EXEC_SOCKET=/run/bluefin-review-exec/broker.sock")
-    CONTAINER_ARGS+=(--env "BLUEFIN_REVIEW_EXEC_SESSION=${REVIEW_EXEC_SESSION}")
-    CONTAINER_ARGS+=(--env "BLUEFIN_REVIEW_EXEC_AVAILABLE=1")
-  fi
-}
-
-scale_cluster_contributors() {
-  local replicas="$1" profile="${2:-gemini}" effort="${3:-}"
-  command -v kubectl &>/dev/null || {
-    echo "ERROR: kubectl is required for cluster contributor scale-out." >&2
-    return 1
-  }
-  local context
-  context="$(kubectl config current-context 2>/dev/null || true)"
-  if [[ -z "$context" ]]; then
-    echo "ERROR: no active Kubernetes context found." >&2
-    return 1
-  fi
-
-  resolve_model_profile "$profile" "$effort"
-
-  ensure_hive_contributor_env
-  local hub
-  hub="$(read_hive_value HIVE_HUB)"
-  if ! valid_hive_hub "$hub"; then
-    echo "ERROR: HIVE_HUB is not set in ${HIVE_CONTRIBUTOR_ENV}." >&2
-    return 1
-  fi
-  CLUSTER_HIVE_HUB="$hub"
-
-  resolve_gh_token
-  if [[ -z "${GH_TOKEN_VALUE:-}" ]]; then
-    report_missing_gh_token
-    echo "ERROR: refusing to update the cluster Secret without a GitHub token." >&2
-    return 1
-  fi
-  resolve_copilot_token
-  if [[ -z "${COPILOT_TOKEN:-}" ]]; then
-    report_missing_copilot_credential
-    echo "ERROR: refusing to update the cluster Secret without a Copilot credential." >&2
-    return 1
-  fi
-
-  kubectl create namespace bluefin-system --dry-run=client -o yaml |
-    kubectl apply -f - >/dev/null || return 1
-
-  kubectl create secret generic review-contributor-secret -n bluefin-system \
-    --from-file=contributor.env="${HIVE_CONTRIBUTOR_ENV}" \
-    --from-file=GH_TOKEN=<(printf '%s' "$GH_TOKEN_VALUE") \
-    --from-file=GITHUB_COPILOT_TOKEN=<(printf '%s' "$COPILOT_TOKEN") \
-    --dry-run=client -o yaml |
-    kubectl apply --server-side --force-conflicts -f - >/dev/null || return 1
-  local legacy_annot
-  legacy_annot="$(kubectl get secret review-contributor-secret -n bluefin-system -o jsonpath='{.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}')" || {
-    echo "ERROR: failed to read secret annotations." >&2
-    return 1
-  }
-  if [[ -n "$legacy_annot" ]]; then
-    kubectl annotate secret review-contributor-secret -n bluefin-system \
-      kubectl.kubernetes.io/last-applied-configuration- >/dev/null || {
-        echo "ERROR: failed to remove legacy plaintext secret annotation." >&2
-        return 1
-      }
-  fi
-
-  local deploy_file="deploy/review-contributor.yaml"
-  if [[ ! -f "$deploy_file" ]]; then
-    echo "ERROR: ${deploy_file} not found." >&2
-    return 1
-  fi
-  kubectl apply -f "$deploy_file" >/dev/null || return 1
-  kubectl set env deployment/review-contributor -n bluefin-system \
-    AGENT_MODEL="$PROFILE_MODEL" \
-    AGENT_REASONING_EFFORT="$PROFILE_EFFORT" \
-    HIVE_HUB="$hub" >/dev/null || return 1
-  kubectl scale deployment/review-contributor -n bluefin-system --replicas="$replicas" >/dev/null || return 1
-  if [[ "$replicas" -gt 0 ]]; then
-    echo "✓ scaled cluster contributor workers to ${replicas} (context ${context}, model ${PROFILE_MODEL} at ${PROFILE_EFFORT} effort)."
-    if ! kubectl rollout status deployment/review-contributor -n bluefin-system --timeout=15s 2>/dev/null; then
-      echo "! rollout still progressing after 15s; workers will continue pulling/starting in background." >&2
-    fi
-    kubectl get pods -n bluefin-system -o wide
-  else
-    echo "✓ scaled cluster contributor workers to 0."
-  fi
-}
 
 scale_contribute() {
-  local replicas="$1" hub model="github-copilot/gemini-3.8-flash"
+  local replicas="$1" hub
   HIVE_SETUP_BACKEND=omp
   ensure_hive_contributor_env || return 1
   hub="$(read_hive_value HIVE_HUB)"
   valid_hive_hub "$hub" || { echo "ERROR: HIVE_HUB is not set in ${HIVE_CONTRIBUTOR_ENV}." >&2; return 1; }
   resolve_gh_token
   [[ -n "${GH_TOKEN_VALUE:-}" ]] || { report_missing_gh_token; return 1; }
-  resolve_copilot_token
-  [[ -n "${COPILOT_TOKEN:-}" ]] || { report_missing_copilot_credential; return 1; }
   kubectl create namespace bluefin-system --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
   kubectl create secret generic contribute-secret -n bluefin-system \
     --from-file=contributor.env="${HIVE_CONTRIBUTOR_ENV}" \
     --from-file=GH_TOKEN=<(printf '%s' "$GH_TOKEN_VALUE") \
-    --from-file=GITHUB_COPILOT_TOKEN=<(printf '%s' "$COPILOT_TOKEN") \
+    --from-file=GITHUB_COPILOT_TOKEN=<(printf '%s' "${GITHUB_COPILOT_TOKEN:-${COPILOT_GITHUB_TOKEN:-}}") \
+    --from-file=ANTHROPIC_API_KEY=<(printf '%s' "${ANTHROPIC_API_KEY:-}") \
+    --from-file=ANTHROPIC_OAUTH_TOKEN=<(printf '%s' "${ANTHROPIC_OAUTH_TOKEN:-}") \
+    --from-file=OPENAI_API_KEY=<(printf '%s' "${OPENAI_API_KEY:-}") \
+    --from-file=GEMINI_API_KEY=<(printf '%s' "${GEMINI_API_KEY:-}") \
     --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f - >/dev/null || return 1
-  local legacy_annot
-  legacy_annot="$(kubectl get secret contribute-secret -n bluefin-system -o jsonpath='{.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}')" || return 1
-  [[ -z "$legacy_annot" ]] || kubectl annotate secret contribute-secret -n bluefin-system kubectl.kubernetes.io/last-applied-configuration- >/dev/null || return 1
+  local prior_annotation
+  prior_annotation="$(kubectl get secret contribute-secret -n bluefin-system -o jsonpath='{.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}')" || return 1
+  [[ -z "$prior_annotation" ]] || kubectl annotate secret contribute-secret -n bluefin-system kubectl.kubernetes.io/last-applied-configuration- >/dev/null || return 1
   kubectl apply -f deploy/contribute.yaml >/dev/null || return 1
-  kubectl set env deployment/contribute -n bluefin-system AGENT_BACKEND=omp AGENT_MODEL="$model" HIVE_HUB="$hub" >/dev/null || return 1
+  kubectl set env deployment/contribute -n bluefin-system AGENT_BACKEND=omp HIVE_HUB="$hub" >/dev/null || return 1
   kubectl scale deployment/contribute -n bluefin-system --replicas="$replicas" >/dev/null || return 1
   kubectl rollout status deployment/contribute -n bluefin-system --timeout=15s >/dev/null 2>&1 || echo "! rollout still progressing after 15s; workers will continue pulling/starting in background." >&2
 }
 
 stop_cluster_contributors() {
-  if command -v kubectl &>/dev/null && kubectl get deployment review-contributor -n bluefin-system &>/dev/null; then
-    kubectl scale deployment/review-contributor -n bluefin-system --replicas=0 >/dev/null
+  if command -v kubectl &>/dev/null && kubectl get deployment contribute -n bluefin-system &>/dev/null; then
+    kubectl scale deployment/contribute -n bluefin-system --replicas=0 >/dev/null
     echo "✓ stopped all cluster contributor workers (scaled to 0 in bluefin-system)."
-    return 0
   else
     echo "✓ no cluster contributor deployment found."
-    return 0
   fi
 }
 '''
 
-# Run the contributor container: the Hive queue worker.
-# Receives Hive-assigned tasks and donates inference through the
-# maintainer's credentials.
-#
-#   just review-container              # gemini: gemini-3.8-flash at max effort
-#   just review-container gemini       # the same, named explicitly
-#   just review-container sol          # gpt-5.6-sol, medium effort
-#   just review-container opus5 high   # claude-opus-5, high effort, 264k context
-#   just review-container k3           # kimi-k3, max effort, 264k context
-#
-# One instance owns the 'review-container' name, so a second concurrent agent
-# needs a name of its own:
-#
-#   REVIEW_CONTAINER_NAME=review-container-2 just review-container opus5 high
-#
-# Usage: just review-container [gemini|sol|gpt-sol|opus5|k3|kimi] [low|medium|high|max]
-# Env:   REVIEW_CONTAINER_NAME=<name>  run a concurrent second instance
-#        (default 'review-container'; must match [a-zA-Z0-9][a-zA-Z0-9_.-]*)
-#        REVIEW_HIVE=<name>  use ~/.config/hive/contributor.<name>.env; when
-#        missing, register a hive under that name. Without it, the current
-#        repository's directory name is tried, then the default
-#        ~/.config/hive/contributor.env.
-[doc("Run the Hive contributor worker: receive assigned tasks and donate inference.")]
-review-container profile="" effort="":
+# Both contributor convenience names enter the same OMP worker. Hive owns task
+# assignment; OMP owns the interactive model and effort choice.
+[doc("Run the Hive + OMP contributor worker.")]
+review-container mode="" count="": (contribute mode count)
+
+[doc("Run the Hive + OMP contributor worker.")]
+contribute mode="" count="":
     #!/usr/bin/env bash
     set -euo pipefail
     {{shared_functions}}
-    TOOL="{{tool_env}}"
-    GEMINI_MODEL="{{gemini_model}}"
-    OPUS_MODEL="{{opus_model}}"
-    SOL_MODEL="{{sol_model}}"
-    K3_MODEL="{{k3_model}}"
-
-    command -v podman &>/dev/null || {
-      echo "ERROR: Podman is required to run the contributor container." >&2
-      echo "  Install Podman, then re-run review-container." >&2
-      exit 1
-    }
-    [[ -z "${REVIEW_DETACH:-}" ]] || {
-      echo "ERROR: detached contributor containers are not supported." >&2
-      exit 1
-    }
-
-    STATE_DIR="${HOME}/.local/state/review"
-    HIVE_SRC_DIR="${STATE_DIR}/hive-src"
-    HIVE_REPO_URL="{{hive_repo_url}}"
-    HIVE_COMMIT="${REVIEW_HIVE_COMMIT:-{{hive_commit}}}"
-    HIVE_COMMIT="${HIVE_COMMIT,,}"
-    mkdir -p "${STATE_DIR}"
-
-    require_valid_tool "$TOOL"
-    BACKEND="${TOOL:-codex}"
-    preflight_agent "$BACKEND"
-
-    raw_profile="{{profile}}"
-    raw_effort="{{effort}}"
-
-    if [[ "$raw_profile" == "cluster" || -n "${REVIEW_SCALE:-}" ]]; then
-      replicas="${REVIEW_SCALE:-2}"
-      model_profile="gemini"
-      model_effort="max"
-      if [[ "$raw_profile" == "cluster" ]]; then
-        if [[ "$raw_effort" =~ ^[0-9]+$ ]]; then
-          replicas="$raw_effort"
-        elif [[ -n "$raw_effort" ]]; then
-          model_profile="$raw_effort"
-        fi
-      elif [[ -n "$raw_profile" ]]; then
-        model_profile="$raw_profile"
-        model_effort="${raw_effort:-max}"
-      fi
-      scale_cluster_contributors "$replicas" "$model_profile" "$model_effort"
-      exit 0
-    fi
-
-    # Resolved before anything interactive so a typo fails immediately rather
-    # than after the model picker and the Hive setup.
-    CONTAINER_NAME="${REVIEW_CONTAINER_NAME:-review-container}"
-    require_valid_container_name "$CONTAINER_NAME"
-
-    resolve_model_profile "{{profile}}" "{{effort}}"
-    REVIEW_RECIPE=review-container
-    ensure_hive_contributor_env
-    report_hive_selection
-    REMOTE_HIVE_TARGET=""
-    REMOTE_HIVE_DIR=""
-    REMOTE_HIVE_ENV=""
-    REMOTE_HIVE_SSH_ARGS=()
-    CODEX_AUTH_STAGING_DIR=""
-    trap 'cleanup_remote_hive_registration; cleanup_codex_auth_file' EXIT
-    stage_hive_registration_for_remote_podman
-
-    CONTRIBUTOR_IMAGE="{{contributor_image}}"
-    require_no_running_instance "$CONTAINER_NAME"
-    ensure_contributor_image "$CONTRIBUTOR_IMAGE"
-
-    CONTAINER_ARGS=(
-      podman run --rm --interactive --tty --replace --name "$CONTAINER_NAME"
-      --label "$(owner_run_label)"
-    )
-    CONTAINER_ARGS+=(
-      # Rootless podman maps the host user to container root by default, so a
-      # 0600 host file bind-mounts in as root-owned and the 'dev' user the
-      # image runs as cannot read it -- contributor.env holds Hive's own
-      # settings and is exactly that. Mapping the host user onto dev's uid
-      # instead makes the mount readable without loosening the host mode.
-      --userns "keep-id:uid=1000,gid=1000"
-      # The selected registration, and nothing else from ~/.config/hive.
-      #
-      # This used to also bind-mount the whole directory, with the selected
-      # file overlaid on top. Rootless Podman prepares the nested target
-      # through the already-mounted host directory, so with a named
-      # registration (REVIEW_HIVE=<name>) the target creation escaped back to
-      # the host: it created a zero-byte ~/.config/hive/contributor.env owned
-      # by a subordinate uid, and the container then failed on the file it had
-      # just caused to exist. Nothing in the image reads anything else from
-      # that directory, so one file mount is both the fix and the smaller
-      # exposure -- a named worker can no longer see other registrations.
-      #
-      # ':z' is the shared SELinux relabel. ':Z' would give each container a
-      # private MCS category, and review supports concurrent named workers
-      # sharing one registration: the second launch would revoke the first
-      # live container's access to it.
-      --volume "${HIVE_CONTRIBUTOR_ENV}:/home/dev/.config/hive/contributor.env:ro,z"
-      --env "AGENT_BACKEND=${BACKEND}"
-      --env "REVIEW_CONTAINER_NAME=${CONTAINER_NAME}"
-      # Podman does not pass COLORTERM through on its own; the entrypoint
-      # needs it to pick the direct-color attach fallback for a host TERM
-      # the image's narrow terminfo set does not know (e.g. xterm-ghostty).
-      --env COLORTERM
-    )
-    if [[ "$BACKEND" == pi ]]; then
-      CONTAINER_ARGS+=(--env ANTHROPIC_API_KEY)
-      echo "✓ Pi credential passed to the agent (value not shown)."
-    fi
-    if [[ "$BACKEND" == codex ]]; then
-      stage_codex_auth_file
-      CONTAINER_ARGS+=(--volume "$CODEX_AUTH_FILE:/home/dev/.codex/auth.json:rw,z")
-      echo "✓ Codex subscription login staged as one private file (contents not shown; host cache not mounted)."
-    fi
-    resolve_gh_token
-    if [[ -n "${GH_TOKEN_VALUE:-}" ]]; then
-      export GH_TOKEN="$GH_TOKEN_VALUE"
-      CONTAINER_ARGS+=(--env GH_TOKEN)
-      report_gh_token_blast_radius "${GH_TOKEN_SOURCE}"
-    else
-      report_missing_gh_token
-    fi
-    CONTAINER_ARGS+=("$CONTRIBUTOR_IMAGE")
-
-    echo "✓ starting the review contributor container."
-    echo "  The entrypoint shows a passive status companion; attach to the agent's"
-    echo "  session from a second terminal: podman exec -it ${CONTAINER_NAME} tmux attach -t contributor"
-    echo "  Stop any time with Ctrl-C."
-    status=0
-    "${CONTAINER_ARGS[@]}" || status=$?
-    exit "$status"
-
-# Start the isolated OMP contributor image. Hive still owns registration,
-# assignment, tmux lifecycle, prompt delivery, and completion.
-[doc("Start the isolated Hive + OMP contributor worker.")]
-contribute profile="" effort="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{shared_functions}}
-    if [[ "{{profile}}" == cluster ]]; then
-      replicas="{{effort}}"; replicas="${replicas:-2}"
+    if [[ {{quote(mode)}} == cluster ]]; then
+      replicas={{quote(count)}}; replicas="${replicas:-2}"
       [[ "$replicas" =~ ^[0-9]+$ ]] || { echo "ERROR: contribute cluster expects a replica count." >&2; exit 1; }
       STATE_DIR="${HOME}/.local/state/review"; HIVE_SRC_DIR="${STATE_DIR}/hive-src"; HIVE_REPO_URL="{{hive_repo_url}}"
       HIVE_COMMIT="${REVIEW_HIVE_COMMIT:-{{hive_commit}}}"; HIVE_COMMIT="${HIVE_COMMIT,,}"; mkdir -p "$STATE_DIR"
-      HIVE_SETUP_BACKEND=omp; REVIEW_RECIPE=contribute
+      REVIEW_RECIPE=contribute
       scale_contribute "$replicas"
       exit $?
     fi
-    command -v podman &>/dev/null || { echo "ERROR: Podman is required to run contribute." >&2; exit 1; }
+    [[ -z {{quote(count)}} ]] || { echo "ERROR: contribute accepts one instance name outside cluster mode." >&2; exit 1; }
+    INSTANCE_HINT={{quote(mode)}}
+    if [[ -n "$INSTANCE_HINT" ]]; then
+      [[ "$INSTANCE_HINT" =~ ^[a-zA-Z0-9._-]+(/[a-zA-Z0-9._-]+)?$ ]] || { echo "ERROR: invalid contributor instance '${INSTANCE_HINT}'." >&2; exit 1; }
+      export REVIEW_HIVE="${REVIEW_HIVE:-${INSTANCE_HINT//\//-}}"
+    fi
     [[ -z "${REVIEW_DETACH:-}" ]] || { echo "ERROR: detached contributor containers are not supported." >&2; exit 1; }
-    case "{{profile}}" in
-      ""|gemini) default_model="github-copilot/gemini-3.8-flash" ;;
-      luna) default_model="github-copilot/gpt-5.6-luna" ;;
-      opus5) default_model="github-copilot/claude-opus-5" ;;
-      sol) default_model="github-copilot/gpt-5.6-sol" ;;
-      *) echo "ERROR: unknown contribute profile '{{profile}}'; expected gemini, luna, opus5, or sol." >&2; exit 1 ;;
-    esac
-    [[ -z "{{effort}}" ]] || { echo "ERROR: contribute does not accept a thinking-effort argument; OMP owns its model settings." >&2; exit 1; }
-    export AGENT_MODEL="${AGENT_MODEL:-$default_model}"
     STATE_DIR="${HOME}/.local/state/review"
     HIVE_SRC_DIR="${STATE_DIR}/hive-src"
     HIVE_REPO_URL="{{hive_repo_url}}"
@@ -1464,302 +625,70 @@ contribute profile="" effort="":
     REVIEW_RECIPE=contribute
     ensure_hive_contributor_env
     report_hive_selection
-    REMOTE_HIVE_TARGET=""; REMOTE_HIVE_DIR=""; REMOTE_HIVE_ENV=""; REMOTE_HIVE_SSH_ARGS=()
-    trap 'cleanup_remote_hive_registration' EXIT
-    stage_hive_registration_for_remote_podman
-    CONTAINER_NAME="${CONTRIBUTE_CONTAINER_NAME:-contribute}"
-    require_valid_container_name "$CONTAINER_NAME"
+    INSTANCE_KEY="$(instance_key "${BLUEFIN_INSTANCE:-contribute-${INSTANCE_HINT:-${HIVE_REGISTRATION_NAME:-default}}}")"
+    INSTANCE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/bluefin/instances/${INSTANCE_KEY}"
+    INSTANCE_HOME="${INSTANCE_ROOT}/home"
+    mkdir -p "$INSTANCE_HOME/workspace"
+    CONTAINER_NAME="bluefin-contribute-${INSTANCE_KEY}-$(date +%s)-$$"
+    CONTRIBUTOR_VOLUME="${BLUEFIN_CONTRIBUTE_VOLUME:-bluefin-contribute-${INSTANCE_KEY}-home}"
     CONTRIBUTOR_IMAGE="{{contribute_image}}"
-    require_no_running_instance "$CONTAINER_NAME"
-    ensure_contributor_image "$CONTRIBUTOR_IMAGE"
-    CONTAINER_ARGS=(podman run --rm --interactive --tty --replace --name "$CONTAINER_NAME" --label "$(owner_run_label)" --userns "keep-id:uid=65532,gid=65532")
-    CONTAINER_ARGS+=(--volume "${HIVE_CONTRIBUTOR_ENV}:/home/bluefin/.config/hive/contributor.env:ro,z" --env AGENT_BACKEND=omp --env AGENT_MODEL --env COLORTERM --env "HIVE_CONTAINER_NAME=${CONTAINER_NAME}" --env HIVE_CONTAINER_RUNTIME=podman)
-    for name in GITHUB_COPILOT_TOKEN COPILOT_GITHUB_TOKEN GITHUB_TOKEN ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN OPENAI_API_KEY GEMINI_API_KEY; do
-      [[ -n "${!name:-}" ]] && CONTAINER_ARGS+=(--env "$name")
-    done
     resolve_gh_token
-    if [[ -n "${GH_TOKEN_VALUE:-}" ]]; then export GH_TOKEN="$GH_TOKEN_VALUE"; CONTAINER_ARGS+=(--env GH_TOKEN); report_gh_token_blast_radius "$GH_TOKEN_SOURCE"; else report_missing_gh_token; fi
-    CONTAINER_ARGS+=("$CONTRIBUTOR_IMAGE")
-    echo "✓ starting the isolated OMP contributor container."
-    echo "  The entrypoint attaches this terminal to the 'contributor' tmux session automatically."
-    echo "  For a second, concurrent viewer: podman exec -it ${CONTAINER_NAME} tmux attach -t contributor"
-    "${CONTAINER_ARGS[@]}"
+    if [[ -n "${GH_TOKEN_VALUE:-}" ]]; then export GH_TOKEN="$GH_TOKEN_VALUE"; report_gh_token_blast_radius "$GH_TOKEN_SOURCE"; else report_missing_gh_token; fi
 
-# Stop cluster contributor workers. This is the explicit lifecycle verb for
-# cluster workers; it refuses attended local runs (which end with Ctrl-C in
-# their terminal) and containers this launcher did not start.
+    KVM_FAILURE=""
+    if kvm_runtime_ready; then
+      REMOTE_HIVE_TARGET=""; REMOTE_HIVE_DIR=""; REMOTE_HIVE_ENV=""; REMOTE_HIVE_SSH_ARGS=()
+      trap 'cleanup_remote_hive_registration' EXIT
+      stage_hive_registration_for_remote_podman
+      ensure_contributor_image "$CONTRIBUTOR_IMAGE"
+      CONTAINER_ARGS=(podman run --runtime=krun --rm --interactive --tty --name "$CONTAINER_NAME" --userns "keep-id:uid=65532,gid=65532")
+      CONTAINER_ARGS+=(--volume "${CONTRIBUTOR_VOLUME}:/home/bluefin:rw" --volume "${HIVE_CONTRIBUTOR_ENV}:/home/bluefin/.config/hive/contributor.env:ro,z" --env AGENT_BACKEND=omp --env COLORTERM --env "HIVE_CONTAINER_NAME=${CONTAINER_NAME}" --env HIVE_CONTAINER_RUNTIME=podman)
+      for name in GITHUB_COPILOT_TOKEN COPILOT_GITHUB_TOKEN GITHUB_TOKEN ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN OPENAI_API_KEY GEMINI_API_KEY; do
+        [[ -n "${!name:-}" ]] && CONTAINER_ARGS+=(--env "$name")
+      done
+      [[ -n "${GH_TOKEN_VALUE:-}" ]] && CONTAINER_ARGS+=(--env GH_TOKEN)
+      CONTAINER_ARGS+=("$CONTRIBUTOR_IMAGE")
+      echo "✓ starting isolated KVM contributor ${CONTAINER_NAME}. Choose model and effort in OMP."
+      "${CONTAINER_ARGS[@]}"
+      exit $?
+    fi
+
+    require_apptainer_fallback
+    [[ "$CONTRIBUTOR_IMAGE" != localhost/* ]] || { echo "ERROR: Apptainer cannot resolve local Podman image ${CONTRIBUTOR_IMAGE}." >&2; exit 1; }
+    APPTAINER_IMAGE="$CONTRIBUTOR_IMAGE"; [[ "$APPTAINER_IMAGE" == *://* ]] || APPTAINER_IMAGE="docker://${APPTAINER_IMAGE}"
+    echo "✓ starting isolated Apptainer contributor ${INSTANCE_KEY}. Choose model and effort in OMP."
+    prepare_apptainer_environment
+    exec apptainer run --containall --no-eval --home "${INSTANCE_HOME}:/home/bluefin" --pwd /home/bluefin/workspace \
+      --bind "${HIVE_CONTRIBUTOR_ENV}:/home/bluefin/.config/hive/contributor.env:ro" "$APPTAINER_IMAGE"
+
+# Stop cluster contributor workers. Local appliances belong to their foreground
+# terminals and stop with Ctrl-C.
 [doc("Stop cluster contributor workers.")]
 review-stop target="cluster":
     #!/usr/bin/env bash
     set -euo pipefail
     {{shared_functions}}
-    TARGET="{{target}}"
-    if [[ "$TARGET" == "cluster" ]]; then
-      stop_cluster_contributors
-      exit 0
-    fi
-    [[ "$TARGET" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || {
-      echo "ERROR: '${TARGET}' is not a valid container name." >&2
-      exit 1
-    }
-    marker="$(podman inspect --format '{{{{index .Config.Labels "review.owner"}}' "$TARGET" 2>/dev/null || true)"
-    if [[ -z "$marker" ]]; then
-      if podman container exists "$TARGET" 2>/dev/null; then
-        echo "ERROR: ${TARGET} was not started by this launcher; not touching it." >&2
-        exit 1
-      fi
-      echo "✓ no container named ${TARGET} is running."
-      exit 0
-    fi
-    echo "ERROR: ${TARGET} is an attended run; press Ctrl-C in its terminal instead." >&2
-    exit 1
+    [[ "{{target}}" == cluster ]] || { echo "ERROR: review-stop only accepts 'cluster'; local appliances stop with Ctrl-C." >&2; exit 1; }
+    stop_cluster_contributors
 
-# The maintainer review dashboard over the Bluefin PR queue.
-# The container runs the dashboard instead of the contributor agent, so no
-# Hive registration is mounted or required. When one exists, only its HIVE_HUB
-# URL is passed so the dashboard can consult the selected deployment.
-# Foreground: q or Ctrl-C stops.
-# Arguments pass straight through to the dashboard:
-#
-#   just review-queue                      # gemini: gemini-3.8-flash at max effort
-#   just review-queue sol                  # gpt-5.6-sol at medium effort
-#   just review-queue k3 high              # pick the model profile and effort
-#   just review-queue owner/repo            # live open PRs for one repository
-#   just review-queue --repo bluefin       # narrow the org queue to one repository
-#   just review-queue opus5 --all          # profile, then dashboard flags
-#
-# One instance owns the 'review-queue' name; REVIEW_QUEUE_NAME overrides it
-# for a concurrent second dashboard, exactly as REVIEW_CONTAINER_NAME does for
-# review-container.
-[doc("Open the maintainer review dashboard over the Bluefin PR queue.")]
-review-queue *queue_args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{shared_functions}}
-    TOOL="{{tool_env}}"
-    GEMINI_MODEL="{{gemini_model}}"
-    OPUS_MODEL="{{opus_model}}"
-    SOL_MODEL="{{sol_model}}"
-    K3_MODEL="{{k3_model}}"
+# Maintainer convenience name for the OMP appliance. Keep this as delegation,
+# not a second launch path: review-queue and review-appliance must execute the
+# same image, entrypoint, configuration, and workbench.
+alias review-queue := review-appliance
 
-    resolve_review_backend
-    K8S_DASHBOARD=0
-    if [[ "${REVIEW_RUNTIME:-}" == k8s ]]; then
-      if review_queue_kubernetes_available; then
-        K8S_DASHBOARD=1
-      else
-        runtime_status=$?
-        if [[ "$runtime_status" == 2 ]]; then
-          exit 1
-        fi
-        echo "! Kubernetes is unavailable; using the local Podman dashboard." >&2
-      fi
-    fi
-    if [[ "$K8S_DASHBOARD" != 1 ]]; then
-      command -v podman &>/dev/null || {
-        echo "ERROR: Podman is required to run the contributor container." >&2
-        echo "  Install Podman, then re-run review-queue." >&2
-        exit 1
-      }
-      require_local_podman_engine
-    fi
-
-    require_valid_tool "$TOOL"
-    preflight_agent "$REVIEW_BACKEND"
-
-    CONTAINER_NAME="${REVIEW_QUEUE_NAME:-review-queue}"
-    require_valid_container_name "$CONTAINER_NAME"
-
-    # Leading non-flag arguments are the model profile and thinking effort,
-    # exactly as review-container takes them; everything from the first '-'
-    # flag onward belongs to the dashboard. Word-splitting {{queue_args}} is
-    # the point: it arrives as one string of separate flags.
-    # shellcheck disable=SC2086
-    set -- {{queue_args}}
-    profile="" effort=""
-    if [[ $# -gt 0 && "$1" != -* && "$1" != */* ]]; then profile="$1"; shift; fi
-    if [[ $# -gt 0 && "$1" != -* && "$1" != */* ]]; then effort="$1"; shift; fi
-    resolve_model_profile "${profile:-gemini}" "$effort"
-    # The unambiguous repository form follows the existing profile/effort
-    # pair. Keep all flag forms byte-for-byte available to the dashboard.
-    if [[ $# -gt 0 && "$1" != -* ]]; then
-      set -- --live-repo "$1" "${@:2}"
-    fi
-
-    # The dashboard needs only the selected hub URL. Resolve the same named
-    # registration as review-container, but never mount contributor.env or pass
-    # its registration token into the maintainer surface.
-    HIVE_CONTRIBUTOR_ENV="${HOME}/.config/hive/contributor.env"
-    hive_registration_name
-    if [[ -n "$HIVE_REGISTRATION_NAME" ]]; then
-      named_hive_env="${HOME}/.config/hive/contributor.${HIVE_REGISTRATION_NAME}.env"
-      if [[ -f "$named_hive_env" ]]; then
-        HIVE_CONTRIBUTOR_ENV="$named_hive_env"
-      elif [[ -n "${REVIEW_HIVE:-}" ]]; then
-        echo "ERROR: no hive registration named '${HIVE_REGISTRATION_NAME}' at ${named_hive_env}." >&2
-        echo "  Register it first: REVIEW_HIVE=${HIVE_REGISTRATION_NAME} just review-container" >&2
-        exit 1
-      fi
-    fi
-    DASHBOARD_HIVE_HUB="${HIVE_HUB:-}"
-    if [[ -n "$DASHBOARD_HIVE_HUB" ]]; then
-      if ! valid_hive_hub "$DASHBOARD_HIVE_HUB"; then
-        echo "! inherited HIVE_HUB is unsupported; the dashboard requires one wss:// or https:// URL and will continue without Hive." >&2
-        DASHBOARD_HIVE_HUB=""
-      fi
-    elif [[ -f "$HIVE_CONTRIBUTOR_ENV" ]]; then
-      DASHBOARD_HIVE_HUB="$(read_hive_value HIVE_HUB)"
-      if [[ -z "$DASHBOARD_HIVE_HUB" ]]; then
-        echo "! ${HIVE_CONTRIBUTOR_ENV} has no usable HIVE_HUB; the dashboard will continue without Hive." >&2
-      elif ! valid_hive_hub "$DASHBOARD_HIVE_HUB"; then
-        echo "! ${HIVE_CONTRIBUTOR_ENV} has an unsupported HIVE_HUB; the dashboard requires one wss:// or https:// URL and will continue without Hive." >&2
-        DASHBOARD_HIVE_HUB=""
-      fi
-    fi
-
-    CONTRIBUTOR_IMAGE="{{contributor_image}}"
-    if [[ "$K8S_DASHBOARD" != 1 ]]; then
-      require_no_running_instance "$CONTAINER_NAME"
-      ensure_contributor_image "$CONTRIBUTOR_IMAGE"
-    fi
-
-    # The lab offer happens before anything starts and answers in one
-    # question. Declining, no terminal, no kubectl, or an unreachable
-    # cluster all leave LAB_SOCKET empty and the dashboard fully usable.
-    if [[ "$K8S_DASHBOARD" != 1 ]]; then
-      offer_lab_session
-      offer_review_exec_session
-    fi
-
-    CONTAINER_ARGS=(
-      podman run --rm --interactive --tty --replace --name "$CONTAINER_NAME"
-      --label "$(owner_run_label)"
-      --userns "keep-id:uid=1000,gid=1000"
-      # Podman does not pass COLORTERM through on its own.
-      --env COLORTERM
-    )
-    add_lab_container_args
-    add_review_exec_container_args
-    # The dashboard's record — dispatched landing batches, their failure
-    # reasons, the action trace — lives under the container's XDG state
-    # directory, and a reclaim-by-replace relaunch must not lose it (#281).
-    # One shared host directory under the host XDG state root: the queue it
-    # records is the same whichever instance name runs, and :z keeps it
-    # writable for concurrent named dashboards.
-    if [[ "$K8S_DASHBOARD" != 1 ]]; then
-      QUEUE_STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/bluefin-review"
-      mkdir -p "$QUEUE_STATE_DIR"
-      CONTAINER_ARGS+=(--volume "${QUEUE_STATE_DIR}:/home/dev/.local/state/bluefin-review:rw,z")
-    fi
-    # The instance name qualifies each landing batch id: two named dashboards
-    # share the state directory, and a bare timestamp id would let their
-    # batches overwrite each other's prompt, status, and log.
-    export BLUEFIN_REVIEW_INSTANCE="$CONTAINER_NAME"
-    CONTAINER_ARGS+=(--env BLUEFIN_REVIEW_INSTANCE)
-    if [[ -n "$DASHBOARD_HIVE_HUB" ]]; then
-      CONTAINER_ARGS+=(--env "HIVE_HUB=${DASHBOARD_HIVE_HUB}")
-      report_hive_selection "$DASHBOARD_HIVE_HUB"
-    fi
-    if [[ "$REVIEW_BACKEND" != codex ]]; then
-      [[ -n "$AGENT_MODEL" ]] && CONTAINER_ARGS+=(--env "AGENT_MODEL=${AGENT_MODEL}")
-      [[ -n "${AGENT_REASONING_EFFORT:-}" ]] && CONTAINER_ARGS+=(--env "AGENT_REASONING_EFFORT=${AGENT_REASONING_EFFORT}")
-    fi
-    if [[ -n "$REVIEW_BACKEND" ]]; then
-      CONTAINER_ARGS+=(--env "BLUEFIN_REVIEW_BACKEND=${REVIEW_BACKEND}")
-      echo "✓ review backend preselected: ${REVIEW_BACKEND}; Start still requires confirmation."
-    fi
-    # The Copilot credential powers every dispatched agent: reviews, fixers,
-    # and landings all run headless, which exits immediately with
-    # "Provider is not configured" when the credential is absent. A dashboard
-    # that can only produce dead dispatches is broken at its one job, so a
-    # missing credential stops the launch.
-    if [[ "$REVIEW_BACKEND" != codex ]]; then
-      resolve_copilot_token
-      if [[ -n "${COPILOT_TOKEN:-}" ]]; then
-        export GITHUB_COPILOT_TOKEN="$COPILOT_TOKEN"
-        CONTAINER_ARGS+=(--env GITHUB_COPILOT_TOKEN)
-        echo "✓ Copilot credential passed to the agent."
-      else
-        report_missing_copilot_credential
-        exit 1
-      fi
-    fi
-    # Codex subscription OAuth is staged into one private file, not mounted
-    # from the host login or configuration directory. The official CLI may
-    # refresh only the disposable copy, which is removed when this run exits.
-    CODEX_AUTH_STAGING_DIR=""
-    # One trap owns this session's teardown: the staged Codex credential,
-    # the lab broker, and the review-exec broker die with the terminal.
-    trap 'cleanup_kubernetes_dashboard; cleanup_codex_auth_file; cleanup_lab_broker; cleanup_review_exec_broker' EXIT
-    if [[ "$REVIEW_BACKEND" == codex ]]; then
-      if [[ "$K8S_DASHBOARD" != 1 ]]; then
-        stage_codex_auth_file
-        if [[ -n "$CODEX_AUTH_FILE" ]]; then
-          CONTAINER_ARGS+=(--volume "$CODEX_AUTH_FILE:/home/dev/.codex/auth.json:rw,z")
-          echo "✓ Codex subscription login staged as one private file (contents not shown; host cache not mounted)."
-        else
-          echo "! Codex subscription login unavailable; run 'codex login' with file credential storage." >&2
-          echo "  Review stays open, reports NEEDS SIGN-IN, and never silently selects Codex." >&2
-        fi
-      else
-        echo "! Kubernetes dashboard sessions do not stage a Codex subscription login." >&2
-      fi
-    fi
-    # The dashboard is a GitHub reader from the first keystroke to the last, so
-    # an identity is load-bearing here, not advisory.
-    resolve_gh_token
-    if [[ -z "${GH_TOKEN_VALUE:-}" ]]; then
-      report_missing_gh_token
-      echo "ERROR: the dashboard reads live pull-request state from GitHub and cannot run without a token." >&2
-      exit 1
-    fi
-    export GH_TOKEN="$GH_TOKEN_VALUE"
-    CONTAINER_ARGS+=(--env GH_TOKEN)
-    report_gh_token_blast_radius "${GH_TOKEN_SOURCE}"
-
-    if [[ "$K8S_DASHBOARD" == 1 ]]; then
-      echo "✓ starting the maintainer review dashboard in Kubernetes."
-      echo "  q or Ctrl-C stops; the dashboard is the only thing running."
-      review_queue_kubernetes "$CONTRIBUTOR_IMAGE" "$@"
-      exit $?
-    fi
-
-    # Whatever survived the profile/effort shift belongs to the dashboard.
-    CONTAINER_ARGS+=("$CONTRIBUTOR_IMAGE" queue "$@")
-
-    if [[ -n "$DASHBOARD_HIVE_HUB" ]]; then
-      echo "✓ starting the maintainer review dashboard (Hive configured)."
-    else
-      echo "✓ starting the maintainer review dashboard (Hive not configured)."
-    fi
-    echo "  q or Ctrl-C stops; the dashboard is the only thing running."
-    "${CONTAINER_ARGS[@]}"
-
-# The distroless review appliance: one image, no host toolchain, no Python
-# dashboard, no Hive worker. It is the Bluefin Review mode of omp and the
-# binaries it needs, and it runs the same on any machine with podman or docker.
-#
-#   just review-appliance                  # the whole organization queue
-#   just review-appliance owner/repo       # review one repository, anywhere
-#   just review-appliance --pr 1284        # preselect one pull request
-#   just review-appliance --issues         # start on issues
-#
-# State lives in a named volume rather than the image, so sessions, logs and
-# review receipts survive a pull. The current directory is mounted read-write at
-# /workspace: the agent reviews what you are standing in.
+# The review appliance prefers one foreground libkrun microVM per invocation.
+# Target-specific state and workspace directories also keep the Apptainer
+# fallback independent when KVM is unavailable.
 [doc("Run the distroless Bluefin Review appliance container.")]
+[positional-arguments]
 review-appliance *appliance_args:
     #!/usr/bin/env bash
     set -euo pipefail
+    {{shared_functions}}
     IMAGE="${REVIEW_APPLIANCE_IMAGE:-ghcr.io/projectbluefin/review:stable}"
-    ENGINE="${CONTAINER_ENGINE:-podman}"
-    if ! command -v "$ENGINE" >/dev/null 2>&1; then
-      echo "ERROR: ${ENGINE} is not installed; the appliance needs podman or docker." >&2
-      exit 1
-    fi
 
     # The token is resolved on the host and inherited by name. It is never an
-    # argument, never a mount, and never lands in the image or a log line.
+    # argument, mount payload, image layer, or log value.
     if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
       GH_TOKEN="$(gh auth token 2>/dev/null || true)"
       export GH_TOKEN
@@ -1769,31 +698,42 @@ review-appliance *appliance_args:
       echo "  Run 'gh auth login' or export GH_TOKEN." >&2
     fi
 
-    ARGS=(run --rm --interactive --tty --name "${REVIEW_APPLIANCE_NAME:-bluefin-review}" --replace)
-    if [[ "$ENGINE" == podman ]]; then
-      # Map the invoking user onto the image's nonroot uid so the named volume
-      # and the workspace mount are writable without loosening either.
-      ARGS+=(--userns "keep-id:uid=65532,gid=65532")
-    fi
-    ARGS+=(
-      --volume "${REVIEW_APPLIANCE_VOLUME:-bluefin-review-home}:/home/bluefin:rw"
-      --volume "${PWD}:/workspace:rw,z"
-      --env GH_TOKEN --env GITHUB_TOKEN --env COPILOT_GITHUB_TOKEN --env GITHUB_COPILOT_TOKEN
-      --env ANTHROPIC_API_KEY --env OPENAI_API_KEY
-      # Hive owns priority when a hub is configured. The hub URL is inherited by
-      # name like every other credential-adjacent value; the appliance only ever
-      # reads from it.
-      --env HIVE_HUB
-      --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}"
-      --env BLUEFIN_REVIEW_ORG
-    )
-    # Forward parsed review scope and options to the appliance container.
     source scripts/parse-review-args.sh
-    # shellcheck disable=SC2086
-    parse_review_args {{appliance_args}}
+    parse_review_args "$@"
     APPLIANCE_ARGS=("${PARSED_REVIEW_ARGS[@]}")
+    SCOPE=projectbluefin
+    PREVIOUS=""
+    for ARG in "${APPLIANCE_ARGS[@]}"; do
+      if [[ "$PREVIOUS" == --repo ]]; then SCOPE="$ARG"; break; fi
+      PREVIOUS="$ARG"
+    done
+    INSTANCE_KEY="$(instance_key "${BLUEFIN_INSTANCE:-review-${SCOPE}}")"
+    INSTANCE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/bluefin/instances/${INSTANCE_KEY}"
+    INSTANCE_HOME="${INSTANCE_ROOT}/home"
+    INSTANCE_WORKSPACE="${INSTANCE_ROOT}/workspace"
+    mkdir -p "$INSTANCE_HOME" "$INSTANCE_WORKSPACE"
+    CONTAINER_NAME="bluefin-review-${INSTANCE_KEY}-$(date +%s)-$$"
+    KVM_FAILURE=""
+    if kvm_runtime_ready; then
+      ARGS=(run --runtime=krun --rm --interactive --tty --name "$CONTAINER_NAME")
+      ARGS+=(--userns "keep-id:uid=65532,gid=65532")
+      ARGS+=(
+        --volume "bluefin-review-${INSTANCE_KEY}-home:/home/bluefin:rw"
+        --volume "bluefin-review-${INSTANCE_KEY}-workspace:/workspace:rw"
+        --env GH_TOKEN --env GITHUB_TOKEN --env COPILOT_GITHUB_TOKEN --env GITHUB_COPILOT_TOKEN
+        --env ANTHROPIC_API_KEY --env ANTHROPIC_OAUTH_TOKEN --env OPENAI_API_KEY --env GEMINI_API_KEY
+        --env HIVE_HUB --env BLUEFIN_REVIEW_ORG
+        --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}"
+      )
+      exec podman "${ARGS[@]}" "$IMAGE" ${APPLIANCE_ARGS[@]+"${APPLIANCE_ARGS[@]}"}
+    fi
 
-    "$ENGINE" "${ARGS[@]}" "$IMAGE" ${APPLIANCE_ARGS[@]+"${APPLIANCE_ARGS[@]}"}
+    require_apptainer_fallback
+    [[ "$IMAGE" != localhost/* ]] || { echo "ERROR: Apptainer cannot resolve local Podman image ${IMAGE}." >&2; exit 1; }
+    APPTAINER_IMAGE="$IMAGE"; [[ "$APPTAINER_IMAGE" == *://* ]] || APPTAINER_IMAGE="docker://${APPTAINER_IMAGE}"
+    prepare_apptainer_environment
+    exec apptainer run --containall --no-eval --home "${INSTANCE_HOME}:/home/bluefin" --pwd /workspace \
+      --bind "${INSTANCE_WORKSPACE}:/workspace" "$APPTAINER_IMAGE" ${APPLIANCE_ARGS[@]+"${APPLIANCE_ARGS[@]}"}
 
 # Build the appliance from this checkout and hold it to its contract. The
 # version is derived, never typed: FSDK series from the pinned base, revision
@@ -1829,8 +769,18 @@ review-doctor:
       if "$@" &>/dev/null; then echo "  ✓ ${label}"; pass=$((pass+1));
       else echo "  ✗ ${label}"; fail=$((fail+1)); fi
     }
-    echo "=== Host ==="
-    check "Podman installed" command -v podman
+    echo "=== Isolation runtime ==="
+    KVM_FAILURE=""
+    if kvm_runtime_ready; then
+      echo "  ✓ Podman krun KVM runtime ready"
+      pass=$((pass+1))
+    elif command -v apptainer &>/dev/null; then
+      echo "  ! ${KVM_FAILURE}; isolated Apptainer fallback ready"
+      pass=$((pass+1))
+    else
+      echo "  ✗ ${KVM_FAILURE}; Apptainer fallback unavailable"
+      fail=$((fail+1))
+    fi
     echo ""
 
     echo "=== GitHub ==="
@@ -1863,28 +813,14 @@ review-doctor:
     unset GH_TOKEN_VALUE
     echo ""
 
-    BACKEND="${TOOL:-codex}"
-    require_valid_tool "$BACKEND" || fail=$((fail+1))
-    echo "=== Agent backend (Codex) ==="
-    if codex_auth_configured; then
-      echo "  ✓ codex: subscription login available"
-      pass=$((pass+1))
-    else
-      echo "  ✗ codex: subscription login unavailable"
-      echo "    Run: codex login (file credential storage)"
-      fail=$((fail+1))
-    fi
-    echo ""
 
     echo "=== Contributor image ==="
-    DOCTOR_CONTRIBUTOR_IMAGE="{{contributor_image}}"
+    DOCTOR_CONTRIBUTOR_IMAGE="{{contribute_image}}"
     if contributor_image_available "$DOCTOR_CONTRIBUTOR_IMAGE"; then
       echo "  ✓ ${DOCTOR_CONTRIBUTOR_IMAGE} is resolvable"
       pass=$((pass+1))
     else
       echo "  ✗ ${DOCTOR_CONTRIBUTOR_IMAGE} cannot be resolved"
-      echo "    Published tags are 'stable', the version tags and 'sha-<commit>'; ':latest' does not exist."
-      echo "    Override with REVIEW_CONTRIBUTOR_IMAGE (a 'sha-' tag or digest pins a build), or build image/Containerfile locally."
       fail=$((fail+1))
     fi
     echo ""
@@ -1899,18 +835,10 @@ review-doctor:
     if [[ -f "$HIVE_CONTRIBUTOR_ENV" ]]; then
       echo "  ✓ ${HIVE_CONTRIBUTOR_ENV} exists"
       pass=$((pass+1))
-      DOCTOR_BACKEND="$(hive_contributor_backend "$HIVE_CONTRIBUTOR_ENV")"
-      if [[ -n "$DOCTOR_BACKEND" && "$DOCTOR_BACKEND" != "$BACKEND" ]]; then
-        echo "  ! ${HIVE_CONTRIBUTOR_ENV} says AGENT_BACKEND=${DOCTOR_BACKEND}, but the selected backend is ${BACKEND}."
-        echo "    The launcher will not rewrite Hive's saved backend selection."
-        echo "    Edit that line yourself if you want the file to match."
-      fi
     else
       echo "  ✗ ${HIVE_CONTRIBUTOR_ENV} is missing"
-      echo "    review runs upstream 'just contribute-setup codex' from"
+      echo "    review runs upstream 'just contribute-setup omp' from"
       echo "    hivecommons/hive @ ${HIVE_COMMIT:0:12} on first attended launch."
-      echo "    That runs with upstream's documented HIVE_SKIP_VERSION_CHECK=true,"
-      echo "    because the pinned checkout is detached and cannot match origin/v4."
       fail=$((fail+1))
     fi
     echo ""
@@ -1920,12 +848,12 @@ review-doctor:
       k8s_ctx="$(kubectl config current-context 2>/dev/null || true)"
       if [[ -n "$k8s_ctx" ]]; then
         echo "  ✓ Kubernetes context: ${k8s_ctx}"
-        if kubectl get deployment review-contributor -n bluefin-system &>/dev/null; then
-          ready_rep="$(kubectl get deployment review-contributor -n bluefin-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)"
-          spec_rep="$(kubectl get deployment review-contributor -n bluefin-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)"
-          echo "  ✓ review-contributor: ${ready_rep:-0}/${spec_rep:-0} ready replicas in bluefin-system"
+        if kubectl get deployment contribute -n bluefin-system &>/dev/null; then
+          ready_rep="$(kubectl get deployment contribute -n bluefin-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)"
+          spec_rep="$(kubectl get deployment contribute -n bluefin-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)"
+          echo "  ✓ contribute: ${ready_rep:-0}/${spec_rep:-0} ready replicas in bluefin-system"
         else
-          echo "  - review-contributor: not deployed (scale with 'just review-container cluster [N]')"
+          echo "  - contribute: not deployed (scale with 'just contribute cluster [N]')"
         fi
       else
         echo "  - kubectl installed, no active context"

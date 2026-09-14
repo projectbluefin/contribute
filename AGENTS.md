@@ -4,11 +4,11 @@
 mode for Oh My Pi shipped in a distroless appliance image, and a launcher.
 The primary maintainer review product runs via the OMP extension entrypoints:
 in source via `bin/omp-review` or packaged via `just review-appliance` and
-`image/appliance/Containerfile`. The `review-container` recipe runs the isolated
-`contribute` Hive worker, and `review-queue` runs the retained Textual maintainer
-compatibility dashboard. Review owns the appliance image, extension, launcher
-credential handoff, and review context; Hive owns its contributor protocol, task
-selection, tmux session, prompt injection, and output capture.
+`image/appliance/Containerfile`. `review-queue` is a convenience alias for that
+same appliance. The `review-container` recipe remains the isolated Hive worker.
+Review owns the appliance image, extension, launcher credential handoff, and
+review context; Hive owns its contributor protocol, task selection, tmux
+session, prompt injection, and output capture.
 OMP owns agent execution, sessions, tasks, and tool boundaries. Maintainer Hive
 reads remain optional, non-mutating context and ordering, while contributor
 task selection and assignment remain Hive-owned.
@@ -22,9 +22,9 @@ task selection and assignment remain Hive-owned.
 
 ## Boundaries
 
-Keep this repository focused: it ships the review appliance and nothing
-beside it. Persistent state stays limited to launcher configuration and the
-review-queue landing record the launcher mounts for the dashboard.
+Keep this repository focused: it ships the OMP review appliance and the Hive
+contributor runtime. Persistent maintainer state belongs to OMP's appliance
+home volume; no second dashboard state store is permitted.
 
 The interactive recipes run the image runtime in the foreground of the
 terminal that launched them, and Ctrl-C stops them. Detached contributor
@@ -45,52 +45,46 @@ credential values, SSH targets, or endpoints appear in arguments, logs, or commi
 files. Preserve `--userns keep-id` for rootless Podman access to the `0600` Hive
 contributor credential; never loosen that file's permissions as a workaround.
 
-That rule scopes how the launcher starts the container; it is not a ban
-on `&` anywhere in the repository. Backgrounding is required where it is what
-preserves signal responsiveness. Bash defers a trap handler while it waits on
-a foreground child, so `image/entrypoint.sh` runs the contributor agent and
-`tmux attach-session` as background jobs it `wait`s on, keeping PID 1
-signal-responsive; a foreground attach swallowed SIGTERM for the whole session
-and forced podman's ten-second SIGKILL. Do not "fix" that.
+That rule scopes how the launcher starts the container; it is not a ban on `&`
+inside a signal-aware entrypoint. `image/contribute/entrypoint.sh` starts Hive's
+`contributor-agent.sh` as the owned child, attaches the attended terminal
+directly to Hive's OMP tmux session, and tears both down through one bounded
+trap. Do not add a second status UI around that session.
 
-`podman run --rm -it` does not bind a container's lifetime to its client:
-`conmon` supervises the container, survives the client, and reparents to the
-user manager, so a hard-killed run can leave a fully running, ownerless,
-unreachable container rather than merely a name. Each launch therefore stamps
-`--label review.owner=<boot-id>:<client-pid>` and treats a container as owned
-only when that PID is alive, in the same boot, and still names the container in
-`/proc`. Anything else is an orphan and is reclaimed silently with `--replace`.
+Every local review or contribution launch prefers Podman's `krun` OCI runtime.
+When Podman, `krun`, or `/dev/kvm` is unavailable, it reports the reason and
+falls back to isolated Apptainer execution.
+KVM invocations get unique container names; fallback invocations get separate
+target-specific home and workspace directories. Persistent OMP state is keyed
+by repository or explicit instance name. `BLUEFIN_INSTANCE` separates
+concurrent sessions for the same target. Local instances stop with their own
+terminal; `review-stop` only manages the Kubernetes contributor deployment.
 
 Hive is the sole authority for selecting and assigning contributor tasks: do
 not skip, reorder, prioritize, or decline a Hive assignment mid-protocol. The
 one permitted filter is own-work exclusion on the maintainer-facing queue
 view — a reviewer never receives their own authored pull requests to review.
 
-Keep review checks and interactive skills as separate layers.
 The review mode in `image/extension/bluefin-review/` equips OMP with companion
 review agents (`bluefin-doctrine`, `bluefin-reviewer`, `bluefin-security`,
 `bluefin-correctness`, `bluefin-test-coverage`, `bluefin-simplicity`,
-`bluefin-ci-triage`) and LLM-callable inspection tools.
-The compatibility maintainer flow in `image/bin/bluefin-review` supplies the
-image-owned `/opt/bluefin/review-scope/.agents/` overlay directly by folding
-its `REVIEW.md` and check definitions into prompts sent to the selected backend.
-Skills generated from the Bluefin catalog, or installed from `skills.sh` and
-other compatible open catalogs, belong under `~/.agents/skills/` for interactive
-contributor sessions and do not become review checks automatically. See [`docs/skills/review-checks.md`](docs/skills/review-checks.md).
+`bluefin-ci-triage`, `bluefin-queue-triage`) and LLM-callable inspection tools. Bluefin policy remains
+in those agents and `policy.ts`; queue, trace, workflowz dispatch, and mutation
+guards remain generic OMP/Hive machinery. Skills generated from the Bluefin
+catalog belong under `~/.agents/skills/` for contributor sessions and do not
+become review checks automatically.
 
-Opening the maintainer dashboard never starts a contributor worker. Scaling
+Opening the maintainer workbench never starts a contributor worker. Scaling
 cluster workers is an explicit, separate choice — `just review-container
 cluster [N]` — and they are stopped with `just review-stop cluster`. A worker
 claims Hive assignments under the contributor's own identity and books hub-side
 failure cooldowns against their standing when it cannot run, so a surface whose
 purpose is reviewing must never scale one as a side effect.
 
-Static queue snapshots are an antipattern: never create or consume a static
-queue artifact to understand pull-request status, queues, or review state. We
-either get pull-request state live — the dashboard's org-wide GitHub search,
-Hive, or the active review container (`podman exec`, container inspection, and
-`${XDG_STATE_HOME:-~/.local/state}/bluefin-review/landings/` logs) — or not at
-all. Never rely on or fetch static JSON artifacts.
+Static queue snapshots are an antipattern: never create or consume one to
+understand pull-request status or Hive order. Read live GitHub/Hive state or
+OMP's durable appliance state; never infer current queue state from captured
+JSON.
 
 This appliance owns no lab and depends on none. Nothing in this repository
 may require, integrate with, or gate on maintainer-local infrastructure: a
@@ -100,24 +94,6 @@ the deliverable it would have validated is verified from published registry
 evidence instead, and the absence of that evidence is reported as a
 finding, never as a blocked pull request.
 
-A maintainer may nonetheless lend one dashboard session their own cluster.
-`just review-queue` detects a usable host Kubernetes context, asks once on
-`/dev/tty`, and — only on yes — starts a host-side broker whose private
-Unix socket is the single thing the container receives. No kubeconfig, no
-Kubernetes credential, no host home, no host networking, no Podman socket,
-and no host binary crosses that boundary; gVisor blocks host sockets by
-default, so `review-queue` alone passes `--runtime-flag=host-uds=open`, and
-only when podman reports the `runsc` runtime. The broker answers three typed
-requests — `status`, `health`, `submit` — bound to session, repository, pull
-request, and exact 40-character head, dispatches only an explicit map of
-QA/test WorkflowTemplates, and files stable verified findings automatically
-to `projectbluefin/lab` (cluster platform) or `projectbluefin/server`
-(server product) behind a versioned fingerprint, a host lock, and a
-duplicate search. `review-container` receives no lab capability at all. The
-capability is optional, session-scoped, and non-blocking: declining it, an
-unreachable cluster, a dead broker, or a failed workflow all leave Review
-fully functional on the registry-evidence path above. See
-[`docs/skills/launcher.md`](docs/skills/launcher.md).
 
 Latest upstream, everywhere. Every dependency — base image, runtimes,
 tools, protocols — tracks the newest upstream version, and Renovate moves
@@ -172,20 +148,16 @@ labels. Never add a local workaround for an accepted upstream gap. See
 - `justfile` is the only shipped launcher artifact. Its public recipes and
   private helpers intentionally live together; `just --list` is the list.
 - `image/appliance/` builds the distroless Bluefin Review appliance image
-  carrying OMP, Pi, GitHub CLI, shell, and the review extension.
-- `image/extension/bluefin-review/` is the TypeScript OMP review extension,
-  providing the queue rail, dashboard, pipeline trace, companion agents,
-  and tools.
-- `image/` also builds the FSDK-derived contributor/compatibility image
-  (`image/Containerfile`) and its layered runtime configuration.
-- `package.json` and `package-lock.json` at the root pin only the contributor
-  relay's `ws` dependency for the image build. This repository is not a Node
-  project.
+  carrying OMP, GitHub CLI, shell, and the review extension.
+- `image/extension/bluefin-review/` is the TypeScript OMP workbench extension,
+  providing the queue, pipeline trace, companion agents, and tools.
+- `image/contribute/` builds the OMP-only Hive contributor image. Both
+  `contribute` and `review-container` launch it.
+- `package.json` and `package-lock.json` pin only the contributor relay's `ws`
+  dependency. This repository is not a Node application.
 - `bin/omp-review` is the source entrypoint for the OMP review mode.
-- `scripts/` contains build-time skill generation, documentation checks, and
-  the host-side lab broker `review-lab-broker.py` the launcher starts for an
-  opted-in `review-queue` session.
-- `tests/` contains launcher, extension, and image contracts.
+- `scripts/` contains build-time generators and documentation checks.
+- `tests/` contains launcher, OMP-extension, contributor, and image contracts.
 - `docs/` contains the skill router and catalog.
 - [`docs/appliance.md`](docs/appliance.md) provides detailed appliance
   installation and configuration guidance.
@@ -228,30 +200,16 @@ boundaries.
 ```bash
 bash scripts/check-skill-frontmatter.sh
 bash tests/generate-skills.sh
-bash tests/sbom-manifest.sh
-bash tests/image-contract.sh
-bash tests/bluefin-review.sh
-bash tests/dashboard-contract.sh
-python3 tests/lab-broker-contract.py
-bash tests/worktree-guard.sh
+bash tests/test-registry.sh
+bash tests/omp-review-mode.sh
+bash tests/appliance-contract.sh
+bash tests/contribute-contract.sh
 bash tests/just-onboarding.sh
 git diff --check
 just --list
 pre-commit run --all-files
 ```
 
-`tests/dashboard-contract.sh` drives the real Textual app through
-`tests/dashboard_pilot.py`, so it builds a hash-locked Textual virtualenv from
-`image/tui/requirements.lock` at `.cache/tui-venv` on first run (`uv` when
-present, `python3 -m venv` otherwise) and reuses it until the lock changes.
-`BLUEFIN_REVIEW_TUI_VENV` points it elsewhere.
-
-`tests/image-audit.sh` needs a container engine and network. It uses `podman`;
-`CONTAINER_ENGINE` names another one. Check the pinned
-FSDK input alone with `--verify-base-evidence`; audit a built or published
-image with `--derived <image>`. The report always records both platform slots
-as native or unavailable, and `--report image-audit-report.md` writes the
-Markdown report to a git-ignored file.
 
 `pre-commit run --all-files` runs the socket-free hygiene checks locally.
 `scripts/check-commit-message.sh` runs as a `commit-msg` hook and refuses a

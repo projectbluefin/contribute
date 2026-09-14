@@ -1,19 +1,10 @@
 /**
  * What to look at first.
  *
- * Two providers, one shape. When a Hive hub is configured the order is Hive's,
- * preserved exactly: this file records the position it was given and never
- * recomputes it, because task selection and priority belong to Hive. Without a
- * hub, the queue is classified from live GitHub evidence so an unorchestrated
- * project still gets a maintainer's order instead of GitHub's update order.
- *
- * The action vocabulary and the classifier are the dashboard's own
- * (`classify_action` and `MAINTAINER_ORDER` in `image/tui/bluefin_review_tui.py`).
- * One product, one set of words: a second vocabulary for the same queue is how
- * two surfaces start disagreeing about what "ready" means.
- *
- * Whichever provider ran, the UI says so. "Hive says nothing is urgent" and "we
- * could not reach Hive" must never look the same.
+ * Hive rank is authoritative whenever the hub is online. Unranked items keep
+ * their fetched GitHub order for browse-only evidence; their category is a
+ * description, never a dispatch priority. This module therefore cannot select,
+ * assign, or promote work independently of Hive.
  */
 
 import type { QueueItem } from "./github.ts";
@@ -41,8 +32,6 @@ export interface Priority {
 
 export interface PrioritizeContext {
 	hive: HiveSnapshot;
-	/** True when durable review state recorded findings for this key. */
-	hasFindings: (key: string) => boolean;
 	now: number;
 }
 
@@ -96,15 +85,13 @@ export function isDependencyBump(item: QueueItem): boolean {
 /**
  * The local fallback: the dashboard's classifier, first match wins.
  *
- * A failing check is actionable before a conflict is, incomplete evidence is a
- * task of its own, and only a green, approved pull request is ready for a human
- * merge. Two signals the live queue does not have are folded in first: a draft
- * is waiting on its author, and a recorded finding is a decision waiting on you.
+ * A failing check is actionable before a conflict is, and only a green,
+ * approved pull request is ready for a human merge. A draft waits on its
+ * author.
  */
 export function categorize(item: QueueItem, context: PrioritizeContext): { category: PriorityCategory; reason: string } {
 	if (item.type === "issue") return { category: "triage", reason: "issue awaiting triage" };
 	if (item.draft) return { category: "investigate", reason: "draft, waiting on its author" };
-	if (context.hasFindings(itemKey(item))) return { category: "review", reason: "recorded review findings" };
 	if (item.ciStatus === "failure") return { category: "fix-ci", reason: "checks failing" };
 	if (item.mergeState === "dirty") return { category: "resolve-conflicts", reason: "conflicts with the base" };
 	if (item.ciStatus === undefined || item.ciStatus === "pending") {
@@ -159,17 +146,18 @@ function hiveReason(item: QueueItem, hive: HiveSnapshot, rank: number): string {
 }
 
 /**
- * Order the queue and explain every position.
- *
- * Stable by construction: ties break on the most recent update, then on the key,
- * so a refetch that changes nothing does not reshuffle the list under the cursor.
+ * Preserve Hive's order when it is available. Without Hive, retain GitHub's
+ * fetched order for browse-only evidence; local categories remain descriptive
+ * and never become dispatch authority.
  */
 export function prioritize(items: readonly QueueItem[], context: PrioritizeContext): PrioritizedQueue {
 	const priorities = new Map<string, Priority>();
 	let hiveRanked = 0;
+	const inputOrder = new Map<string, number>();
 
 	for (const item of items) {
 		const key = itemKey(item);
+		inputOrder.set(key, inputOrder.size);
 		const demotion = demotionFor(item, context.now);
 		const rank = context.hive.online ? hiveRankFor(item, context.hive) : undefined;
 		if (rank !== undefined) {
@@ -187,6 +175,10 @@ export function prioritize(items: readonly QueueItem[], context: PrioritizeConte
 		priorities.set(key, { category, source: "local", reason, demotion });
 	}
 
+	if (!context.hive.online) {
+		return { items: [...items], priorities, source: "local", hiveRanked: 0 };
+	}
+
 	const ordered = [...items].sort((left, right) => {
 		const a = priorities.get(itemKey(left))!;
 		const b = priorities.get(itemKey(right))!;
@@ -197,40 +189,15 @@ export function prioritize(items: readonly QueueItem[], context: PrioritizeConte
 			if (a.hiveRank !== b.hiveRank) return a.hiveRank - b.hiveRank;
 		}
 
-		// When sorting issues (triage category or issue type), clump items by repository
-		// so contributors work within repository borders for each reviewable cohort.
-		const isIssueCohort = left.type === "issue" && right.type === "issue";
-		if (isIssueCohort) {
-			const repoCmp = left.repo.localeCompare(right.repo);
-			if (repoCmp !== 0) return repoCmp;
-		}
-
-		const byCategory = MAINTAINER_ORDER[a.category] - MAINTAINER_ORDER[b.category];
-		if (byCategory !== 0) return byCategory;
-		if (a.demotion !== b.demotion) return a.demotion - b.demotion;
-		if (right.updatedAt !== left.updatedAt) return right.updatedAt - left.updatedAt;
-		return itemKey(left).localeCompare(itemKey(right));
+		// Hive supplied no relative order for either item. Preserve GitHub's
+		// fetched order; local categories are descriptive, never a second priority.
+		return inputOrder.get(itemKey(left))! - inputOrder.get(itemKey(right))!;
 	});
 
 	return {
 		items: ordered,
 		priorities,
-		source: hiveRanked > 0 ? "hive" : "local",
+		source: "hive",
 		hiveRanked,
 	};
-}
-
-/** Counts per category, for the headline. */
-export function categoryTally(priorities: ReadonlyMap<string, Priority>): Record<PriorityCategory, number> {
-	const tally: Record<PriorityCategory, number> = {
-		hive: 0,
-		"ready-for-human-merge": 0,
-		review: 0,
-		"resolve-conflicts": 0,
-		"fix-ci": 0,
-		investigate: 0,
-		triage: 0,
-	};
-	for (const priority of priorities.values()) tally[priority.category] += 1;
-	return tally;
 }

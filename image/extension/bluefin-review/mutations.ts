@@ -1,306 +1,146 @@
-/**
- * Typed GitHub mutation capability selection, fallback policy, retry classification,
- * and merge authority enforcement.
- *
- * Invariant: Typed GitHub mutations prefer native/gh/API tools. Browser is bounded
- * fallback for UI-only work; equivalent preferred attempts are not repeated indefinitely.
- * Preserves human confirmation and merge authority.
- */
+/** Confirmed GitHub comment plans and fail-closed live revalidation. */
 
-export type MutationKind = "title" | "label" | "review" | "comment";
-export type MutationCapability = "native" | "browser";
-
-export interface TitleMutationParams {
-	title: string;
-	targetType?: "pull_request" | "issue";
+export interface CommentTargetSnapshot {
+	readonly repo: string;
+	readonly number: number;
+	readonly type: "pull_request" | "issue";
+	readonly headSha?: string;
 }
 
-export interface LabelMutationParams {
-	addLabels?: string[];
-	removeLabels?: string[];
-	targetType?: "pull_request" | "issue";
+export interface NativeInvocation {
+	readonly command: string;
+	readonly args: readonly string[];
 }
 
-export interface ReviewMutationParams {
-	event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
-	body?: string;
+export interface CommentActionPlan {
+	readonly id: string;
+	readonly targets: readonly CommentTargetSnapshot[];
+	readonly body: string;
+	readonly signature: string;
+	readonly createdAt: number;
 }
 
-export interface CommentMutationParams {
-	body: string;
-	targetType?: "pull_request" | "issue";
+export interface CommentPlanValidation {
+	readonly valid: boolean;
+	readonly errors: readonly string[];
 }
 
-export type MutationParamsMap = {
-	title: TitleMutationParams;
-	label: LabelMutationParams;
-	review: ReviewMutationParams;
-	comment: CommentMutationParams;
-};
+const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
-export interface MutationRequest<K extends MutationKind = MutationKind> {
-	kind: K;
-	repo: string;
-	number: number;
-	params: MutationParamsMap[K];
-	unsupportedNative?: boolean;
+export function commentInvocation(target: CommentTargetSnapshot, body: string): NativeInvocation {
+	const subcommand = target.type === "pull_request" ? "pr" : "issue";
+	return {
+		command: "gh",
+		args: [subcommand, "comment", String(target.number), "--repo", target.repo, "--body", body],
+	};
 }
 
-export interface MutationPlan {
-	kind: MutationKind;
-	repo: string;
-	number: number;
-	capability: MutationCapability;
-	command?: string;
-	reason: string;
-	fallbackAvailable: boolean;
-	bounded: boolean;
-	attemptCount: number;
-	blocked?: boolean;
-}
+export function createCommentActionPlan(
+	targets: readonly CommentTargetSnapshot[],
+	body: string,
+	createdAt = Date.now(),
+): CommentActionPlan {
+	const trimmedBody = body.trim();
+	if (!trimmedBody) {
+		throw new Error("Comment body cannot be empty");
+	}
+	if (!targets || targets.length === 0) {
+		throw new Error("Comment targets cannot be empty");
+	}
 
-export type RetryClassification =
-	| "fresh"
-	| "retryable"
-	| "equivalent_attempt_exhausted"
-	| "fallback_to_browser"
-	| "unsupported";
-
-export interface MutationAttemptRecord {
-	signature: string;
-	capability: MutationCapability;
-	timestamp: number;
-	success: boolean;
-	error?: string;
-}
-
-export interface MergeAuthorityCheckItem {
-	id: number;
-	repo: string;
-	ciStatus?: string;
-	reviewState?: string;
-	labels?: string[];
-	author?: string;
-	draft?: boolean;
-}
-
-export interface MergeAuthorityResult {
-	allowed: boolean;
-	reason?: string;
-}
-
-function quote(val: string): string {
-	return `"${val.replace(/(["\\$`])/g, "\\$1")}"`;
-}
-
-export function generateNativeCommand<K extends MutationKind>(request: MutationRequest<K>): string {
-	switch (request.kind) {
-		case "title": {
-			const p = request.params as TitleMutationParams;
-			const type = p.targetType === "issue" ? "issue" : "pr";
-			return `gh ${type} edit ${request.number} --repo ${request.repo} --title ${quote(p.title)}`;
+	const seen = new Set<string>();
+	for (const target of targets) {
+		if (!target.repo || !REPO_PATTERN.test(target.repo)) {
+			throw new Error(`Invalid target repository: ${target.repo}`);
 		}
-		case "label": {
-			const p = request.params as LabelMutationParams;
-			const type = p.targetType === "issue" ? "issue" : "pr";
-			const parts = [`gh ${type} edit ${request.number} --repo ${request.repo}`];
-			if (p.addLabels && p.addLabels.length > 0) {
-				for (const l of p.addLabels) {
-					parts.push(`--add-label ${quote(l)}`);
-				}
+		if (!Number.isInteger(target.number) || target.number <= 0) {
+			throw new Error(`Invalid target number: ${target.number}`);
+		}
+		if (target.type !== "pull_request" && target.type !== "issue") {
+			throw new Error(`Invalid target type: ${(target as CommentTargetSnapshot).type}`);
+		}
+		if (target.type === "pull_request" && !target.headSha?.trim()) {
+			throw new Error(`Missing pull request head for ${target.repo}#${target.number}`);
+		}
+		const key = `${target.repo}#${target.number}`;
+		if (seen.has(key)) {
+			throw new Error(`Duplicate comment target: ${key}`);
+		}
+		seen.add(key);
+	}
+
+	const targetSignatures = targets.map(
+		(target) => `${target.type}:${target.repo}#${target.number}${target.headSha ? `@${target.headSha}` : ""}`,
+	);
+	const signature = `comment:${targetSignatures.join(",")}:${body}`;
+	const id = `plan_${createdAt.toString(36)}_${Math.abs(
+		signature.split("").reduce((acc, ch) => ((acc << 5) - acc + ch.charCodeAt(0)) | 0, 0),
+	).toString(36)}`;
+
+	return Object.freeze({
+		id,
+		targets: Object.freeze(targets.map((t) => Object.freeze({ ...t }))),
+		body,
+		signature,
+		createdAt,
+	});
+}
+
+export function renderCommentActionPlan(plan: CommentActionPlan): string {
+	const lines: string[] = [
+		`Comment Action Plan (${plan.targets.length} target${plan.targets.length === 1 ? "" : "s"}):`,
+	];
+	for (const target of plan.targets) {
+		const invocation = commentInvocation(target, plan.body);
+		const headNote = target.headSha ? ` (head: ${target.headSha.slice(0, 7)})` : "";
+		lines.push(`  - [${target.type}] ${target.repo}#${target.number}${headNote}`);
+		lines.push(`    $ ${[invocation.command, ...invocation.args].join(" ")}`);
+	}
+	lines.push("Body:");
+	const indentedBody = plan.body
+		.split("\n")
+		.map((l) => `    ${l}`)
+		.join("\n");
+	lines.push(indentedBody);
+	return lines.join("\n");
+}
+
+export function validateCommentActionPlan(
+	plan: CommentActionPlan,
+	liveTargets: readonly CommentTargetSnapshot[],
+): CommentPlanValidation {
+	const errors: string[] = [];
+	const liveMap = new Map<string, CommentTargetSnapshot>();
+	for (const live of liveTargets) {
+		liveMap.set(`${live.repo}#${live.number}`, live);
+	}
+
+	for (const target of plan.targets) {
+		const key = `${target.repo}#${target.number}`;
+		const live = liveMap.get(key);
+		if (!live) {
+			errors.push(`Target missing from live targets: ${key}`);
+			continue;
+		}
+		if (live.type !== target.type) {
+			errors.push(
+				`Type mismatch for ${key}: plan expected ${target.type}, live target is ${live.type}`,
+			);
+		}
+		if (target.type === "pull_request") {
+			if (!target.headSha?.trim()) {
+				errors.push(`No plan head for ${key}; cannot revalidate pull request`);
 			}
-			if (p.removeLabels && p.removeLabels.length > 0) {
-				for (const l of p.removeLabels) {
-					parts.push(`--remove-label ${quote(l)}`);
-				}
+			if (!live.headSha) {
+				errors.push(`No live head for ${key}; cannot revalidate plan snapshot ${target.headSha}`);
+			} else if (target.headSha !== live.headSha) {
+				errors.push(`PR head changed for ${key}: plan snapshot was ${target.headSha}, live is ${live.headSha}`);
 			}
-			return parts.join(" ");
-		}
-		case "review": {
-			const p = request.params as ReviewMutationParams;
-			const flag =
-				p.event === "APPROVE"
-					? "--approve"
-					: p.event === "REQUEST_CHANGES"
-						? "--request-changes"
-						: "--comment";
-			const bodyPart = p.body ? ` --body ${quote(p.body)}` : "";
-			return `gh pr review ${request.number} --repo ${request.repo} ${flag}${bodyPart}`;
-		}
-		case "comment": {
-			const p = request.params as CommentMutationParams;
-			const type = p.targetType === "issue" ? "issue" : "pr";
-			return `gh ${type} comment ${request.number} --repo ${request.repo} --body ${quote(p.body)}`;
-		}
-		default:
-			throw new Error(`unsupported mutation kind: ${(request as MutationRequest).kind}`);
-	}
-}
-
-export function mutationSignature<K extends MutationKind>(request: MutationRequest<K>): string {
-	return `${request.repo}#${request.number}:${request.kind}:${JSON.stringify(request.params)}`;
-}
-
-export class MutationCapabilityPolicy {
-	readonly maxEquivalentAttempts: number;
-	readonly maxBrowserFallbacks: number;
-	private attempts: MutationAttemptRecord[] = [];
-
-	constructor(options: { maxEquivalentAttempts?: number; maxBrowserFallbacks?: number } = {}) {
-		this.maxEquivalentAttempts = options.maxEquivalentAttempts ?? 1;
-		this.maxBrowserFallbacks = options.maxBrowserFallbacks ?? 1;
-	}
-
-	clear(): void {
-		this.attempts = [];
-	}
-
-	recordAttempt(record: MutationAttemptRecord): void {
-		this.attempts.push(record);
-	}
-
-	getAttemptsFor(signature: string): MutationAttemptRecord[] {
-		return this.attempts.filter((a) => a.signature === signature);
-	}
-
-	classifyAttempt<K extends MutationKind>(
-		request: MutationRequest<K>,
-		preferredCapability: MutationCapability = "native",
-	): RetryClassification {
-		const sig = mutationSignature(request);
-		const past = this.getAttemptsFor(sig);
-		const pastCapability = past.filter((a) => a.capability === preferredCapability);
-
-		if (pastCapability.length === 0) {
-			return "fresh";
-		}
-
-		if (preferredCapability === "native") {
-			const browserPast = past.filter((a) => a.capability === "browser");
-			if (browserPast.length < this.maxBrowserFallbacks) {
-				return "fallback_to_browser";
-			}
-			return "equivalent_attempt_exhausted";
-		}
-
-		if (pastCapability.length >= this.maxBrowserFallbacks) {
-			return "equivalent_attempt_exhausted";
-		}
-
-		return "retryable";
-	}
-
-	selectCapability<K extends MutationKind>(request: MutationRequest<K>): MutationPlan {
-		const sig = mutationSignature(request);
-		const past = this.getAttemptsFor(sig);
-
-		// When explicitly unsupported by native (UI-only work)
-		if (request.unsupportedNative) {
-			const browserPast = past.filter((a) => a.capability === "browser");
-			if (browserPast.length >= this.maxBrowserFallbacks) {
-				return {
-					kind: request.kind,
-					repo: request.repo,
-					number: request.number,
-					capability: "browser",
-					reason: "bounded browser fallback exhausted; equivalent attempts not repeated indefinitely",
-					fallbackAvailable: false,
-					bounded: true,
-					attemptCount: browserPast.length,
-					blocked: true,
-				};
-			}
-			return {
-				kind: request.kind,
-				repo: request.repo,
-				number: request.number,
-				capability: "browser",
-				reason: "native capability unsupported for UI-only work; bounded browser fallback selected",
-				fallbackAvailable: false,
-				bounded: true,
-				attemptCount: browserPast.length + 1,
-			};
-		}
-
-		// Prefer typed native tools (gh/API) first
-		const nativePast = past.filter((a) => a.capability === "native");
-		if (nativePast.length < this.maxEquivalentAttempts) {
-			return {
-				kind: request.kind,
-				repo: request.repo,
-				number: request.number,
-				capability: "native",
-				command: generateNativeCommand(request),
-				reason: "typed GitHub mutations prefer native/gh/API tools",
-				fallbackAvailable: true,
-				bounded: true,
-				attemptCount: nativePast.length + 1,
-			};
-		}
-
-		// Native attempts exhausted; check bounded browser fallback
-		const browserPast = past.filter((a) => a.capability === "browser");
-		if (browserPast.length < this.maxBrowserFallbacks) {
-			return {
-				kind: request.kind,
-				repo: request.repo,
-				number: request.number,
-				capability: "browser",
-				reason: "native mutation failed or exhausted; bounded browser fallback selected",
-				fallbackAvailable: false,
-				bounded: true,
-				attemptCount: browserPast.length + 1,
-			};
-		}
-
-		// Both exhausted: reject repeated equivalent attempts
-		return {
-			kind: request.kind,
-			repo: request.repo,
-			number: request.number,
-			capability: "native",
-			reason: "equivalent preferred attempts are not repeated indefinitely; mutation halted",
-			fallbackAvailable: false,
-			bounded: true,
-			attemptCount: nativePast.length + browserPast.length,
-			blocked: true,
-		};
-	}
-}
-
-export function checkMergeAuthority(
-	item: MergeAuthorityCheckItem,
-	operatorLogin?: string,
-): MergeAuthorityResult {
-	if (item.draft) {
-		return { allowed: false, reason: "stop and report: pull request is draft" };
-	}
-	const ci = item.ciStatus?.toLowerCase();
-	if (ci === "failure" || ci === "failed" || ci === "failing") {
-		return { allowed: false, reason: "stop and report instead of merging: check is failing" };
-	}
-	if (ci === "pending" || ci === "running" || ci === "in_progress") {
-		return { allowed: false, reason: "stop and report instead of merging: check is pending" };
-	}
-	if (item.labels) {
-		if (item.labels.some((l) => l.toLowerCase() === "hold")) {
-			return { allowed: false, reason: "merge blocked: pull request has hold label" };
-		}
-		if (item.labels.some((l) => l.toLowerCase() === "blocked")) {
-			return { allowed: false, reason: "merge blocked: pull request has blocked label" };
 		}
 	}
-	if (item.reviewState === "CHANGES_REQUESTED") {
-		return { allowed: false, reason: "merge blocked: changes requested on pull request" };
-	}
-	if (item.reviewState === "REVIEW_REQUIRED") {
-		return { allowed: false, reason: "merge blocked: review required before landing" };
-	}
-	if (operatorLogin && item.author && item.author.toLowerCase() === operatorLogin.toLowerCase()) {
-		return {
-			allowed: false,
-			reason: "cannot approve or merge own pull request: requires another contributor's review",
-		};
-	}
-	return { allowed: true };
+
+	return Object.freeze({
+		valid: errors.length === 0,
+		errors: Object.freeze(errors),
+	});
 }

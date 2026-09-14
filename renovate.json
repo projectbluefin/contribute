@@ -5,11 +5,11 @@
   ],
   "customManagers": [
     {
-      "description": "Track hivecommons/hive origin/v4 as a pinned commit SHA. The SHA is duplicated in the launcher, the image, and the README, and tests/image-contract.sh plus validate.yml require all three to agree, so one depName keeps every match in a single Renovate branch and PR.",
+      "description": "Track hivecommons/hive origin/v4 as a pinned commit SHA. The SHA is duplicated in the launcher, contributor image, and README; one depName keeps every match in a single Renovate branch and PR.",
       "customType": "regex",
       "managerFilePatterns": [
         "/(^|/)justfile$/",
-        "/(^|/)image/Containerfile$/",
+        "/(^|/)image/contribute/Containerfile$/",
         "/(^|/)README\\.md$/"
       ],
       "matchStrings": [

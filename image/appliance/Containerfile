@@ -5,10 +5,10 @@
 #
 # It derives from Project Bluefin's distroless FSDK base — glibc, CA
 # certificates, tzdata, and the full terminfo database, no shell and no package
-# manager — and adds exactly four fetched artifacts (omp, node, pi, gh) plus the
+# manager — and adds exactly two fetched artifacts (`omp` and `gh`) plus the
 # smallest closure of FSDK binaries the agent genuinely needs to work: a shell,
-# git, and python. Nothing else. There is no perl, no distro userland, and
-# nothing that can install one.
+# git, and Python. Nothing else. There is no alternate agent CLI or package
+# manager in the final image.
 #
 # A shell is present deliberately and is the single documented deviation from
 # "distroless". omp's `bash` tool spawns one, and an agent that cannot run
@@ -30,13 +30,6 @@ ARG FSDK_BUILDER_IMAGE=ghcr.io/projectbluefin/lab-runner:26.08@sha256:5217c4e4ed
 ARG OMP_VERSION=18.1.18
 ARG OMP_X86_64_SHA256=45421f9a5f112bc47cb9f77c4b4d7927631f8ff859624f821287ec854eb239fc
 ARG OMP_AARCH64_SHA256=1ae8273c231ceb88cebc9971901cf7f5d97ed4149cdc740a814f629cd2b4dcb2
-# renovate: datasource=npm depName=@earendil-works/pi-coding-agent
-ARG PI_VERSION=0.85.1
-# node exists in this image only to run pi; omp embeds its own Bun runtime.
-# renovate: datasource=node-version depName=node
-ARG NODE_VERSION=24.18.1
-ARG NODE_X86_64_SHA256=d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0
-ARG NODE_AARCH64_SHA256=7201e3a09dc825bac57867c81913e2b8f0ef87d04cb9082af4cda82f6ff3d88c
 # renovate: datasource=github-releases depName=cli/cli
 ARG GH_VERSION=2.97.0
 ARG GH_X86_64_SHA256=a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112
@@ -52,10 +45,6 @@ FROM ${FSDK_BUILDER_IMAGE} AS build
 ARG OMP_VERSION
 ARG OMP_X86_64_SHA256
 ARG OMP_AARCH64_SHA256
-ARG PI_VERSION
-ARG NODE_VERSION
-ARG NODE_X86_64_SHA256
-ARG NODE_AARCH64_SHA256
 ARG GH_VERSION
 ARG GH_X86_64_SHA256
 ARG GH_AARCH64_SHA256
@@ -65,29 +54,19 @@ ARG REVIEW_REVISION
 # `SHELL` is ignored for the OCI image format, so every RUN sets its own shell
 # options rather than trusting an instruction the builder drops on the floor.
 #
-# One layer fetches everything, because the node tarball is both a shipped
-# artifact and the npm that installs pi; splitting them downloads it twice.
-# Every artifact is checked against a digest recorded above before it is allowed
-# to become executable: a download that cannot be verified does not happen.
-#
-# The pi tree is then cut down to what actually runs: esbuild publishes one
-# package per platform and npm installs all of them — 284 MiB of binaries for
-# operating systems this image cannot execute — while source maps, changelogs
-# and test fixtures ship by npm convention rather than because anything reads
-# them at runtime.
+# One layer fetches both artifacts. Every artifact is checked against a digest
+# recorded above before it is allowed to become executable.
 RUN set -eu; \
     arch="$(uname -m)"; \
     case "$arch" in \
       x86_64) omp_asset=omp-linux-x64; omp_sha="$OMP_X86_64_SHA256"; \
-              node_arch=x64; node_sha="$NODE_X86_64_SHA256"; \
               gh_arch=amd64; gh_sha="$GH_X86_64_SHA256" ;; \
       aarch64) omp_asset=omp-linux-arm64; omp_sha="$OMP_AARCH64_SHA256"; \
-              node_arch=arm64; node_sha="$NODE_AARCH64_SHA256"; \
-              gh_arch=arm64; gh_sha="$GH_AARCH64_SHA256" ;; \
+               gh_arch=arm64; gh_sha="$GH_AARCH64_SHA256" ;; \
       *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
     esac; \
     workdir="$(mktemp -d)"; \
-    mkdir -p /out/usr/bin /out/usr/lib/bluefin; \
+    mkdir -p /out/usr/bin; \
     \
     curl --fail --location --show-error --silent \
       "https://github.com/can1357/oh-my-pi/releases/download/v${OMP_VERSION}/${omp_asset}" \
@@ -96,40 +75,11 @@ RUN set -eu; \
     install -m 0755 "$workdir/omp" /out/usr/bin/omp; \
     \
     curl --fail --location --show-error --silent \
-      "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
-      -o "$workdir/node.tar.xz"; \
-    echo "${node_sha}  $workdir/node.tar.xz" | sha256sum --check --status; \
-    tar --no-same-owner -xf "$workdir/node.tar.xz" -C "$workdir"; \
-    node_root="$workdir/node-v${NODE_VERSION}-linux-${node_arch}"; \
-    install -m 0755 "$node_root/bin/node" /out/usr/bin/node; \
-    \
-    curl --fail --location --show-error --silent \
       "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gh_arch}.tar.gz" \
       -o "$workdir/gh.tar.gz"; \
     echo "${gh_sha}  $workdir/gh.tar.gz" | sha256sum --check --status; \
     tar --no-same-owner -xf "$workdir/gh.tar.gz" -C "$workdir"; \
     install -m 0755 "$workdir/gh_${GH_VERSION}_linux_${gh_arch}/bin/gh" /out/usr/bin/gh; \
-    \
-    PATH="$node_root/bin:$PATH" npm install --global \
-      --prefix /out/usr/lib/bluefin/pi --omit=dev --ignore-scripts \
-      "@earendil-works/pi-coding-agent@${PI_VERSION}"; \
-    rm -rf /out/usr/lib/bluefin/pi/bin; \
-    \
-    pi_root=/out/usr/lib/bluefin/pi/lib/node_modules/@earendil-works/pi-coding-agent; \
-    test -f "$pi_root/dist/bundle/cli.js"; \
-    \
-    find "$pi_root/node_modules/@esbuild" -mindepth 1 -maxdepth 1 -type d \
-      ! -name "linux-${node_arch}" -exec rm -rf {} +; \
-    test -d "$pi_root/node_modules/@esbuild/linux-${node_arch}"; \
-    find /out/usr/lib/bluefin/pi \
-      \( -name '*.map' -o -name '*.md' -o -name '.github' -o -name 'test' \
-         -o -name 'tests' -o -name '__tests__' -o -name 'docs' -o -name 'example' \
-         -o -name 'examples' \) -prune -exec rm -rf {} +; \
-    \
-    printf '#!/usr/bin/bash\nexec /usr/bin/node %s/dist/bundle/cli.js "$@"\n' \
-      /usr/lib/bluefin/pi/lib/node_modules/@earendil-works/pi-coding-agent \
-      > /out/usr/bin/pi; \
-    chmod 0755 /out/usr/bin/pi; \
     \
     rm -rf "$workdir"
 
@@ -151,10 +101,6 @@ RUN arch="$(uname -m)"; \
       --omp-version "$OMP_VERSION" \
       --omp-sha256-x86-64 "$OMP_X86_64_SHA256" \
       --omp-sha256-aarch64 "$OMP_AARCH64_SHA256" \
-      --pi-version "$PI_VERSION" \
-      --node-version "$NODE_VERSION" \
-      --node-sha256-x86-64 "$NODE_X86_64_SHA256" \
-      --node-sha256-aarch64 "$NODE_AARCH64_SHA256" \
       --gh-version "$GH_VERSION" \
       --gh-sha256-x86-64 "$GH_X86_64_SHA256" \
       --gh-sha256-aarch64 "$GH_AARCH64_SHA256" \
@@ -173,11 +119,10 @@ RUN set -eu; \
 COPY --chown=65532:65532 image/extension/bluefin-review /out/usr/share/bluefin/review/extension
 COPY --chmod=0755 image/appliance/entrypoint.sh /out/usr/bin/bluefin-review-appliance
 COPY image/appliance/config.yml /out/usr/share/bluefin/review/appliance-config.yml
-COPY --chmod=0755 bin/dinosay /out/usr/bin/dinosay
 # Fail the build here rather than in a maintainer's terminal: every staged
 # binary must resolve its interpreter and libraries against the staged closure.
 RUN set -eu; \
-    for binary in /out/usr/bin/omp /out/usr/bin/node /out/usr/bin/gh /out/usr/bin/git /out/usr/bin/bash /out/usr/bin/python3; do \
+    for binary in /out/usr/bin/omp /out/usr/bin/gh /out/usr/bin/git /out/usr/bin/bash /out/usr/bin/python3; do \
       test -x "$binary" || { echo "missing $binary" >&2; exit 1; }; \
     done; \
     test -e /out/usr/share/bluefin/review/extension/index.ts; \
@@ -191,7 +136,6 @@ ARG REVIEW_VERSION
 ARG REVIEW_REVISION
 ARG FSDK_BASE_IMAGE
 ARG OMP_VERSION
-ARG PI_VERSION
 
 COPY --from=build /out /
 
@@ -218,8 +162,7 @@ LABEL org.opencontainers.image.title="Bluefin Review" \
       org.opencontainers.image.base.name="${FSDK_BASE_IMAGE}" \
       io.projectbluefin.review.appliance="true" \
       io.projectbluefin.review.harness="omp" \
-      io.projectbluefin.review.omp.version="${OMP_VERSION}" \
-      io.projectbluefin.review.pi.version="${PI_VERSION}"
+      io.projectbluefin.review.omp.version="${OMP_VERSION}"
 
 USER 65532:65532
 WORKDIR /workspace

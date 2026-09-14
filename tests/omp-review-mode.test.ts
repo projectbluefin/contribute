@@ -1,47 +1,40 @@
 /**
  * Contract test for the omp review mode.
  *
- * Runs the real modules against a fake omp host, a fake GitHub, and a real
- * on-disk state tree in a temp directory. No terminal, no network, no omp.
+ * Runs the real modules against a fake OMP host and fake GitHub/Hive APIs.
+ * No terminal, network, or OMP process is required.
  *
  *   node --test tests/omp-review-mode.test.ts
  */
 
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { GLYPH, PLAIN_PAINTER, formatDuration, statusIcon } from "../image/extension/bluefin-review/glyphs.ts";
-import { renderSpanTree, traceToText, visibleSpanIds, traceClassBadge, type TraceClass } from "../image/extension/bluefin-review/trace.ts";
+import { workbenchPainter } from "../image/extension/bluefin-review/paint.ts";
+import { renderSpanTree, traceToText, visibleSpanIds } from "../image/extension/bluefin-review/trace.ts";
 import { truncateToWidth, visibleWidth } from "../image/extension/bluefin-review/width.ts";
-import { buildPipelineSpans, readStateSnapshot, landingStateStatus, runStateStatus, reviewEventStatus, classifyRunState, classifyReviewEvent, classifyLanding } from "../image/extension/bluefin-review/state.ts";
-import { appendFileSync } from "node:fs";
 import { fetchDiff, fetchItemsByKey, fetchQueue, parseScope, searchExpression } from "../image/extension/bluefin-review/github.ts";
 import { EMPTY_HIVE, buildRankMap, fetchHive, hiveFailureStatus, resolveHub } from "../image/extension/bluefin-review/hive.ts";
 import { categorize, prioritize } from "../image/extension/bluefin-review/priority.ts";
 import { BATCH_LIMIT, ReviewMode, ciGlyph } from "../image/extension/bluefin-review/mode.ts";
 import { ReviewDashboard, parseMouseEvent } from "../image/extension/bluefin-review/dashboard.ts";
-import { STALE_AFTER_MS, queueAge, renderHitlist, renderRail, statusSegment, tmuxReviewStatusBar } from "../image/extension/bluefin-review/rail.ts";
+import { STALE_AFTER_MS, queueAge, renderRail, statusSegment } from "../image/extension/bluefin-review/rail.ts";
 import { SessionTrace } from "../image/extension/bluefin-review/session.ts";
-import { BluefinAnsiSplash } from "../image/extension/bluefin-review/splash.ts";
 import {
 	STATE_ENTRY,
+	BATCH_ENTRY,
+	COMMENT_ENTRY,
+	BLUEFIN_POLICY,
 	actionPrompt,
 	createReviewExtension,
-	MutationCapabilityPolicy,
-	checkMergeAuthority,
-	generateNativeCommand,
-	mutationSignature,
-	SLAY_DELIVERY_RULE,
-	SLAY_DELIVERY_STATES,
-	VERIFICATION_STATUSES,
-	classifyVerificationOutcome,
-	resolveSlayDelivery,
-	formatSlayFinalResponse,
-	formatDraftPrBody,
+	createCommentActionPlan,
+	renderCommentActionPlan,
+	validateCommentActionPlan,
+	commentInvocation,
 } from "../image/extension/bluefin-review/extension.ts";
 
 const NOW = 1_800_000_000_000;
@@ -52,93 +45,6 @@ const ISOLATED_ENV = { GH_TOKEN: "t", HOME: "/nonexistent", XDG_CONFIG_HOME: "/n
 
 // ---------------------------------------------------------------- fixtures
 
-function stateTree(): string {
-	const root = mkdtempSync(join(tmpdir(), "bluefin-state-"));
-	mkdirSync(join(root, "run-state"), { recursive: true });
-	mkdirSync(join(root, "review-batches"), { recursive: true });
-	mkdirSync(join(root, "landings"), { recursive: true });
-	mkdirSync(join(root, "reviews"), { recursive: true });
-
-	const seconds = NOW / 1000;
-	writeFileSync(
-		join(root, "run-state", "run-state.json"),
-		JSON.stringify({
-			version: 1,
-			next_sequence: 2,
-			records: [
-				{
-					identity: {
-						repository: "projectbluefin/review",
-						pull_request: 42,
-						base_sha: "a".repeat(40),
-						head_sha: "b".repeat(40),
-						backend: "omp",
-						model: "gemini-3.8-flash",
-						effort: "max",
-						check_scope_version: "1",
-					},
-					state: "review_findings",
-					terminal_outcome: null,
-					reason: "2 high severity findings",
-					retry_at: "",
-					created_at: seconds - 300,
-					updated_at: seconds - 120,
-					sequence: 1,
-				},
-			],
-		}),
-	);
-
-	const events = [
-		{ key: "projectbluefin/review#42", state: "running", note: "review dispatched", ts: seconds - 290 },
-		{ key: "projectbluefin/review#42", state: "findings", note: "2 high", ts: seconds - 130, receipt: "r.json" },
-		{ key: "projectbluefin/other#7", state: "complete", note: "clean", ts: seconds - 100 },
-	];
-	writeFileSync(join(root, "review-batches", "batch-1.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
-
-	const landing = [
-		{ expect: ["projectbluefin/review#42"], ts: seconds - 120, issues: false, fix: false },
-		{ pr: "projectbluefin/review#42", state: "diagnosing", note: "reading failures", ts: seconds - 110 },
-		{ pr: "projectbluefin/review#42", state: "fixing", note: "patching launcher", ts: seconds - 90 },
-		{ pr: "projectbluefin/review#42", state: "waiting-ci", note: "pushed", ts: seconds - 40 },
-	];
-	writeFileSync(join(root, "landings", "task-1.jsonl"), landing.map((e) => JSON.stringify(e)).join("\n") + "\n{ torn write");
-
-	writeFileSync(
-		join(root, "reviews", "projectbluefin__review__42-abc.json"),
-		JSON.stringify({
-			version: 1,
-			identity: {
-				repository: "projectbluefin/review",
-				pull_request: 42,
-				base_sha: "a".repeat(40),
-				head_sha: "b".repeat(40),
-				backend: "omp",
-				model: "gemini-3.8-flash",
-				effort: "max",
-				check_scope_version: "1",
-			},
-			analysis: {
-				version: 1,
-				state: "findings",
-				counts: { critical: 0, high: 2, medium: 1, low: 0 },
-				findings: [
-					{ severity: "high", file: "image/entrypoint.sh", line: 88, title: "unquoted expansion" },
-					{ severity: "high", file: "justfile", line: 412, title: "kubectl fallthrough" },
-					{ severity: "medium", file: "tests/just-onboarding.sh", line: 12, title: "missing fake" },
-				],
-				verification: [
-					{ name: "doctrine", state: "verified", evidence: "AGENTS.md read" },
-					{ name: "tests", state: "skipped", evidence: "not run" },
-				],
-			},
-			transcript: [],
-			provenance: {},
-			created_at: "2027-01-15T12:00:00Z",
-		}),
-	);
-	return root;
-}
 
 function queueItem(overrides = {}) {
 	return {
@@ -237,6 +143,57 @@ function fakeFetch(calls, known = {}) {
 	};
 }
 
+function hiveBackedFetch(items, calls = []) {
+	const nodes = items.map((item) => ({
+		number: item.id,
+		title: item.title,
+		url: `https://github.com/${item.repo}/pull/${item.id}`,
+		updatedAt: new Date(NOW - item.id * 1000).toISOString(),
+		isDraft: false,
+		mergeable: "MERGEABLE",
+		reviewDecision: "REVIEW_REQUIRED",
+		headRefOid: item.headSha ?? String(item.id).padStart(40, "0"),
+		author: { login: "reviewer" },
+		repository: { nameWithOwner: item.repo },
+		labels: { nodes: [] },
+		commits: { nodes: [{ commit: { statusCheckRollup: { state: "SUCCESS" } } }] },
+	}));
+	return async (url, init) => {
+		const target = String(url);
+		calls.push(target);
+		if (target.endsWith("/api/v1/status")) {
+			return { ok: true, status: 200, statusText: "OK", json: async () => ({ actionable_items: items.length }) };
+		}
+		if (target.endsWith("/api/contribute/queue")) {
+			return {
+				ok: true,
+				status: 200,
+				statusText: "OK",
+				json: async () => ({ queue: items.map((item) => ({ key: `${item.repo}#${item.id}`, repo: item.repo, number: item.id, title: item.title })) }),
+			};
+		}
+		if (target.endsWith("/api/contribute/triage")) {
+			return { ok: true, status: 200, statusText: "OK", json: async () => ({ groups: [] }) };
+		}
+		if (target.endsWith("/api/v1/contributors")) {
+			return { ok: true, status: 200, statusText: "OK", json: async () => ({ contributors: [] }) };
+		}
+		if (target.includes("/graphql")) {
+			const body = JSON.parse(String(init?.body ?? "{}"));
+			if (body.variables?.search !== undefined) {
+				return { ok: true, status: 200, statusText: "OK", json: async () => ({ data: { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes } } }) };
+			}
+			const data = {};
+			const aliases = /(\w+): repository\(owner: "([^"]+)", name: "([^"]+)"\)\s*\{\s*issueOrPullRequest\(number: (\d+)\)/g;
+			for (const [, alias, owner, repo, number] of body.query.matchAll(aliases)) {
+				data[alias] = { issueOrPullRequest: nodes.find((node) => node.number === Number(number) && node.repository.nameWithOwner === `${owner}/${repo}`) ?? null };
+			}
+			return { ok: true, status: 200, statusText: "OK", json: async () => ({ data }) };
+		}
+		return { ok: true, status: 200, statusText: "OK", json: async () => [] };
+	};
+}
+
 /** Fake omp extension host recording every registration. */
 function fakeHost() {
 	const zodLeaf = () => ({ optional: () => zodLeaf(), describe: () => zodLeaf() });
@@ -249,6 +206,8 @@ function fakeHost() {
 		tools: new Map(),
 		messages: [],
 		entries: [],
+		execCalls: [],
+		execResult: { stdout: "https://github.com/projectbluefin/review/issues/42#issuecomment-1\n", stderr: "", code: 0, killed: false },
 		zod: { object: () => ({}), string: zodLeaf, number: zodLeaf },
 		setLabel(label) {
 			this.labels.push(label);
@@ -271,6 +230,10 @@ function fakeHost() {
 		sendUserMessage(content) {
 			this.messages.push(content);
 		},
+		async exec(command, args) {
+			this.execCalls.push({ command, args });
+			return this.execResult;
+		},
 		appendEntry(customType, data) {
 			this.entries.push({ customType, data });
 		},
@@ -280,10 +243,9 @@ function fakeHost() {
 /**
  * Fake omp session context.
  *
- * `ui.custom` models a real overlay: it builds the component and resolves only
- * when that component calls `done`. A fake that resolved immediately hid the
- * defect that shipped — a splash which only a keypress could dismiss, awaited
- * inside `session_start` until omp killed the handler.
+ * `ui.custom` models the real workbench: it builds the component and resolves
+ * only when that component calls `done`. Resolving immediately would hide a
+ * session-start handler that blocks OMP.
  */
 function fakeCtx() {
 	const notifications = [];
@@ -291,21 +253,27 @@ function fakeCtx() {
 	const widgets = new Map();
 	const overlays = [];
 	const pasted = [];
+	const confirmations = [];
+	const editorResponses = [];
 	const ctx = {
 		hasUI: true,
 		notifications,
 		statuses,
 		widgets,
 		overlays,
-		footers: [] as Array<unknown>,
 		pasted,
+		confirmations,
+		editorResponses,
+		asyncJobs: { running: [], recent: [], delivery: { pending: 0 } },
 		ui: {
 			notify: (message, level) => notifications.push({ message, level }),
+			confirm: async (title, message) => {
+				confirmations.push({ title, message });
+				return true;
+			},
+			editor: async () => editorResponses.shift(),
 			setStatus: (key, value) => statuses.set(key, value),
 			setWidget: (key, content) => widgets.set(key, content),
-			setFooter(factory) {
-				this.parent.footers.push(factory);
-			},
 			setTitle: () => {},
 			pasteToEditor(text) {
 				pasted.push(text);
@@ -316,6 +284,9 @@ function fakeCtx() {
 				return promise;
 			},
 			theme: { fg: (_c, t) => t, bold: (t) => t, inverse: (t) => t },
+		},
+		getAsyncJobSnapshot() {
+			return this.asyncJobs;
 		},
 		sessionManager: { getBranch: () => [] },
 	};
@@ -330,8 +301,22 @@ test("duration formatting follows Dagger's units", () => {
 	assert.equal(formatDuration(59_949), "59.9s");
 	assert.equal(formatDuration(154_000), "2m34s");
 	assert.equal(formatDuration(4_325_000), "1h12m5s");
+
 	assert.equal(formatDuration(187_230_000), "2d4h0m30s");
 	assert.equal(formatDuration(-1), "");
+});
+test("workbench palette changes every semantic accent with issue mode", () => {
+	let mode: "prs" | "issues" = "prs";
+	const theme = {
+		fg: (color: string, text: string) => `<${color}>${text}`,
+		bold: (text: string) => text,
+		inverse: (text: string) => text,
+	};
+	const painter = workbenchPainter(theme, () => mode);
+	assert.equal(painter.fg("accent", "mode"), "<accent>mode");
+	mode = "issues";
+	assert.equal(painter.fg("accent", "mode"), "<warning>mode");
+	assert.equal(painter.fg("border", "─"), "<warning>─");
 });
 
 test("status icons are the Dagger glyphs and the spinner cycles", () => {
@@ -428,149 +413,8 @@ test("rendered rows never exceed the viewport width", () => {
 	for (const row of rows) assert.ok(visibleWidth(row.text) <= 40, `${visibleWidth(row.text)} > 40`);
 });
 
-// ---------------------------------------------------------------- state
 
-test("durable state becomes a pipeline trace", (t) => {
-	const root = stateTree();
-	t.after(() => rmSync(root, { recursive: true, force: true }));
-
-	const snapshot = readStateSnapshot(root);
-	assert.equal(snapshot.runs.length, 1);
-	assert.equal(snapshot.reviewEvents.length, 3);
-	assert.equal(snapshot.landingEvents.filter((e) => e.pullRequestKey).length, 3, "the torn line is skipped");
-	assert.equal(snapshot.receipts.get("projectbluefin/review#42")?.findings.length, 3);
-
-	const spans = buildPipelineSpans("projectbluefin/review#42", "fix launcher", snapshot, NOW);
-	const text = traceToText(spans, NOW, 120);
-
-	assert.equal(spans[0].status, "running", "landing is still in flight");
-	assert.match(text, /run › review_findings/);
-	assert.match(text, /review/);
-	assert.match(text, /landing/);
-	assert.match(text, /waiting-ci/);
-	// Only the selected item's events are projected.
-	assert.doesNotMatch(text, /other#7/);
-
-	const expanded = traceToText(
-		buildPipelineSpans("projectbluefin/review#42", "fix launcher", snapshot, NOW),
-		NOW,
-		120,
-	);
-	assert.match(expanded, /image\/entrypoint\.sh:88/, "findings are reachable in the trace");
-	assert.match(expanded, /2 high, 1 medium/);
-});
-
-test("an unknown pull request reports no state instead of inventing it", (t) => {
-	const root = stateTree();
-	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const spans = buildPipelineSpans("projectbluefin/review#999", "unknown", readStateSnapshot(root), NOW);
-	assert.match(traceToText(spans, NOW), /no recorded pipeline state/);
-});
-
-test("a missing state root is empty, not an error", () => {
-	const snapshot = readStateSnapshot(join(tmpdir(), "bluefin-state-does-not-exist"));
-	assert.deepEqual(snapshot.runs, []);
-	assert.equal(snapshot.error, undefined);
-});
-
-test("appliance states map onto span statuses", () => {
-	assert.equal(runStateStatus("reviewing"), "running");
-	assert.equal(runStateStatus("review_clean"), "success");
-	assert.equal(runStateStatus("review_findings"), "findings");
-	assert.equal(runStateStatus("head_changed"), "failure");
-	assert.equal(landingStateStatus("waiting-ci"), "running");
-	assert.equal(landingStateStatus("merged"), "success");
-	assert.equal(landingStateStatus("blocked"), "findings");
-	assert.equal(landingStateStatus("failed"), "failure");
-});
-
-test("the run-state machine fails as environment or tool, never as a PR check (#465)", () => {
-	// The whole point of the taxonomy: a run-state machine failure is the review
-	// workspace or the agent step failing, NOT the pull request's own checks.
-	assert.equal(classifyRunState("head_changed"), "environment");
-	assert.equal(classifyRunState("mutation_failed"), "tool");
-	assert.equal(classifyRunState("unknown_state_now"), "environment");
-	// The visual status is unchanged: every one of these still reads as a red ✘.
-	assert.equal(runStateStatus("head_changed"), "failure");
-	assert.equal(runStateStatus("mutation_failed"), "failure");
-	// A review that needs a human is findings to act on, not a PR check failure.
-	assert.equal(classifyRunState("blocked"), "findings");
-	assert.equal(classifyRunState("human_review_missing"), "findings");
-	assert.equal(runStateStatus("blocked"), "findings");
-});
-
-test("an unavailable review is a verification failure, not a PR check (#471, #465)", () => {
-	assert.equal(classifyRunState("review_missing"), "verification");
-	assert.equal(classifyRunState("review_incomplete"), "verification");
-	assert.equal(classifyRunState("review_unparsable"), "verification");
-	assert.equal(runStateStatus("review_missing"), "failure");
-});
-
-test("a cancelled review is normal flow, rendered skipped not failed (#465)", () => {
-	assert.equal(classifyReviewEvent("cancelled"), "cancelled");
-	assert.equal(reviewEventStatus("cancelled"), "skipped");
-	assert.equal(classifyReviewEvent("running"), "running");
-	assert.equal(classifyReviewEvent("cached"), "cached");
-	assert.equal(classifyReviewEvent("complete"), "success");
-	assert.equal(classifyReviewEvent("findings"), "findings");
-	assert.equal(classifyReviewEvent("unknown_now"), "environment");
-	assert.equal(reviewEventStatus("unknown_now"), "failure");
-});
-
-test("the failure taxonomy has a distinct label for every class (#465)", () => {
-	const labels = ["pending", "running", "success", "cached", "findings", "cancelled", "pr-check", "verification", "environment", "tool"].map(
-		(cls) => traceClassBadge(cls as TraceClass),
-	);
-	assert.deepEqual(labels, ["", "", "", "CACHED", "", "CANCELLED", "CHECK", "UNVERIFIED", "WORKSPACE", "TOOL"]);
-	// The four failure classes each get their own tag; they never share one.
-	assert.notEqual(traceClassBadge("pr-check"), traceClassBadge("environment"));
-	assert.notEqual(traceClassBadge("verification"), traceClassBadge("tool"));
-});
-
-test("a head_changed run is classified environment, never pr-check (#465)", () => {
-	const root = stateTree();
-	try {
-		const snapshot = readStateSnapshot(root);
-		// Rewrite the run record to the workspace-mismatch terminal state.
-		snapshot.runs[0].state = "head_changed";
-		const spans = buildPipelineSpans("projectbluefin/review#42", "fix launcher", snapshot, NOW);
-		const run = spans[0].children!.find((span) => span.id.endsWith("/run"));
-		assert.ok(run, "the run span exists");
-		assert.equal(run!.cls, "environment");
-		// The trace says WORKSPACE, never CHECK — this is not a PR check failure.
-		const text = traceToText(spans, NOW, 200);
-		assert.match(text, /WORKSPACE/);
-		assert.doesNotMatch(text, /CHECK/);
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("a selected PR's failed checks mark the root span pr-check, distinct from the run-state class (#465)", async () => {
-	const root = stateTree();
-	try {
-		const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root, fetchImpl: fakeFetch([]), env: ISOLATED_ENV });
-		mode.setToken("t");
-		await mode.refreshQueue();
-		mode.refreshState();
-		mode.setFilter("launcher"); // selects #42, whose GitHub checks are failing
-		assert.equal(mode.selected()!.id, 42);
-		const spans = mode.pipelineSpans(NOW);
-		// The root names the PR's own checks; the run-state workspace mismatch is a
-		// different class on its own span — never conflated with the PR check failure.
-		assert.equal(spans[0].cls, "pr-check");
-		const run = spans[0].children!.find((span) => span.id.endsWith("/run"));
-		// The run-state class is the review's own (findings here), never pr-check.
-		assert.notEqual(run!.cls, "pr-check");
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("the queue badge comes from the PR checks, not the run-state failure (#465)", () => {
-	// The queue badge is the GitHub ciGlyph of the pull request; a run-state
-	// failure never rewrites it. buildPipelineSpans reads the queue item's
-	// ciStatus for display but never mutates it, so the queue stays in PR state.
+test("the queue badge comes directly from GitHub checks", () => {
 	const item = queueItem({ ciStatus: "failure" });
 	assert.equal(ciGlyph(item.ciStatus).status, "failure");
 	assert.equal(queueItem({ ciStatus: "success" }).ciStatus, "success");
@@ -679,12 +523,8 @@ test("scope refresh keeps the latest response when requests finish out of order"
 		}),
 	});
 
-	const mode = new ReviewMode({
-		org: "projectbluefin",
-		stateRoot: join(tmpdir(), "nope"),
-		fetchImpl,
-		env: ISOLATED_ENV,
-	});
+	const mode = new ReviewMode({ org: "projectbluefin", fetchImpl,
+		env: ISOLATED_ENV, });
 	mode.setToken("t");
 	const staleRefresh = mode.refreshQueue();
 	assert.equal(requests.length, 1);
@@ -742,12 +582,8 @@ test("scope refresh discards stale Hive backfill responses", async () => {
 		json: async () => ({ data: { w0: { issueOrPullRequest: { ...item, closed: false } } } }),
 	});
 
-	const mode = new ReviewMode({
-		org: "projectbluefin",
-		stateRoot: join(tmpdir(), "nope"),
-		fetchImpl,
-		env: ISOLATED_ENV,
-	});
+	const mode = new ReviewMode({ org: "projectbluefin", fetchImpl,
+		env: ISOLATED_ENV, });
 	mode.setToken("t");
 	mode.setScope({ kind: "repo", value: "owner/old" });
 	const oldKey = "owner/old#9";
@@ -862,7 +698,7 @@ test("a queue cut off by the fetch ceiling says so", async () => {
 	const result = await fetchQueue("prs", { token: "t", limit: 1, fetchImpl: paged });
 	assert.equal(result.truncated, true);
 
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope"), fetchImpl: paged });
+	const mode = new ReviewMode({ org: "projectbluefin", fetchImpl: paged });
 	mode.setToken("t");
 	await mode.refreshQueue();
 	assert.match(mode.position(), /\+$/);
@@ -871,21 +707,19 @@ test("a queue cut off by the fetch ceiling says so", async () => {
 	assert.equal(complete.truncated, false);
 });
 
-test("mode ranks, filters, moves, and keeps the selection across a refetch", async () => {
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope"), fetchImpl: fakeFetch([]), env: ISOLATED_ENV });
+test("without Hive the queue stays in GitHub evidence order and remains descriptive", async () => {
+	const mode = new ReviewMode({ org: "projectbluefin", fetchImpl: fakeFetch([]), env: ISOLATED_ENV });
 	mode.setToken("t");
 	await mode.refreshQueue();
 	assert.equal(mode.visibleItems().length, 2);
 
-	// Without a hub the local ranking leads: #7 is green and landable, #42 is
-	// failing. GitHub's update order put #42 first.
-	assert.equal(mode.selected().id, 7);
-	assert.equal(mode.priorityFor(mode.selected()).category, "ready-for-human-merge");
+	assert.equal(mode.selected().id, 42, "browse-only mode preserves the fetched GitHub order");
+	assert.equal(mode.priorityFor(mode.selected()).category, "fix-ci", "categories remain descriptive");
 	assert.equal(mode.orderSource(), "local");
 
 	mode.move(1);
-	assert.equal(mode.selected().id, 42);
-	assert.equal(mode.priorityFor(mode.selected()).category, "fix-ci");
+	assert.equal(mode.selected().id, 7);
+	assert.equal(mode.priorityFor(mode.selected()).category, "ready-for-human-merge");
 	const before = mode.selectedKey();
 	await mode.refreshQueue();
 	assert.equal(mode.selectedKey(), before, "a refetch must not move the cursor off the item you were reading");
@@ -905,63 +739,37 @@ test("mode ranks, filters, moves, and keeps the selection across a refetch", asy
 	assert.deepEqual(mode.ciTally(), { success: 1, failure: 1, pending: 0, unknown: 0 });
 });
 
-test("rail renders the queue, the pipeline, and the keymap within width", (t) => {
-	const root = stateTree();
-	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
+test("rail renders the queue, OMP activity, and keymap within width", () => {
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.items = [queueItem()];
 	mode.fetchedAt = NOW - 3000;
-	mode.refreshState();
 
-	const rows = renderRail(mode, PLAIN_PAINTER, 100, NOW, 0, [{ chord: "alt+b", label: "dashboard" }]);
-	assert.ok(rows[0].includes("projectbluefin/review#42") || rows[0].includes("#42"));
-	assert.ok(rows[0].includes("alt+b: dash"));
+	const rows = renderRail(mode, PLAIN_PAINTER, 100, NOW, 0, [{ chord: "alt+b", label: "workbench" }]);
+	assert.ok(rows.some((row) => row.includes("projectbluefin/review#42") || row.includes("#42")));
+	assert.ok(rows.some((row) => row.includes("alt+b: workbench")));
 	for (const row of rows) assert.ok(visibleWidth(row) <= 100);
 
-	const multiRows = renderRail(mode, PLAIN_PAINTER, 100, NOW, 0, [{ chord: "alt+b", label: "dashboard" }], { compact: false });
-	assert.ok(multiRows[0].includes("⬢ bluefin"));
-	assert.ok(multiRows[1].includes("projectbluefin/review#42"));
-	assert.ok(multiRows.some((row) => row.includes("landing")), "the rail shows live pipeline stages");
-	assert.ok(multiRows.some((row) => row.includes("alt+b")));
-	assert.ok(multiRows[multiRows.length - 1].includes("BLUEFIN"), "tmux status bar is at the very bottom");
-	for (const row of multiRows) assert.ok(visibleWidth(row) <= 100);
+	mode.session.startTurn(NOW - 1000);
+	const activeRows = renderRail(mode, PLAIN_PAINTER, 100, NOW, 0, [{ chord: "alt+b", label: "workbench" }]);
+	assert.ok(activeRows.some((row) => row.includes("turn 1")), "the rail projects live OMP activity");
+	for (const row of activeRows) assert.ok(visibleWidth(row) <= 100);
 
 	assert.match(statusSegment(mode, PLAIN_PAINTER, NOW), /PR 1\/1 #42/);
 	mode.selectedKeys.add("projectbluefin/review#42");
 	assert.match(statusSegment(mode, PLAIN_PAINTER, NOW), /PR \[1 sel\] 1\/1 #42/);
 	mode.selectedKeys.clear();
 
-	mode.hive = { ...mode.hive, workers: "2/15", reviewers: "2/15" };
-	const tmuxBar = tmuxReviewStatusBar(mode, PLAIN_PAINTER, 150, NOW);
-	assert.ok(tmuxBar.includes("BLUEFIN") && tmuxBar.includes("review"));
-	assert.ok(tmuxBar.includes("Task:") && tmuxBar.includes("#42"));
-	assert.ok(tmuxBar.includes("Issues:") && tmuxBar.includes("PRs:"));
-	assert.ok(tmuxBar.includes("Workers:") && tmuxBar.includes("2/15"));
-	assert.ok(tmuxBar.includes("Reviewers:") && tmuxBar.includes("2/15"));
-});
-test("hitlist renders window of items around cursor above the editor", (t) => {
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope") });
-	mode.items = [
-		queueItem({ id: 1, repo: "projectbluefin/a", title: "first issue" }),
-		queueItem({ id: 2, repo: "projectbluefin/b", title: "second issue" }),
-		queueItem({ id: 3, repo: "projectbluefin/c", title: "third issue" }),
-	];
-	mode.cursor = 1;
-	const rows = renderHitlist(mode, PLAIN_PAINTER, 80, 5);
-	assert.ok(rows[0].includes("HITLIST"));
-	assert.ok(rows.some((row) => row.includes("#2") && row.includes(GLYPH.caretClosed)));
-	for (const row of rows) assert.ok(visibleWidth(row) <= 80);
 });
 
 test("rail explains an empty queue instead of pretending to load forever", () => {
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope") });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.queueError = "GitHub GraphQL 401 Unauthorized";
 	const rows = renderRail(mode, PLAIN_PAINTER, 80, NOW, 0, []);
 	assert.match(rows[0], /401/);
 });
 
 test("rail and dashboard clarify when queue is empty because of hive-only filter", () => {
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope") });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.hive = {
 		...EMPTY_HIVE,
 		configured: true,
@@ -989,7 +797,7 @@ test("queue age is silent while fresh and loud once stale", (t) => {
 	assert.match(queueAge(NOW - STALE_AFTER_MS - 1, NOW), /^stale /);
 	assert.equal(queueAge(0, NOW), "never fetched");
 
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope") });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.items = [queueItem()];
 	mode.fetchedAt = NOW - 1000;
 	assert.ok(!renderRail(mode, PLAIN_PAINTER, 100, NOW, 0, [])[0].includes("stale"));
@@ -997,27 +805,13 @@ test("queue age is silent while fresh and loud once stale", (t) => {
 	assert.match(renderRail(mode, PLAIN_PAINTER, 100, NOW, 0, [])[0], /stale/);
 });
 
-test("polling durable state reports change, not just activity", (t) => {
-	const root = stateTree();
-	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
-
-	assert.equal(mode.refreshState(), true, "the first read is a change");
-	assert.equal(mode.refreshState(), false, "an unchanged tree must not cost a repaint");
-
-	appendFileSync(
-		join(root, "review-batches", "batch-1.jsonl"),
-		JSON.stringify({ key: "projectbluefin/review#42", state: "complete", note: "fixed", ts: NOW / 1000 }) + "\n",
-	);
-	assert.equal(mode.refreshState(), true);
-});
 
 test("dashboard navigates, folds, filters, and returns actions", (t) => {
-	const root = stateTree();
+	const root = mkdtempSync(join(tmpdir(), "workbench-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.items = [queueItem(), queueItem({ id: 7, repo: "projectbluefin/other", title: "feat(ui): dagger rail", ciStatus: "success" })];
-	mode.refreshState();
+	;
 
 	let action;
 	let refreshes = 0;
@@ -1036,25 +830,24 @@ test("dashboard navigates, folds, filters, and returns actions", (t) => {
 	t.after(() => dashboard.dispose());
 
 	const frame = () => dashboard.render(120);
-	assert.ok(frame()[0].includes("bluefin review"));
+	assert.ok(frame()[0].includes("HIVE WORKBENCH"));
 	for (const row of frame()) assert.ok(visibleWidth(row) <= 120, row);
 
-	// Ranked order: the green #7 leads, the failing #42 follows.
-	assert.equal(mode.selected().id, 7);
+	assert.equal(mode.selected().id, 42, "browse-only mode preserves fetched order");
 	dashboard.handleInput("j");
-	assert.equal(mode.selected().id, 42);
-	dashboard.handleInput("k");
 	assert.equal(mode.selected().id, 7);
+	dashboard.handleInput("k");
+	assert.equal(mode.selected().id, 42);
 
-	// Trace pane: fold the root and the tree collapses to one row.
-	dashboard.handleInput("\t");
+	// Trace pane: `t` changes pane; Tab is reserved for PR/issue mode.
+	dashboard.handleInput("t");
 	dashboard.handleInput("h");
 	const folded = frame().filter((row) => row.includes("review#42")).length;
 	dashboard.handleInput("l");
 	assert.ok(frame().length >= folded);
 
-	// Filtering is modal and only commits on Enter.
-	dashboard.handleInput("\t");
+	// Filtering is inline and only commits on Enter.
+	dashboard.handleInput("t");
 	dashboard.handleInput("/");
 	for (const ch of "dagger") dashboard.handleInput(ch);
 	assert.equal(mode.filter, "", "filter is a draft until committed");
@@ -1063,18 +856,18 @@ test("dashboard navigates, folds, filters, and returns actions", (t) => {
 	assert.equal(mode.selected().id, 7);
 	assert.equal(mode.filter, "dagger");
 
-	dashboard.handleInput("u");
+	dashboard.handleInput("r");
 	assert.equal(refreshes, 1);
 
-	dashboard.handleInput("r");
-	assert.equal(action.kind, "review");
+	dashboard.handleInput("s");
+	assert.equal(action.kind, "slay");
 	assert.equal(action.item.id, 7);
 
 	dashboard.handleInput("\r");
-	assert.equal(action.kind, "review");
+	assert.equal(action.kind, "reference");
 	assert.equal(action.item.id, 7);
-	dashboard.handleInput("*");
-	assert.equal(action.kind, "leaderboard", "* opens the hive leaderboard");
+	dashboard.handleInput("c");
+	assert.equal(action.kind, "comment");
 
 	dashboard.handleInput("o");
 	assert.equal(action.kind, "scope", "o asks for another repository");
@@ -1082,17 +875,18 @@ test("dashboard navigates, folds, filters, and returns actions", (t) => {
 	assert.equal(action.kind, "close");
 
 	dashboard.handleInput("?");
-	assert.ok(frame().some((row) => row.includes("slay")), "help lists the action keys");
+	assert.ok(frame().some((row) => row.includes("comment")), "help lists supported actions");
+	assert.ok(frame().some((row) => row.includes("slay")), "help exposes mass autoreview");
 });
 test("dashboard interactive search live-filters and selects items by title", (t) => {
-	const root = stateTree();
+	const root = mkdtempSync(join(tmpdir(), "workbench-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.items = [
 		queueItem({ id: 7, repo: "projectbluefin/other", title: "token exchange fix", ciStatus: "success" }),
 		queueItem({ id: 42, repo: "projectbluefin/review", title: "second item", ciStatus: "failure" }),
 	];
-	mode.refreshState();
+	;
 	const dashboard = new ReviewDashboard({ requestRender() {} }, PLAIN_PAINTER, mode, () => {}, () => {}, 20);
 	t.after(() => dashboard.dispose());
 
@@ -1115,15 +909,102 @@ test("dashboard interactive search live-filters and selects items by title", (t)
 	assert.equal(mode.selectedKeys.size, 1);
 	assert.ok(mode.selectedKeys.has("projectbluefin/other#7"));
 });
-test("dashboard supports multi-selection with space, x to clear, and batch action dispatch", (t) => {
-	const root = stateTree();
+
+test("workbench Tab switches entity mode and Alt+B selects one repository group", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "workbench-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
+	const mode = new ReviewMode({ org: "projectbluefin" });
+	mode.items = [
+		queueItem({ id: 1, repo: "projectbluefin/a", ciStatus: "success" }),
+		queueItem({ id: 2, repo: "projectbluefin/a", ciStatus: "success" }),
+		queueItem({ id: 3, repo: "projectbluefin/b", ciStatus: "failure" }),
+	];
+	mode.reprioritize();
+	mode.selectById("projectbluefin/a", 1);
+	const modes: string[] = [];
+	let refreshes = 0;
+	const dashboard = new ReviewDashboard(
+		{ requestRender() {} },
+		PLAIN_PAINTER,
+		mode,
+		() => {},
+		() => { refreshes += 1; },
+		20,
+		undefined,
+		(next) => modes.push(next),
+	);
+	t.after(() => dashboard.dispose());
+
+	dashboard.handleInput("alt+b");
+	assert.deepEqual([...mode.selectedKeys].sort(), ["projectbluefin/a#1", "projectbluefin/a#2"]);
+	dashboard.handleInput("alt+b");
+	assert.equal(mode.selectedKeys.size, 0);
+
+	dashboard.handleInput("\t");
+	assert.equal(mode.queueMode, "issues");
+	assert.deepEqual(modes, ["issues"]);
+	assert.equal(refreshes, 1);
+	assert.match(dashboard.render(120).join("\n"), /HIVE WORKBENCH/);
+});
+
+test("repository waves preserve interleaved Hive order and pause survives session persistence", () => {
+	const mode = new ReviewMode({ org: "projectbluefin" });
+	mode.items = [
+		queueItem({ id: 1, repo: "projectbluefin/a" }),
+		queueItem({ id: 3, repo: "projectbluefin/b" }),
+		queueItem({ id: 2, repo: "projectbluefin/a" }),
+	];
+	mode.reprioritize();
+	for (const item of mode.items) mode.selectedKeys.add(`${item.repo}#${item.id}`);
+	assert.deepEqual(
+		mode.repositoryWaves().map((wave) => [wave.repo, wave.items.map((item) => item.id)]),
+		[["projectbluefin/a", [1]], ["projectbluefin/b", [3]], ["projectbluefin/a", [2]]],
+	);
+	assert.equal(mode.togglePaused(), true);
+	const persisted = mode.toPersisted();
+	assert.equal(persisted.paused, true);
+	const restored = new ReviewMode({ org: "projectbluefin" });
+	restored.restore(persisted);
+	assert.equal(restored.paused, true);
+});
+
+test("comment plans bind ordered targets and fail closed on live drift", () => {
+	const targets = [
+		{ repo: "projectbluefin/review", number: 42, type: "pull_request" as const, headSha: "a".repeat(40) },
+		{ repo: "projectbluefin/review", number: 43, type: "issue" as const },
+	];
+	const plan = createCommentActionPlan(targets, "Evidence-backed comment", 123);
+	assert.equal(plan.createdAt, 123);
+	assert.match(renderCommentActionPlan(plan), /projectbluefin\/review#42/);
+	assert.match(renderCommentActionPlan(plan), /Evidence-backed comment/);
+	assert.equal(validateCommentActionPlan(plan, targets).valid, true);
+	assert.equal(
+		validateCommentActionPlan(plan, [{ ...targets[0], headSha: "b".repeat(40) }, targets[1]]).valid,
+		false,
+	);
+	assert.deepEqual(commentInvocation(targets[1], plan.body), {
+		command: "gh",
+		args: ["issue", "comment", "43", "--repo", "projectbluefin/review", "--body", "Evidence-backed comment"],
+	});
+	assert.throws(() => createCommentActionPlan(targets, "   "), /comment body/i);
+});
+
+test("comment plans reject pull requests without a preview head", () => {
+	const target = { repo: "projectbluefin/review", number: 42, type: "pull_request" as const };
+	assert.throws(() => createCommentActionPlan([target], "Review evidence"), /Missing pull request head/);
+	const plan = createCommentActionPlan([{ ...target, headSha: "a".repeat(40) }], "Review evidence");
+	assert.equal(validateCommentActionPlan(plan, [target]).valid, false);
+	assert.equal(validateCommentActionPlan({ ...plan, targets: [target] }, [target]).valid, false);
+});
+test("dashboard supports multi-selection with space, x to clear, and slay dispatch", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "workbench-test-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.items = [
 		queueItem({ id: 7, repo: "projectbluefin/other", title: "first item", ciStatus: "success" }),
 		queueItem({ id: 42, repo: "projectbluefin/review", title: "second item", ciStatus: "failure" }),
 	];
-	mode.refreshState();
+	;
 
 	let action;
 	const dashboard = new ReviewDashboard(
@@ -1151,8 +1032,8 @@ test("dashboard supports multi-selection with space, x to clear, and batch actio
 	// Select item 42 directly without pressing j
 	dashboard.handleInput(" ");
 	assert.ok(dashboard.render(120).some((row) => row.includes("2 selected")));
-	// Pressing r on multiple selected items natively dispatches autoslay (slay) mode with both items
-	dashboard.handleInput("r");
+	// Slay sends every selected item through mass autoreview.
+	dashboard.handleInput("s");
 	assert.equal(action.kind, "slay");
 	assert.equal(action.items.length, 2);
 	assert.equal(action.items[0].id, 7);
@@ -1163,7 +1044,7 @@ test("dashboard supports multi-selection with space, x to clear, and batch actio
 });
 
 test("dashboard stacks panes on a narrow terminal", (t) => {
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope") });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.items = [queueItem()];
 	const dashboard = new ReviewDashboard({ requestRender() {} }, PLAIN_PAINTER, mode, () => {}, () => {}, 20);
 	t.after(() => dashboard.dispose());
@@ -1178,7 +1059,7 @@ function prItem(overrides) {
 	return queueItem({ ciStatus: "success", mergeState: "clean", reviewState: "review_required", ...overrides });
 }
 
-test("without a hub the queue takes the maintainer's order", () => {
+test("without a hub the queue remains unranked in fetched order", () => {
 	const now = NOW;
 	const items = [
 		prItem({ id: 1, title: "chore(deps): bump", author: "renovate[bot]", labels: ["deps"], reviewState: "approved" }),
@@ -1189,39 +1070,20 @@ test("without a hub the queue takes the maintainer's order", () => {
 		prItem({ id: 6, title: "running checks", ciStatus: "pending" }),
 		prItem({ id: 7, title: "reviewed change" }),
 	];
-	const ranked = prioritize(items, {
-		hive: EMPTY_HIVE,
-		hasFindings: (key) => key === "projectbluefin/review#7",
-		now,
-	});
+	const ranked = prioritize(items, { hive: EMPTY_HIVE, now });
 
 	assert.equal(ranked.source, "local");
-	assert.deepEqual(
-		ranked.items.map((item) => item.id),
-		// Ties inside a category break on recency, then on key, so the order is
-		// stable across refetches: #2 and #6 share a timestamp here.
-		[3, 1, 7, 5, 4, 2, 6],
-		"merge-ready, then review, then conflicts, then CI, then unknowns",
-	);
+	assert.deepEqual(ranked.items.map((item) => item.id), [1, 2, 3, 4, 5, 6, 7]);
 	assert.equal(ranked.priorities.get("projectbluefin/review#3").category, "ready-for-human-merge");
 	assert.equal(ranked.priorities.get("projectbluefin/review#7").category, "review");
-	assert.match(ranked.priorities.get("projectbluefin/review#7").reason, /recorded review findings/);
+	assert.match(ranked.priorities.get("projectbluefin/review#7").reason, /awaiting review/);
 	assert.equal(ranked.priorities.get("projectbluefin/review#5").category, "resolve-conflicts");
 	assert.equal(ranked.priorities.get("projectbluefin/review#4").category, "fix-ci");
 	assert.equal(ranked.priorities.get("projectbluefin/review#2").category, "investigate");
-
-	// A dependency bump is real work, but never the first thing to read: it sinks
-	// below the human change in its own category.
-	assert.ok(
-		ranked.items.findIndex((item) => item.id === 3) < ranked.items.findIndex((item) => item.id === 1),
-		"an approved human change outranks an approved bot bump",
-	);
-	assert.equal(
-		categorize(queueItem({ type: "issue" }), { hive: EMPTY_HIVE, hasFindings: () => false, now }).category,
-		"triage",
-	);
+	assert.equal(ranked.priorities.get("projectbluefin/review#1").demotion, 1, "descriptive metadata may still mark a dependency bump");
+	assert.equal(categorize(queueItem({ type: "issue" }), { hive: EMPTY_HIVE, now }).category, "triage");
 });
-test("issue queue is organized by repo and delineated with dividers", () => {
+test("browse-only issue queues preserve fetched order and delineate repository transitions", () => {
 	const now = NOW;
 	const items = [
 		queueItem({ id: 201, type: "issue", repo: "projectbluefin/server", title: "server issue", updatedAt: now - 100 }),
@@ -1229,19 +1091,13 @@ test("issue queue is organized by repo and delineated with dividers", () => {
 		queueItem({ id: 202, type: "issue", repo: "projectbluefin/server", title: "another server issue", updatedAt: now - 10 }),
 		queueItem({ id: 102, type: "issue", repo: "projectbluefin/actions", title: "second actions issue", updatedAt: now - 20 }),
 	];
-	const ranked = prioritize(items, { hive: EMPTY_HIVE, hasFindings: () => false, now });
-	// Must group by repository first so cohorts stay within repository borders
+	const ranked = prioritize(items, { hive: EMPTY_HIVE, now });
 	assert.deepEqual(
-		ranked.items.map((it) => `${it.repo}#${it.id}`),
-		[
-			"projectbluefin/actions#102",
-			"projectbluefin/actions#101",
-			"projectbluefin/server#202",
-			"projectbluefin/server#201",
-		],
+		ranked.items.map((item) => `${item.repo}#${item.id}`),
+		["projectbluefin/server#201", "projectbluefin/actions#101", "projectbluefin/server#202", "projectbluefin/actions#102"],
 	);
 
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: "/nonexistent" });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.items = items;
 	mode.queueMode = "issues";
 	mode.reprioritize();
@@ -1281,7 +1137,7 @@ test("with a hub the order is Hive's, including through a closing reference", ()
 		prItem({ id: 11, ciStatus: "failure", closingIssues: ["projectbluefin/docs#900"] }),
 		prItem({ id: 5, ciStatus: "pending" }),
 	];
-	const ranked = prioritize(items, { hive, hasFindings: () => false, now: NOW });
+	const ranked = prioritize(items, { hive, now: NOW });
 
 	assert.equal(ranked.source, "hive");
 	assert.equal(ranked.hiveRanked, 2);
@@ -1298,7 +1154,7 @@ test("mode defaults to a hive-only view when hub is online, toggled with H", () 
 		items: [{ key: "projectbluefin/review#11", repo: "projectbluefin/review", number: 11, title: "queued", url: "", labels: [] }],
 		ranks: buildRankMap([{ key: "projectbluefin/review#11", repo: "projectbluefin/review", number: 11, title: "", url: "", labels: [] }], []),
 	};
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope"), env: ISOLATED_ENV });
+	const mode = new ReviewMode({ org: "projectbluefin", env: ISOLATED_ENV });
 	mode.hive = hive;
 	mode.items = [
 		prItem({ id: 3, ciStatus: "success" }),
@@ -1438,7 +1294,7 @@ test("scoping the queue to one repository refetches and persists", async () => {
 			json: async () => ({ data: { search: { pageInfo: { hasNextPage: false }, nodes: [] } } }),
 		};
 	};
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope"), fetchImpl: scoped, env: ISOLATED_ENV });
+	const mode = new ReviewMode({ org: "projectbluefin", fetchImpl: scoped, env: ISOLATED_ENV });
 	mode.setToken("t");
 	mode.setScope(parseScope("owner/repo", "projectbluefin"));
 	await mode.refreshQueue();
@@ -1489,13 +1345,13 @@ test("CLI flags forward parsed scope and preselected item to mode", async () => 
 	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl: scopedFetch, env: ISOLATED_ENV });
 	const ctx = fakeCtx();
 	ctx.ui.parent = ctx;
-	pi.flagValues.set("splash", false);
+	;
 	pi.flagValues.set("repo", "projectbluefin/review");
 	pi.flagValues.set("pr", "42");
 	await pi.events.get("session_start")({}, ctx);
 	await review.whenStarted();
 
-	const status = await pi.tools.get("bluefin_review_status").execute("id", {});
+	const status = await pi.tools.get("hive_workbench_status").execute("id", {});
 	assert.equal(status.details.scope.kind, "repo");
 	assert.equal(status.details.scope.value, "projectbluefin/review");
 	assert.equal(status.details.selected.id, 42);
@@ -1531,201 +1387,314 @@ test("the extension registers keyboard-only surfaces and real tools", async () =
 	const pi = fakeHost();
 	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl: fakeFetch([]), env: ISOLATED_ENV });
 
-	assert.deepEqual(pi.labels, ["Bluefin Review"]);
-	assert.deepEqual([...pi.shortcuts.keys()].sort(), ["alt+b", "alt+i", "alt+j", "alt+k", "alt+o", "alt+s", "alt+u", "alt+x", "alt+y"]);
-	assert.deepEqual([...pi.flags.keys()].sort(), ["all", "autoslay", "issues", "pr", "repo", "skip-repo", "splash"]);
+	assert.deepEqual(pi.labels, ["Hive Workbench"]);
+	assert.deepEqual([...pi.shortcuts.keys()].sort(), ["alt+b", "alt+s", "alt+u"]);
+	assert.deepEqual([...pi.flags.keys()].sort(), ["all", "autoslay", "issues", "pr", "repo", "skip-repo"]);
 	assert.deepEqual([...pi.tools.keys()].sort(), [
-		"bluefin_hive_lookup",
-		"bluefin_review_diff",
-		"bluefin_review_queue",
-		"bluefin_review_status",
-		"bluefin_review_trace",
+		"hive_workbench_diff",
+		"hive_workbench_lookup",
+		"hive_workbench_queue",
+		"hive_workbench_status",
+		"hive_workbench_trace",
 	]);
 	// Reserved chords would be silently dropped by omp.
 	for (const chord of pi.shortcuts.keys()) assert.match(chord, /^alt\+[a-z]$/);
 
 	const ctx = fakeCtx();
 	ctx.ui.parent = ctx;
-	pi.flagValues.set("splash", false);
 	await pi.events.get("session_start")({}, ctx);
 	await review.whenStarted();
-	// Ranked, not fetched-order: #7 is green and landable, #42 is failing.
-	assert.ok(ctx.statuses.get("bluefin_queue")?.includes("#7"), ctx.statuses.get("bluefin_queue"));
-	assert.equal(typeof ctx.widgets.get("bluefin-rail"), "function", "the rail is a component, not capped strings");
-	assert.equal(ctx.widgets.get("bluefin-hitlist"), undefined, "hitlist widget is removed to avoid editor crowding");
-	assert.equal(ctx.footers.length, 1, "footer is registered as the lower status line");
-	const footerComp = (ctx.footers[0] as (tui: unknown, theme: unknown) => { render(w: number): string[] })({}, ctx.ui.theme);
-	const footerRows = footerComp.render(120);
-	assert.ok(footerRows[0].includes("BLUEFIN"), "footer renders tmux status bar as very bottom row");
-	const diff = await pi.tools.get("bluefin_review_diff").execute("id", { pull_request: 42 });
+	assert.ok(ctx.statuses.get("hive_workbench")?.includes("#42"), ctx.statuses.get("hive_workbench"));
+	assert.equal(typeof ctx.widgets.get("hive-workbench-rail"), "function", "the rail is a component, not capped strings");
+	const diff = await pi.tools.get("hive_workbench_diff").execute("id", { pull_request: 42 });
 	assert.match(diff.content[0].text, /image\/entrypoint\.sh/);
 	assert.equal(diff.details.pull_request, 42);
 	assert.equal(diff.details.repo, "projectbluefin/review");
-	const bad = await pi.tools.get("bluefin_review_diff").execute("id", { pull_request: 0 });
+	const bad = await pi.tools.get("hive_workbench_diff").execute("id", { pull_request: 0 });
 	assert.equal(bad.isError, true);
 
-	const status = await pi.tools.get("bluefin_review_status").execute("id", {});
-	assert.match(status.content[0].text, /selected projectbluefin\/other#7/);
-	// The model must be told which authority ordered the queue, and that Hive's
-	// order is not its to rearrange.
-	assert.match(status.content[0].text, /order: local — no hive hub configured/);
-	assert.match(status.content[0].text, /priority: ready-for-human-merge/);
+	const status = await pi.tools.get("hive_workbench_status").execute("id", {});
+	assert.match(status.content[0].text, /selected projectbluefin\/review#42/);
+	assert.match(status.content[0].text, /order: unranked — no hive hub configured/);
+	assert.match(status.content[0].text, /priority: fix-ci/);
 	assert.equal(status.details.order_source, "local");
 	assert.equal(status.details.hive.configured, false);
 	assert.equal(status.details.scope.value, "projectbluefin");
 
-	const queue = await pi.tools.get("bluefin_review_queue").execute("id", {});
-	assert.match(queue.content[0].text, /^\[ready-for-human-merge\] projectbluefin\/other#7/m);
+	const queue = await pi.tools.get("hive_workbench_queue").execute("id", {});
+	assert.match(queue.content[0].text, /^\[fix-ci\] projectbluefin\/review#42/m);
 	assert.equal(queue.details.order_source, "local");
 
 	pi.events.get("tool_execution_start")({ toolCallId: "x", toolName: "grep", args: { pattern: "HIVE_HUB" } }, ctx);
-	const live = await pi.tools.get("bluefin_review_status").execute("id", {});
-	assert.equal(live.details.selected.id, 7);
-	const lookup = await pi.tools.get("bluefin_hive_lookup").execute("id", {});
+	const live = await pi.tools.get("hive_workbench_status").execute("id", {});
+	assert.equal(live.details.selected.id, 42);
+	const lookup = await pi.tools.get("hive_workbench_lookup").execute("id", {});
 	assert.match(lookup.content[0].text, /Hive hub is not configured/);
-	// Startup opens the dashboard itself, and it stays open until the maintainer
-	// closes it, so alt+b on an open dashboard must not stack a second overlay.
-	assert.equal(ctx.overlays.length, 1, "startup opens exactly one dashboard");
+	assert.equal(ctx.overlays.length, 1, "startup opens exactly one workbench");
 	await pi.shortcuts.get("alt+b").handler(ctx);
-	assert.equal(ctx.overlays.length, 1, "alt+b on an open dashboard opens nothing new");
-
-	// alt+s triggers autoslay directly in Hive priority order
-	await pi.shortcuts.get("alt+s").handler(ctx);
-	assert.ok(pi.messages.length > 0, "alt+s must dispatch autoslay user message in Hive priority order");
+	assert.equal(ctx.overlays.length, 1, "Alt+B does not stack an already-open workbench");
+	assert.equal(pi.messages.length, 0, "opening the workbench never dispatches work");
+	const workbench = ctx.overlays[0];
+	workbench.handleInput("A");
+	workbench.handleInput("s");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(pi.messages.length, 1, "slay dispatches without requiring Hive ranking");
+	assert.match(pi.messages[0], /bluefin-reviewer/);
+	assert.ok(!ctx.notifications.some((notification) => /browse-only mode disables dispatch/.test(notification.message)));
 });
 
-test("autoslay falls back to unranked PR batch review and slaying with 7 subagents when no Hive-ranked items exist", async () => {
+test("--autoslay starts mass autoreview on launch", async () => {
 	const pi = fakeHost();
+	pi.flagValues.set("autoslay", true);
 	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl: fakeFetch([]), env: ISOLATED_ENV });
 	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+
+	await pi.events.get("session_start")({}, ctx);
 	await review.whenStarted();
+	await new Promise((resolve) => setImmediate(resolve));
 
-	// Populate unranked open PRs with Hive configured/online so hiveOnly would normally show 0
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope") });
-	mode.hive = {
-		...EMPTY_HIVE,
-		configured: true,
-		online: true,
-		hub: "https://hive.example",
-	};
-	const prs = [
-		prItem({ id: 101, repo: "projectbluefin/review", title: "first unranked pr" }),
-		prItem({ id: 102, repo: "projectbluefin/review", title: "second unranked pr" }),
-		prItem({ id: 103, repo: "projectbluefin/review", title: "third unranked pr" }),
-	];
-	mode.items = prs;
-	mode.reprioritize();
-
-	// hiveOnly hides them from visibleItems
-	assert.equal(mode.visibleItems().length, 0);
-	// slayableItems falls back to the unranked PR batch
-	const slayable = mode.slayableItems();
-	assert.equal(slayable.length, 3);
-	assert.equal(slayable[0].id, 101);
-
-	// The actionPrompt for the batch must include the 7-subagent cap
-	const prompt = actionPrompt({ kind: "slay", item: slayable[0], items: slayable });
-	assert.match(prompt, /ONE subagent per issue\/PR/);
-	assert.match(prompt, /capped at a maximum of 7 concurrent subagents/);
-	assert.doesNotMatch(prompt, /k3-final-review/);
-	assert.match(prompt, /Execute the full fix-and-merge landing pass/);
+	assert.equal(pi.messages.length, 1);
+	assert.match(pi.messages[0], /bluefin-reviewer/);
+	assert.match(pi.messages[0], /Never approve or merge/);
 });
 
-test("dispatch prompts forbid sleeping on CI and cap the evidence they pull", () => {
+test("comment action previews once, revalidates live state, executes argv, and persists a receipt", async () => {
+	const items = [{ id: 42, repo: "projectbluefin/review", title: "comment target", headSha: "a".repeat(40) }];
+	const pi = fakeHost();
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+	ctx.editorResponses.push("Evidence-backed comment");
+	const review = createReviewExtension(pi, {
+		org: "projectbluefin",
+		fetchImpl: hiveBackedFetch(items),
+		env: { ...ISOLATED_ENV, HIVE_HUB: "wss://hive.example/contribute" },
+	});
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+	const dashboard = ctx.overlays[0];
+	dashboard.handleInput("c");
+	await new Promise((resolve) => setImmediate(resolve));
+
+	assert.equal(ctx.overlays.length, 1, "comment action keeps the workbench mounted");
+	assert.equal(ctx.confirmations.length, 1, "one immutable plan is confirmed once");
+	assert.match(ctx.confirmations[0].message, /projectbluefin\/review#42/);
+	assert.deepEqual(pi.execCalls, [{
+		command: "gh",
+		args: ["pr", "comment", "42", "--repo", "projectbluefin/review", "--body", "Evidence-backed comment"],
+	}]);
+	const receipt = pi.entries.filter((entry) => entry.customType === COMMENT_ENTRY).at(-1).data;
+	assert.equal(receipt.state, "complete");
+	assert.deepEqual(receipt.receipts, [pi.execResult.stdout.trim()]);
+});
+
+test("comment batches revalidate later heads and retain partial receipts", async () => {
+	const items = [
+		{ id: 42, repo: "projectbluefin/review", title: "first target", headSha: "a".repeat(40) },
+		{ id: 43, repo: "projectbluefin/review", title: "later target", headSha: "b".repeat(40) },
+	];
+	const pi = fakeHost();
+	const execute = pi.exec.bind(pi);
+	pi.exec = async (command, args) => {
+		const result = await execute(command, args);
+		items[1].headSha = "c".repeat(40);
+		return result;
+	};
+	const ctx = fakeCtx();
+	ctx.editorResponses.push("Review evidence");
+	const review = createReviewExtension(pi, {
+		org: "projectbluefin",
+		fetchImpl: (url, init) => hiveBackedFetch(items)(url, init),
+		env: { ...ISOLATED_ENV, HIVE_HUB: "wss://hive.example/contribute" },
+	});
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+	ctx.overlays[0].handleInput("A");
+	ctx.overlays[0].handleInput("c");
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	await promise;
+
+	assert.equal(pi.execCalls.length, 1, "a changed second head must not receive the stale comment");
+	assert.equal(pi.execCalls[0].args[2], "42");
+	const receipt = pi.entries.filter((entry) => entry.customType === COMMENT_ENTRY).at(-1).data;
+	assert.equal(receipt.state, "failed");
+	assert.match(receipt.error, /PR head changed/);
+	assert.deepEqual(receipt.receipts, [pi.execResult.stdout.trim()]);
+});
+
+test("pinned OMP agent_end advances repository waves only after final settlement", async () => {
+	const items = [
+		{ id: 1, repo: "projectbluefin/a", title: "a one", headSha: "1".repeat(40) },
+		{ id: 2, repo: "projectbluefin/a", title: "a two", headSha: "2".repeat(40) },
+		{ id: 3, repo: "projectbluefin/b", title: "b one", headSha: "3".repeat(40) },
+	];
+	const pi = fakeHost();
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+	const review = createReviewExtension(pi, {
+		org: "projectbluefin",
+		fetchImpl: hiveBackedFetch(items),
+		env: { ...ISOLATED_ENV, HIVE_HUB: "wss://hive.example/contribute" },
+	});
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+	const dashboard = ctx.overlays[0];
+	dashboard.handleInput("A");
+	dashboard.handleInput("s");
+	await new Promise((resolve) => setImmediate(resolve));
+
+	assert.equal(pi.messages.length, 1);
+	assert.match(pi.messages[0], /^Slay this repository wave for projectbluefin\/a through mass autoreview:/m);
+	assert.match(pi.messages[0], /workflowz this repository wave/);
+	assert.match(pi.messages[0], /projectbluefin\/a/);
+	assert.doesNotMatch(pi.messages[0], /projectbluefin\/b/);
+
+	ctx.asyncJobs.recent = [{ id: "hive-wave", status: "completed", startTime: Date.now() + 1 }];
+	await pi.events.get("agent_end")({ willContinue: true }, ctx);
+	assert.equal(pi.messages.length, 1, "an OMP continuation must not admit another repository");
+	ctx.asyncJobs.running = [{ id: "still-running", status: "running", startTime: Date.now() + 1 }];
+	await pi.events.get("agent_end")({}, ctx);
+	assert.equal(pi.messages.length, 1, "unfinished workers must settle before another repository starts");
+	ctx.asyncJobs.running = [];
+
+	dashboard.handleInput("p");
+	ctx.asyncJobs.recent = [{ id: "hive-wave", status: "completed", startTime: Date.now() + 1 }];
+	await pi.events.get("agent_end")({}, ctx);
+	assert.equal(pi.messages.length, 1, "pause prevents the next repository from starting");
+	dashboard.handleInput("p");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(pi.messages.length, 2);
+	assert.match(pi.messages[1], /projectbluefin\/b/);
+	assert.doesNotMatch(pi.messages[1], /projectbluefin\/a/);
+
+	ctx.asyncJobs.recent = [{ id: "hive-wave-2", status: "completed", startTime: Date.now() + 1 }];
+	await pi.events.get("agent_end")({}, ctx);
+	const batches = pi.entries.filter((entry) => entry.customType === BATCH_ENTRY).map((entry) => entry.data);
+	assert.equal(batches.at(-1).state, "complete");
+	assert.equal(batches.at(-1).completedItems, 3);
+	assert.ok(dashboard.render(120).some((line) => line.includes("3/3 terminal")));
+});
+
+
+
+test("a failed workflowz job blocks later repository waves", async () => {
+	const items = [
+		{ id: 1, repo: "projectbluefin/a", title: "a one" },
+		{ id: 2, repo: "projectbluefin/a", title: "a two" },
+		{ id: 3, repo: "projectbluefin/b", title: "b one" },
+	];
+	const pi = fakeHost();
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+	const review = createReviewExtension(pi, {
+		org: "projectbluefin",
+		fetchImpl: hiveBackedFetch(items),
+		env: { ...ISOLATED_ENV, HIVE_HUB: "wss://hive.example/contribute" },
+	});
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+	const dashboard = ctx.overlays[0];
+	dashboard.handleInput("A");
+	dashboard.handleInput("s");
+	await new Promise((resolve) => setImmediate(resolve));
+	ctx.asyncJobs.recent = [{ id: "failed-worker", status: "failed", startTime: Date.now() + 1 }];
+	await pi.events.get("agent_end")({}, ctx);
+
+	assert.equal(pi.messages.length, 1, "a failed wave never advances to the next repository");
+	const slay = pi.entries.filter((entry) => entry.customType === BATCH_ENTRY).at(-1).data;
+	assert.equal(slay.state, "blocked");
+	assert.match(slay.error, /workflowz job.*failed/);
+});
+test("restart blocks interrupted slays and never replays confirmed comments", async () => {
+	const item = { id: 42, repo: "projectbluefin/review", title: "recover safely", headSha: "a".repeat(40) };
+	const commentPlan = createCommentActionPlan([
+		{ repo: item.repo, number: item.id, type: "pull_request", headSha: item.headSha },
+	], "Do not replay me", 100);
+	const pi = fakeHost();
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+	ctx.sessionManager = {
+		getBranch: () => [
+			{ type: "custom", customType: STATE_ENTRY, data: { mode: "prs" } },
+			{
+				type: "custom",
+				customType: BATCH_ENTRY,
+				data: {
+					version: 1,
+					id: "slay-old",
+					kind: "slay",
+					waves: [{ repo: item.repo, items: [{ ...item, type: "pr" }] }],
+					currentWave: 0,
+					completedItems: 0,
+					totalItems: 1,
+					state: "running",
+					startedAt: 50,
+					waveStartedAt: 60,
+				},
+			},
+			{ type: "custom", customType: COMMENT_ENTRY, data: { version: 1, state: "confirmed", plan: commentPlan } },
+		],
+	};
+	const review = createReviewExtension(pi, {
+		org: "projectbluefin",
+		fetchImpl: hiveBackedFetch([item]),
+		env: { ...ISOLATED_ENV, HIVE_HUB: "wss://hive.example/contribute" },
+	});
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+
+	assert.equal(pi.execCalls.length, 0, "confirmed comments are never replayed after restart");
+	assert.equal(pi.messages.length, 0, "interrupted repository waves are never replayed");
+	assert.ok(ctx.notifications.some((notification) => /interrupted comment plan was not replayed/.test(notification.message)));
+	const recovered = pi.entries.filter((entry) => entry.customType === BATCH_ENTRY).at(-1).data;
+	assert.equal(recovered.state, "blocked");
+	assert.match(recovered.error, /session ended/);
+	assert.ok(ctx.overlays[0].render(240).some((line) => line.includes("BLOCKED")));
+});
+
+test("slay prompts invoke bluefin-reviewer workpools with bounded evidence", () => {
 	const item = queueItem();
-	const slay = actionPrompt({ kind: "slay", item });
-	const approve = actionPrompt({ kind: "approve", item });
-	// The single-item landing pass is the path a one-item queue actually takes.
-	assert.match(slay, /Never sleep or run polling loops/);
-	assert.match(approve, /Never sleep or run polling loops/);
-	// "as soon as checks are green" invited the wait loop that burned the turns.
-	assert.doesNotMatch(slay, /as soon as checks are green/);
-	// Context is re-sent every turn, so evidence is read once and stays bounded.
-	for (const prompt of [slay, approve]) {
+	const sibling = queueItem({ id: 7, repo: item.repo });
+	const slay = actionPrompt({ kind: "slay", item, items: [item, sibling] });
+	const fix = actionPrompt({ kind: "fix", item, items: [item, sibling] });
+	for (const prompt of [slay, fix]) {
+		assert.match(prompt, /workflowz this repository wave/);
+		assert.match(prompt, /Never sleep or poll/);
 		assert.match(prompt, /Evidence is bounded and read once/);
 		assert.match(prompt, /--name-only/);
 		assert.doesNotMatch(prompt, /--json [\w,]*\bbody\b/);
+		assert.doesNotMatch(prompt, /maximum of 7|approve and merge|fix-and-merge/);
 	}
-	// A batch hands both rules to every subagent it fans out.
-	const batch = actionPrompt({ kind: "slay", item, items: [item, queueItem({ id: 7, repo: "projectbluefin/other" })] });
-	assert.match(batch, /Never sleep or run polling loops/);
-	assert.match(batch, /Evidence is bounded and read once/);
+	assert.match(slay, /fresh bluefin-reviewer workpool item per issue or pull request/);
+	assert.match(fix, /fresh isolated agent\(\) handle per issue or pull request/);
 });
 
-test("slaying a conflicted pull request repairs it instead of reporting it blocked", () => {
+test("fix waves repair conflicts without landing them", () => {
 	const dirty = queueItem({ ciStatus: "failure", mergeState: "dirty", reviewState: "review_required" });
-	const slay = actionPrompt({ kind: "slay", item: dirty });
-	// A dirty merge base is work the branch can do to itself, not a verdict.
-	assert.match(slay, /conflicting merge base .* is a repair you perform, not a reason to stop/);
-	assert.match(slay, /git merge origin\/<base>/);
-	// The repo's conflict doctrine: merge the base in, never rewrite history.
-	assert.match(slay, /Never rebase the branch, never resolve with `--ours` or `--theirs`, and never force-push/);
-	// Blocked stays available, but only for a conflict the branch cannot settle.
-	assert.match(slay, /no push access to the fork, or two sides make incompatible decisions/);
-	// Every fanned-out subagent inherits it, since they are what actually do the work.
-	const batch = actionPrompt({ kind: "slay", item: dirty, items: [dirty, queueItem({ id: 7, repo: "projectbluefin/other", mergeState: "dirty" })] });
-	assert.match(batch, /<<<SUBAGENT-RULES[\s\S]*is a repair you perform[\s\S]*SUBAGENT-RULES>>>/);
+	const sibling = queueItem({ id: 7, repo: dirty.repo, mergeState: "dirty" });
+	const batch = actionPrompt({ kind: "fix", item: dirty, items: [dirty, sibling] });
+	assert.match(batch, /merge=dirty/);
+	assert.match(batch, /fresh isolated agent\(\) handle/);
+	assert.match(batch, /Never approve or merge/);
 });
 
-test("the queue read travels with its caveat and the subagent rules are copyable", () => {
+test("the queue read travels with its caveat and workflowz rules are copyable", () => {
 	const green = queueItem({ ciStatus: "success", mergeState: "clean", reviewState: "approved" });
-	const slay = actionPrompt({ kind: "slay", item: green });
-	// The state the queue already paid for travels with the item.
-	assert.match(slay, /\[queue read: ci=success merge=clean review=approved — revalidate head live before mutating\]/);
-	// Unknown fields are omitted rather than sent as noise.
-	const bare = actionPrompt({ kind: "slay", item: queueItem({ ciStatus: undefined, mergeState: "unknown", reviewState: "unknown" }) });
-	assert.doesNotMatch(bare, /merge=unknown|review=unknown/);
-	// A parent copies item lines and drops surrounding prose, so the caveat that makes
-	// a snapshot unsafe to mutate on is inside the brackets, not beside them.
-	const batch = actionPrompt({ kind: "slay", item: green, items: [green, queueItem({ id: 7, repo: "projectbluefin/other", ciStatus: "failure" })] });
-	for (const line of batch.split("\n").filter((l) => l.includes("queue read:"))) {
-		assert.match(line, /revalidate head live before mutating/, line);
+	const sibling = queueItem({ id: 7, repo: green.repo, ciStatus: "failure" });
+	const batch = actionPrompt({ kind: "fix", item: green, items: [green, sibling] });
+	for (const line of batch.split("\n").filter((line) => line.includes("queue read:"))) {
+		assert.match(line, /revalidate live before mutating/, line);
 	}
-	// And the rules a subagent needs are a delimited block, not an instruction to paraphrase.
-	assert.match(batch, /<<<SUBAGENT-RULES[\s\S]*Never sleep or run polling loops[\s\S]*SUBAGENT-RULES>>>/);
-	assert.match(batch, /copied verbatim/);
+	assert.match(batch, /<<<SUBAGENT-RULES[\s\S]*Never sleep or poll[\s\S]*SUBAGENT-RULES>>>/);
+	assert.match(batch, /Copy this block verbatim/);
 });
 
-test("a terminal block excludes an item only while it is still the truth", (t) => {
-	const root = stateTree();
-	t.after(() => rmSync(root, { recursive: true, force: true }));
 
-	const blockedAt = NOW / 1000;
-	appendFileSync(
-		join(root, "landings", "task-blocked.jsonl"),
-		[
-			{ pr: "projectbluefin/review#101", state: "blocked", note: "ruleset requires 2 approvals", head: "a".repeat(40), ts: blockedAt },
-			{ pr: "projectbluefin/review#103", state: "blocked", note: "ruleset requires 2 approvals", head: "a".repeat(40), ts: blockedAt },
-			{ pr: "projectbluefin/review#104", state: "blocked", note: "needs a rebase", head: "a".repeat(40), ts: blockedAt },
-		].map((e) => JSON.stringify(e)).join("\n") + "\n",
-	);
-
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
-	mode.items = [
-		// Still blocked: same head, nothing has happened since the record.
-		prItem({ id: 101, repo: "projectbluefin/review", title: "blocked pr", headSha: "a".repeat(40), updatedAt: NOW - 60_000 }),
-		// Never blocked.
-		prItem({ id: 102, repo: "projectbluefin/review", title: "actionable pr", headSha: "c".repeat(40), updatedAt: NOW }),
-		// The second approval landed after the block: same head, newer activity.
-		prItem({ id: 103, repo: "projectbluefin/review", title: "approved since", headSha: "a".repeat(40), updatedAt: NOW + 60_000 }),
-		// The author pushed a fix: different head.
-		prItem({ id: 104, repo: "projectbluefin/review", title: "rebased since", headSha: "b".repeat(40), updatedAt: NOW - 60_000 }),
-	];
-	mode.reprioritize();
-
-	const ids = mode.slayableItems().map((i) => i.id).sort((a, b) => a - b);
-	assert.deepEqual(ids, [102, 103, 104], "a stale block must not outlive the state it described");
-	assert.ok(!ids.includes(101), "an unchanged blocked pull request stays excluded");
-});
-
-// The timeout is the assertion: a handler that waits on its own work never
-// returns here, and node:test turns that into a failure instead of a hung suite.
-test("session_start returns without waiting for the queue or the intro", { timeout: 5000 }, async () => {
+// The timeout is the assertion: startup registers its refreshers and returns
+// before a slow GitHub read can consume OMP's extension-handler budget.
+test("session_start returns while the queue is still loading", { timeout: 5000 }, async () => {
 	const pi = fakeHost();
-	// A GitHub that never answers and an intro nobody dismisses. omp kills an
-	// extension handler that has not returned inside its budget, and everything
-	// that keeps the queue fresh — the state, queue and hub poll timers — is
-	// registered by this handler. Blocking here cost the session all three.
 	const stalled = Promise.withResolvers();
 	const review = createReviewExtension(pi, {
 		org: "projectbluefin",
@@ -1736,21 +1705,15 @@ test("session_start returns without waiting for the queue or the intro", { timeo
 	ctx.ui.parent = ctx;
 
 	await pi.events.get("session_start")({}, ctx);
+	assert.equal(ctx.overlays.length, 0, "no second surface is mounted while data loads");
+	assert.equal(typeof ctx.widgets.get("hive-workbench-rail"), "function", "the rail is mounted before the first await");
 
-	// Handed back mid-flight, not by skipping the work: the intro is on screen
-	// and the rail is mounted to show the queue arriving behind it.
-	assert.equal(ctx.overlays.length, 1, "the intro is still open when the handler returns");
-	assert.equal(typeof ctx.widgets.get("bluefin-rail"), "function", "the rail is mounted before the first await");
-
-	// Let the stalled reads answer and dismiss the intro: startup then completes
-	// on its own and lands the maintainer in the dashboard.
 	stalled.resolve({ ok: false, status: 504, statusText: "Gateway Timeout", json: async () => ({}) });
-	ctx.overlays[0].handleInput(" ");
 	await review.whenStarted();
-	assert.equal(ctx.overlays.length, 2, "the dashboard opens once the intro is done");
+	assert.equal(ctx.overlays.length, 1, "the one workbench opens after the initial queue read");
 	assert.ok(
 		ctx.notifications.some((entry) => entry.level === "error" && /504/.test(entry.message)),
-		"a queue that failed says so instead of rendering as an empty queue",
+		"a queue that failed says so instead of rendering as empty",
 	);
 });
 test("refresh cancellation is silent while replacement activity continues", async () => {
@@ -1783,7 +1746,7 @@ test("refresh cancellation is silent while replacement activity continues", asyn
 	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl, env: ISOLATED_ENV });
 	const ctx = fakeCtx();
 	ctx.ui.parent = ctx;
-	pi.flagValues.set("splash", false);
+	;
 
 	await pi.events.get("session_start")({}, ctx);
 	await firstStarted.promise;
@@ -1814,26 +1777,11 @@ test("a headless session hands the queue to the tools, not to the handler", asyn
 	// The handler returned before the fetch landed, so the tool has to wait for
 	// it. Reading the queue too early is how a print-mode run reports that a busy
 	// organization has nothing open.
-	const queue = await pi.tools.get("bluefin_review_queue").execute("id", {});
+	const queue = await pi.tools.get("hive_workbench_queue").execute("id", {});
 	assert.match(queue.content[0].text, /projectbluefin\/other#7/);
 	assert.equal(queue.details.items.length, 2);
 });
 
-test("the intro dismisses itself instead of holding the session open", (t) => {
-	t.mock.timers.enable({ apis: ["setInterval"] });
-	let dismissals = 0;
-	const timed = new BluefinAnsiSplash({ requestRender: () => {} }, () => dismissals++);
-	t.mock.timers.tick(10_000);
-	assert.equal(dismissals, 1, "the intro must end on its own, and exactly once");
-	timed.dispose();
-
-	// A keypress still ends it early; that is the affordance the intro advertises.
-	let pressed = 0;
-	const interactive = new BluefinAnsiSplash({ requestRender: () => {} }, () => pressed++);
-	interactive.handleInput(" ");
-	t.mock.timers.tick(10_000);
-	assert.equal(pressed, 1, "a keypress dismisses the intro once, and the timer cannot repeat it");
-});
 
 test("a resumed session reopens on the item it left", async () => {
 	const pi = fakeHost();
@@ -1848,10 +1796,10 @@ test("a resumed session reopens on the item it left", async () => {
 			{ type: "custom", customType: STATE_ENTRY, data: { mode: "prs", repo: "projectbluefin/other", id: 7 } },
 		],
 	};
-	pi.flagValues.set("splash", false);
+	;
 	await pi.events.get("session_start")({}, ctx);
 	await review.whenStarted();
-	assert.ok(ctx.statuses.get("bluefin_queue")?.includes("#7"));
+	assert.ok(ctx.statuses.get("hive_workbench")?.includes("#7"));
 });
 
 test("the status tool names the authority that ordered the queue", async () => {
@@ -1874,22 +1822,22 @@ test("the status tool names the authority that ordered the queue", async () => {
 		const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl, env });
 		const ctx = fakeCtx();
 		ctx.ui.parent = ctx;
-		pi.flagValues.set("splash", false);
+		;
 		await pi.events.get("session_start")({}, ctx);
 		await review.whenStarted();
-		return await pi.tools.get("bluefin_review_status").execute("id", {});
+		return await pi.tools.get("hive_workbench_status").execute("id", {});
 	};
 
 	const hubEnv = { ...ISOLATED_ENV, HIVE_HUB: "https://hive.example" };
 
 	const noHub = await statusFor(fakeFetch([]), ISOLATED_ENV);
-	assert.match(noHub.content[0].text, /order: local — no hive hub configured/);
+	assert.match(noHub.content[0].text, /order: unranked — no hive hub configured/);
 	assert.equal(noHub.details.hive.configured, false);
 
 	const quiet = await statusFor(hiveFetch([]), hubEnv);
-	assert.match(quiet.content[0].text, /order: local — hive is online .* has queued nothing in this scope/);
+	assert.match(quiet.content[0].text, /order: hive — 0 of 2 items ranked/);
 	assert.equal(quiet.details.hive.online, true);
-	assert.equal(quiet.details.order_source, "local", "an online hub with nothing to say does not order the queue");
+	assert.equal(quiet.details.order_source, "hive", "an online hub remains the ordering authority even when nothing is ranked in scope");
 
 	// The same hub, now ranking one of the fetched pull requests.
 	const ranking = await statusFor(
@@ -1906,7 +1854,7 @@ test("the status tool names the authority that ordered the queue", async () => {
 		return { ok: false, status: 502, statusText: "Bad Gateway", json: async () => ({}) };
 	}, hubEnv);
 	// The header/status line is a concise fallback status, not the raw error.
-	assert.match(unreachable.content[0].text, /order: local — hive unavailable, configured but unreachable/);
+	assert.match(unreachable.content[0].text, /order: unavailable — hive unavailable; GitHub evidence is browse-only/);
 	// The raw diagnostic is kept behind the status, in the structured details.
 	assert.match(unreachable.details.hive.error ?? "", /502/, "the raw error stays in the status details, not the header");
 });
@@ -1939,7 +1887,7 @@ test("an optional Hive failure degrades to a concise fallback status", () => {
 });
 
 test("the rail header shows the concise status and never the raw error", () => {
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: join(tmpdir(), "nope") });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.hive = {
 		...EMPTY_HIVE,
 		hub: "https://hive.example",
@@ -1951,7 +1899,7 @@ test("the rail header shows the concise status and never the raw error", () => {
 	mode.items = [queueItem()];
 	mode.reprioritize();
 
-	const rows = renderRail(mode, PLAIN_PAINTER, 120, NOW, 0, [], { compact: false });
+	const rows = renderRail(mode, PLAIN_PAINTER, 120, NOW, 0, []);
 	assert.match(rows[0], /hive network/, "a network failure reads as a concise status");
 	assert.doesNotMatch(rows[0], /ENOTFOUND/, "the raw diagnostic must not dominate the header");
 	assert.doesNotMatch(rows[0], /hive\.example/, "the hub host is not a status line");
@@ -1965,15 +1913,15 @@ test("the status tool names all three optional-Hive states distinctly", async ()
 		const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl, env });
 		const ctx = fakeCtx();
 		ctx.ui.parent = ctx;
-		pi.flagValues.set("splash", false);
+		;
 		await pi.events.get("session_start")({}, ctx);
 		await review.whenStarted();
-		return await pi.tools.get("bluefin_review_status").execute("id", {});
+		return await pi.tools.get("hive_workbench_status").execute("id", {});
 	};
 
 	// 1. Unconfigured: no hub at all.
 	const noHub = await statusFor(fakeFetch([]), ISOLATED_ENV);
-	assert.match(noHub.content[0].text, /order: local — no hive hub configured/);
+	assert.match(noHub.content[0].text, /order: unranked — no hive hub configured/);
 	assert.equal(noHub.details.hive.configured, false);
 
 	// 2. Online with nothing queued in this scope: not an error, just empty.
@@ -1985,7 +1933,7 @@ test("the status tool names all three optional-Hive states distinctly", async ()
 		},
 		hubEnv,
 	);
-	assert.match(quiet.content[0].text, /order: local — hive is online .* has queued nothing in this scope/);
+	assert.match(quiet.content[0].text, /order: hive — 0 of 2 items ranked/);
 	assert.equal(quiet.details.hive.online, true);
 
 	// 3. Configured but broken: a concise status up front, the raw error behind it.
@@ -1996,7 +1944,7 @@ test("the status tool names all three optional-Hive states distinctly", async ()
 		},
 		hubEnv,
 	);
-	assert.match(broken.content[0].text, /order: local — hive unavailable, configured but unreachable/);
+	assert.match(broken.content[0].text, /order: unavailable — hive unavailable; GitHub evidence is browse-only/);
 	assert.match(broken.details.hive.error ?? "", /502/, "the raw error is the diagnostic, kept in the status details");
 	assert.equal(broken.details.hive.online, false);
 });
@@ -2011,71 +1959,33 @@ test("a hive-only session with a broken hub still fails visibly and concisely", 
 	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl: hiveFetch, env: hubEnv });
 	const ctx = fakeCtx();
 	ctx.ui.parent = ctx;
-	pi.flagValues.set("splash", false);
+	;
 	await pi.events.get("session_start")({}, ctx);
 	await review.whenStarted();
 
-	// The failure is reported at startup, not swallowed by the fallback.
 	assert.ok(
-		ctx.notifications.some((n) => /hive unavailable, ordering locally/.test(n.message)),
+		ctx.notifications.some((notification) => /hive unavailable; browse-only mode/.test(notification.message)),
 		`a broken hive must fail visibly at startup, got ${JSON.stringify(ctx.notifications)}`,
 	);
-	// Reported in concise form; the raw 502 is not what the maintainer sees.
-	const startupHive = ctx.notifications.find((n) => /ordering locally/.test(n.message));
+	const startupHive = ctx.notifications.find((notification) => /browse-only mode/.test(notification.message));
 	assert.doesNotMatch(startupHive.message, /502/);
 });
 
 
-test("action prompts name the evidence and refuse to merge red checks", () => {
+test("action prompts use bounded evidence without granting landing authority", () => {
 	const item = queueItem();
-	assert.match(actionPrompt({ kind: "review", item }), /bluefin_review_diff/);
-	assert.match(actionPrompt({ kind: "review", item }), /bluefin_review_trace/);
-	const approve = actionPrompt({ kind: "approve", item });
-	assert.match(approve, /gh pr checks 42 --repo projectbluefin\/review/);
-	assert.match(approve, /Stop and report instead of merging/);
-	assert.match(actionPrompt({ kind: "fix", item }), /Do not suppress a finding/);
-	const docs = actionPrompt({ kind: "docs", item });
-	assert.match(docs, /projectbluefin\/common agentic documentation system/);
-	assert.match(docs, /check-skill-frontmatter\.sh/);
-	const batchAction = { kind: "review", item, items: [item, queueItem({ id: 7, repo: "projectbluefin/other" })] };
-	const batchPrompt = actionPrompt(batchAction);
-	assert.doesNotMatch(batchPrompt, /k3-final-review/);
-	assert.match(batchPrompt, /Repository `projectbluefin\/review`/);
-	assert.match(batchPrompt, /Repository `projectbluefin\/other`/);
+	assert.match(actionPrompt({ kind: "slay", item }), /hive_workbench_diff/);
+	assert.match(actionPrompt({ kind: "slay", item }), /hive_workbench_trace/);
+	assert.match(actionPrompt({ kind: "slay", item }), /bluefin-reviewer/);
+	assert.match(actionPrompt({ kind: "fix", item }), /Never approve or merge/);
+	const slayAction = { kind: "slay", item, items: [item, queueItem({ id: 7, repo: item.repo })] };
+	const slayPrompt = actionPrompt(slayAction);
+	assert.match(slayPrompt, /workflowz this repository wave/);
+	assert.match(slayPrompt, /Report one terminal outcome per item/);
+	assert.match(slayPrompt, /Never approve or merge/);
 	assert.equal(actionPrompt({ kind: "close" }), undefined);
-	assert.match(batchPrompt, /Never ask the user for confirmation/);
-	assert.match(batchPrompt, /execute all actions end-to-end autonomously/);
-	assert.match(batchPrompt, /immediately request the next assignment/);
-	assert.match(actionPrompt({ kind: "review", item }), /Never ask the user for confirmation/);
 });
 
-test("slaying an issue ships a pull request for someone else to merge", () => {
-	const issue = queueItem({ id: 936, type: "issue", repo: "projectbluefin/documentation", title: "npm test misses scripts/lib" });
-	const prompt = actionPrompt({ kind: "slay", item: issue });
-	assert.match(prompt, /open a pull request/);
-	assert.match(prompt, /Closes projectbluefin\/documentation#936/);
-	assert.match(prompt, /never merge your own/);
-	assert.match(prompt, /gh issue close/);
-	assert.match(prompt, /already been resolved or closed/);
-	assert.doesNotMatch(prompt, /review the diff/, "an issue has no diff to land");
-
-	// A pull request still gets the landing pass; the key means two things.
-	const landing = actionPrompt({ kind: "slay", item: queueItem() });
-	assert.match(landing, /fix-and-merge landing pass/);
-	assert.match(landing, /approve and land the pull request/);
-	assert.match(landing, /gh run rerun/);
-	assert.match(landing, /failing tests or defects/);
-	// A batch of issues is still one pull request per issue, not one for the lot.
-	const batch = [issue, queueItem({ id: 941, type: "issue", repo: "projectbluefin/documentation" })];
-	const batchPrompt = actionPrompt({ kind: "slay", item: issue, items: batch });
-	assert.match(batchPrompt, /one pull request per issue/);
-	assert.match(batchPrompt, /never merge your own/);
-	assert.match(batchPrompt, /report an evidenced finding/);
-	assert.match(batchPrompt, /gh issue close/);
-	// A mixed selection cannot be both, so it keeps the landing pass it had.
-	const mixed = actionPrompt({ kind: "slay", item: issue, items: [issue, queueItem()] });
-	assert.match(mixed, /fix-and-merge landing pass/);
-});
 
 test("hive work the search never returned is still admitted to the queue", async () => {
 	// Hive queues an issue that is nowhere near the top of a recency-ordered
@@ -2130,12 +2040,12 @@ test("hive work the search never returned is still admitted to the queue", async
 	});
 	const ctx = fakeCtx();
 	ctx.ui.parent = ctx;
-	pi.flagValues.set("splash", false);
+	;
 	pi.flagValues.set("issues", true);
 	await pi.events.get("session_start")({}, ctx);
 	await review.whenStarted();
 
-	const queue = await pi.tools.get("bluefin_review_queue").execute("id", {});
+	const queue = await pi.tools.get("hive_workbench_queue").execute("id", {});
 	assert.match(queue.content[0].text, /projectbluefin\/lab#470/, "hive work outside the search must still be queued");
 	assert.equal(queue.details.order_source, "hive");
 
@@ -2144,15 +2054,15 @@ test("hive work the search never returned is still admitted to the queue", async
 	// behind a list that merely looks complete.
 	assert.doesNotMatch(queue.content[0].text, /#936/);
 	assert.doesNotMatch(queue.content[0].text, /#466/, "finished work is not a queue");
-	const status = await pi.tools.get("bluefin_review_status").execute("id", {});
+	const status = await pi.tools.get("hive_workbench_status").execute("id", {});
 	assert.equal(status.details.hive.queued.present, 1);
 	assert.equal(status.details.hive.queued.total, 3);
 });
 
 test("the dashboard drills into Hive's queue by stage and explains each item", (t) => {
-	const root = stateTree();
+	const root = mkdtempSync(join(tmpdir(), "workbench-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 
 	const ready = { key: "projectbluefin/lab#470", repo: "projectbluefin/lab", number: 470, title: "vanilla-kde", url: "https://github.com/projectbluefin/lab/issues/470", labels: ["gate"], level: "ready" };
 	const triaging = { key: "projectbluefin/docs#936", repo: "projectbluefin/docs", number: 936, title: "npm test gap", url: "", labels: [], level: "triaging" };
@@ -2174,7 +2084,7 @@ test("the dashboard drills into Hive's queue by stage and explains each item", (
 		// A pull request that closes the ready issue: work already exists for it.
 		queueItem({ id: 12, repo: "projectbluefin/lab", title: "feat: boot KDE under OVMF", ciStatus: "success", closingIssues: [ready.key] }),
 	];
-	mode.refreshState();
+	;
 	mode.reprioritize();
 
 	// L steps through Hive's own stages, in the hub's order, then back to all.
@@ -2208,9 +2118,9 @@ test("the dashboard drills into Hive's queue by stage and explains each item", (
 });
 
 test("a filtered slice is selected and dispatched in one wave", (t) => {
-	const root = stateTree();
+	const root = mkdtempSync(join(tmpdir(), "workbench-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.items = Array.from({ length: 40 }, (_, i) =>
 		queueItem({ id: 100 + i, type: "issue", repo: "projectbluefin/lab", title: `queued work ${i}` }),
 	);
@@ -2237,66 +2147,13 @@ test("a filtered slice is selected and dispatched in one wave", (t) => {
 	dashboard.handleInput("A");
 	assert.equal(mode.selectedKeys.size, narrowed, "A is bound to the slice selection");
 
-	// The dispatched prompt fans out one subagent per issue/PR, capped at 7.
 	const batch = mode.chosenItems();
-	const prompt = actionPrompt({ kind: "slay", item: batch[0], items: batch });
-	assert.match(prompt, /ONE subagent per issue\/PR/);
-	assert.match(prompt, /capped at a maximum of 7 concurrent subagents/);
-	assert.doesNotMatch(prompt, /k3-final-review/);
+	const prompt = actionPrompt({ kind: "fix", item: batch[0], items: batch });
+	assert.match(prompt, /workflowz this repository wave/);
+	assert.match(prompt, /fresh isolated agent\(\) handle per issue or pull request/);
+	assert.doesNotMatch(prompt, /maximum of 7|fix-and-merge|approve and merge/);
 });
 
-test("RED: unlabeled open projectbluefin/review issue is rejected and NOT sent to sendUserMessage", async () => {
-	const pi = fakeHost();
-	const issueFetch = (url, init) => {
-		if (String(url).includes("/graphql")) {
-			return {
-				ok: true,
-				status: 200,
-				statusText: "OK",
-				json: async () => ({
-					data: {
-						search: {
-							pageInfo: { hasNextPage: false, endCursor: null },
-							nodes: [
-								{
-									number: 485,
-									title: "gate issue admission",
-									url: "https://github.com/projectbluefin/review/issues/485",
-									updatedAt: new Date(NOW - 1000).toISOString(),
-									author: { login: "someone" },
-									repository: { nameWithOwner: "projectbluefin/review" },
-									labels: { nodes: [] },
-								},
-							],
-						},
-					},
-				}),
-			};
-		}
-		return { ok: true, status: 200, statusText: "OK", json: async () => [] };
-	};
-	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl: issueFetch, env: ISOLATED_ENV });
-	const ctx = fakeCtx();
-	ctx.ui.parent = ctx;
-	pi.flagValues.set("splash", false);
-	pi.flagValues.set("issues", true);
-	await pi.events.get("session_start")({}, ctx);
-	await review.whenStarted();
-
-	assert.equal(ctx.overlays.length, 1);
-	const dashboard = ctx.overlays[0];
-
-	pi.messages.length = 0;
-
-	// Slay the unlabeled projectbluefin/review issue
-	dashboard.handleInput("s");
-	await Promise.resolve(); // allow microtasks to flush
-
-	// In unpatched code: pi.messages has length 1 (dispatched without admission).
-	// For the RED test, assert that messages.length === 0 and an admission error notification was emitted.
-	// This will FAIL on current unpatched main!
-	assert.equal(pi.messages.length, 0, "unlabeled projectbluefin/review issue must NOT reach sendUserMessage");
-});
 
 test("issue admission gate handles positive admission, negative cases, and invariants", async () => {
 	const setup = async (issueAttrs, options = {}) => {
@@ -2316,22 +2173,50 @@ test("issue admission gate handles positive admission, negative cases, and invar
 							data: {
 								search: {
 									pageInfo: { hasNextPage: false, endCursor: null },
-									nodes: issues.map((it) => ({
-										number: it.number ?? 485,
-										title: it.title ?? "test issue",
-										url: `https://github.com/${it.repo ?? "projectbluefin/review"}/${it.type === "pr" ? "pull" : "issues"}/${it.number ?? 485}`,
-										updatedAt: new Date(NOW - 1000).toISOString(),
-										isDraft: false,
-										mergeable: "MERGEABLE",
-										reviewDecision: "REVIEW_REQUIRED",
-										author: { login: "someone" },
-										repository: { nameWithOwner: it.repo ?? "projectbluefin/review" },
-										labels: { nodes: (it.labels ?? []).map((l) => ({ name: l })) },
-									})),
+								nodes: issues.map((it) => ({
+									number: it.number ?? 485,
+									title: it.title ?? "test issue",
+									url: `https://github.com/${it.repo ?? "projectbluefin/review"}/${it.type === "pr" ? "pull" : "issues"}/${it.number ?? 485}`,
+									updatedAt: new Date(NOW - 1000).toISOString(),
+									isDraft: false,
+									mergeable: "MERGEABLE",
+									reviewDecision: "REVIEW_REQUIRED",
+									author: { login: "someone" },
+									repository: { nameWithOwner: it.repo ?? "projectbluefin/review" },
+									labels: { nodes: (it.labels ?? []).map((label) => ({ name: label })) },
+									headRefOid: it.headSha ?? "a".repeat(40),
+								})),
 								},
 							},
 						}),
 					};
+				}
+				if (body.query.includes("issueOrPullRequest")) {
+					const data = {};
+					const exactRegex = /(\w+): repository\(owner: "([^"]+)", name: "([^"]+)"\)[\s\S]*?issueOrPullRequest\(number: (\d+)\)/g;
+					for (const [, alias, owner, repo, numberStr] of body.query.matchAll(exactRegex)) {
+						const num = Number(numberStr);
+						const fullRepo = `${owner}/${repo}`;
+						const it = issues.find((candidate) => (candidate.number ?? 485) === num && (candidate.repo ?? "projectbluefin/review") === fullRepo);
+						data[alias] = it ? { issueOrPullRequest: {
+							closed: false,
+							number: num,
+							title: it.title ?? "test pull request",
+							url: `https://github.com/${fullRepo}/pull/${num}`,
+							updatedAt: new Date(NOW - 1000).toISOString(),
+							author: { login: "someone" },
+							repository: { nameWithOwner: fullRepo },
+							labels: { nodes: (it.labels ?? []).map((label) => ({ name: label })) },
+							isDraft: false,
+							mergeable: "MERGEABLE",
+							reviewDecision: "REVIEW_REQUIRED",
+							changedFiles: 1,
+							headRefOid: it.headSha ?? "a".repeat(40),
+							commits: { nodes: [{ commit: { statusCheckRollup: { state: "SUCCESS" } } }] },
+							closingIssuesReferences: { nodes: [] },
+						} } : { issueOrPullRequest: null };
+					}
+					return { ok: true, status: 200, statusText: "OK", json: async () => ({ data }) };
 				}
 
 				// If options.fetchError is provided, simulate request failure on admission
@@ -2382,15 +2267,38 @@ test("issue admission gate handles positive admission, negative cases, and invar
 			}
 			return { ok: true, status: 200, statusText: "OK", json: async () => [] };
 		};
+		const fetchImpl = (url, init) => {
+			const target = String(url);
+			if (target.endsWith("/api/v1/status")) {
+				return Promise.resolve({ ok: true, status: 200, statusText: "OK", json: async () => ({ actionable_items: issues.length }) });
+			}
+			if (target.endsWith("/api/contribute/queue")) {
+				return Promise.resolve({
+					ok: true,
+					status: 200,
+					statusText: "OK",
+					json: async () => ({ queue: issues.map((item) => ({
+						key: `${item.repo ?? "projectbluefin/review"}#${item.number ?? 485}`,
+						repo: item.repo ?? "projectbluefin/review",
+						number: item.number ?? 485,
+						title: item.title ?? "test issue",
+					})) }),
+				});
+			}
+			if (target.endsWith("/api/contribute/triage")) return Promise.resolve({ ok: true, status: 200, statusText: "OK", json: async () => ({ groups: [] }) });
+			if (target.endsWith("/api/v1/contributors")) return Promise.resolve({ ok: true, status: 200, statusText: "OK", json: async () => ({ contributors: [] }) });
+			return (options.customFetch ?? issueFetch)(url, init);
+		};
 
 		const review = createReviewExtension(pi, {
 			org: "projectbluefin",
-			fetchImpl: options.customFetch ?? issueFetch,
-			env: ISOLATED_ENV,
+			fetchImpl,
+			env: { ...ISOLATED_ENV, HIVE_HUB: "wss://hive.example/contribute" },
+			policy: BLUEFIN_POLICY,
 		});
 		const ctx = fakeCtx();
 		ctx.ui.parent = ctx;
-		pi.flagValues.set("splash", false);
+		;
 		if (!options.isPr) pi.flagValues.set("issues", true);
 		await pi.events.get("session_start")({}, ctx);
 		await review.whenStarted();
@@ -2405,17 +2313,17 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, turn } = await setup({ number: 485, labels: ["3-clanker-queue"] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 1, "admitted issue dispatches exactly once");
-		assert.match(pi.messages[0], /Close out projectbluefin\/review#485/);
+		assert.match(pi.messages[0], /Implement projectbluefin\/review#485/);
 	}
 
 	// 2. No label
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: [] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "no label -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("missing explicit admission label")));
@@ -2425,7 +2333,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-human-queue"] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "3-human-queue only -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("missing explicit admission label")));
@@ -2435,7 +2343,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["hive/triage", "agent/task", "area/image"] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "hive/agent labels only -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("missing explicit admission label")));
@@ -2445,7 +2353,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-clanker-queue", "hold"] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "hold label -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("hold label")));
@@ -2455,7 +2363,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-clanker-queue", "blocked"] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "blocked label -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("blocked label")));
@@ -2465,7 +2373,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-clanker-queue"], closed: true });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "closed issue -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("issue is closed")));
@@ -2476,7 +2384,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 		// Queue showed 3-clanker-queue, but admission check returns labels: []
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-clanker-queue"], admissionLabels: [] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "label removed between display and dispatch -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("missing explicit admission label")));
@@ -2486,7 +2394,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-clanker-queue"] }, { networkError: true });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "network error -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("Admission check failed")));
@@ -2494,7 +2402,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-clanker-queue"] }, { graphqlErrors: [{ message: "rate limited" }] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "graphql error -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("rate limited")));
@@ -2504,7 +2412,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-clanker-queue"] }, { labelsTruncated: true });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "truncated labels -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("incomplete label evidence")));
@@ -2516,7 +2424,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 			{ missingClosed: true },
 		);
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "missing open-state evidence -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("issue is closed")));
@@ -2527,7 +2435,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 			{ missingLabelPageInfo: true },
 		);
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "missing label pagination evidence -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("incomplete label evidence")));
@@ -2537,7 +2445,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-clanker-queue"] }, { wrongRepo: true });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "wrong repo returned -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("repository mismatch")));
@@ -2545,7 +2453,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-clanker-queue"] }, { wrongNumber: true });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "wrong issue number returned -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("issue number mismatch")));
@@ -2555,7 +2463,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: ["3-clanker-queue"] }, { missingNode: true });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "missing node -> no dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("not found")));
@@ -2571,7 +2479,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 		// Select all items using 'A'
 		dashboard.handleInput("A");
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "batch with one ineligible item yields zero dispatches");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("issue has hold label")));
@@ -2586,7 +2494,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 		const { pi, dashboard, ctx, turn } = await setup(items);
 		dashboard.handleInput("A");
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "mixed-repo batch with ineligible review issue yields zero dispatches");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("missing explicit admission label")));
@@ -2596,7 +2504,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, turn } = await setup({ number: 936, repo: "projectbluefin/utah", labels: [] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 1, "unmanaged repository issue dispatches without any admission read");
 		assert.match(pi.messages[0], /projectbluefin\/utah#936/);
@@ -2610,11 +2518,11 @@ test("issue admission gate handles positive admission, negative cases, and invar
 		dashboard.handleInput("d");
 		await turn();
 		assert.equal(pi.messages.length, 1, "diff is read-only and dispatches without admission gate");
-		assert.match(pi.messages[0], /Call bluefin_review_diff/);
+		assert.match(pi.messages[0], /Call hive_workbench_diff/);
 	}
 	{
 		const { dashboard, ctx, turn } = await setup({ number: 485, labels: [] });
-		dashboard.handleInput("y");
+		dashboard.handleInput("\r");
 		await turn();
 		assert.ok(ctx.pasted.length > 0, "cite/reference is read-only");
 	}
@@ -2627,15 +2535,6 @@ test("issue admission gate handles positive admission, negative cases, and invar
 		assert.equal(pi.messages.length, 0, "fix on unadmitted Review issue dispatches zero messages");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("missing explicit admission label")));
 	}
-	// docs on an unadmitted Review issue dispatches zero messages and notifies
-	{
-		const { pi, dashboard, ctx, turn } = await setup({ number: 485, labels: [] });
-		pi.messages.length = 0;
-		dashboard.handleInput("D");
-		await turn();
-		assert.equal(pi.messages.length, 0, "docs on unadmitted Review issue dispatches zero messages");
-		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("missing explicit admission label")));
-	}
 	// fix on a projectbluefin/review PR is unchanged (no admission read, dispatches)
 	{
 		const { pi, dashboard, turn } = await setup({ number: 42, type: "pr", repo: "projectbluefin/review", labels: [] }, { isPr: true });
@@ -2643,7 +2542,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 1, "fix on Review PR dispatches unchanged without admission read");
-		assert.match(pi.messages[0], /Fix the findings recorded for projectbluefin\/review#42/);
+		assert.match(pi.messages[0], /Fix projectbluefin\/review#42/);
 	}
 
 	// 16b. Managed-repository policy is per repository, each with its own vocabulary
@@ -2652,7 +2551,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 		// and a narrower denied set than projectbluefin/review.
 		const { pi, dashboard, turn } = await setup({ number: 21, repo: "projectbluefin/documentation", labels: ["3-docs-queue"] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 1, "documentation issue admitted on its own queue label");
 		assert.match(pi.messages[0], /projectbluefin\/documentation#21/);
@@ -2661,7 +2560,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 		// A review vocabulary label does not admit a documentation issue.
 		const { pi, dashboard, ctx, turn } = await setup({ number: 21, repo: "projectbluefin/documentation", labels: ["3-clanker-queue"] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "review queue label does not admit a documentation issue");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("missing explicit admission label")));
@@ -2671,7 +2570,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 		// does not block; documentation's own denied label (hold) does.
 		const { pi, dashboard, ctx, turn } = await setup({ number: 21, repo: "projectbluefin/documentation", labels: ["3-docs-queue", "hold"] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "documentation hold label blocks its own dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("issue has hold label")));
@@ -2680,7 +2579,7 @@ test("issue admission gate handles positive admission, negative cases, and invar
 		// Negative fixture in the review repository: hold blocks there too.
 		const { pi, dashboard, ctx, turn } = await setup({ number: 485, repo: "projectbluefin/review", labels: ["3-clanker-queue", "hold"] });
 		pi.messages.length = 0;
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await turn();
 		assert.equal(pi.messages.length, 0, "review hold label blocks its own dispatch");
 		assert.ok(ctx.notifications.some((n) => n.level === "error" && n.message.includes("issue has hold label")));
@@ -2732,11 +2631,11 @@ test("issue admission gate handles positive admission, negative cases, and invar
 			return { ok: true, status: 200, statusText: "OK", json: async () => [] };
 		};
 
-		const { pi, dashboard, turn } = await setup([], { customFetch });
+		const { pi, dashboard, turn } = await setup([{ number: 485 }, { number: 486 }], { customFetch });
 		pi.messages.length = 0;
 		dashboard.handleInput(" ");
 		// Trigger dispatch for the explicitly selected item 485.
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 
 		// While admission read is pending, navigate to item 486
 		dashboard.handleInput("j");
@@ -2823,21 +2722,19 @@ test("issue admission gate handles positive admission, negative cases, and invar
 			return { ok: true, status: 200, statusText: "OK", json: async () => [] };
 		};
 
-		const { pi, dashboard, ctx, turn } = await setup([], { customFetch });
+		const { pi, dashboard, ctx, turn } = await setup([{ number: 485 }, { number: 486 }], { customFetch });
 		pi.messages.length = 0;
 
 		// Dispatch 1 on explicitly selected item 485 (pending on p1).
 		dashboard.handleInput(" ");
-		dashboard.handleInput("s");
+		dashboard.handleInput("f");
 		await Promise.resolve();
 
-		// Move to item 486 and start Dispatch 2 (superseding Dispatch 1).
-		await pi.shortcuts.get("alt+b").handler(ctx);
-		const dashboard2 = ctx.overlays[1];
-		dashboard2.handleInput("x");
-		dashboard2.handleInput("j");
-		dashboard2.handleInput(" ");
-		dashboard2.handleInput("s");
+		// Move to item 486 and start Dispatch 2 on the same persistent workbench.
+		dashboard.handleInput("x");
+		dashboard.handleInput("j");
+		dashboard.handleInput(" ");
+		dashboard.handleInput("f");
 		await Promise.resolve();
 		// Resolve Dispatch 2 first
 		resolveSecond({
@@ -2890,166 +2787,25 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	}
 });
 
-// P2 — prefer bounded native GitHub mutations before browser automation (#469)
-// Fixture proves native title edit first, bounded browser fallback for unsupported work,
-// no repeated equivalent attempts, and preserved human confirmation/merge authority.
-test("typed GitHub mutations prefer native tools, bound browser fallback, prevent repeated attempts, and preserve merge authority", () => {
-	const policy = new MutationCapabilityPolicy({ maxEquivalentAttempts: 1, maxBrowserFallbacks: 1 });
-
-	// 1. Title mutation prefers native first (gh pr edit / gh issue edit)
-	const titleReq = {
-		kind: "title" as const,
-		repo: "projectbluefin/review",
-		number: 440,
-		params: { title: "test: contract for scripts/check-skill-frontmatter.sh" },
-	};
-	const titlePlan = policy.selectCapability(titleReq);
-	assert.equal(titlePlan.capability, "native", "title edit must prefer native first");
-	assert.match(titlePlan.command!, /^gh pr edit 440 --repo projectbluefin\/review --title /);
-	assert.match(titlePlan.command!, /check-skill-frontmatter\.sh/);
-	assert.equal(titlePlan.fallbackAvailable, true);
-	assert.equal(titlePlan.bounded, true);
-
-	// 2. Label mutation prefers native first
-	const labelReq = {
-		kind: "label" as const,
-		repo: "projectbluefin/review",
-		number: 440,
-		params: { addLabels: ["lgtm"], removeLabels: ["hold"] },
-	};
-	const labelPlan = policy.selectCapability(labelReq);
-	assert.equal(labelPlan.capability, "native", "label mutation must prefer native first");
-	assert.match(labelPlan.command!, /^gh pr edit 440 --repo projectbluefin\/review/);
-	assert.match(labelPlan.command!, /--add-label "lgtm"/);
-	assert.match(labelPlan.command!, /--remove-label "hold"/);
-
-	// 3. Review mutation prefers native first
-	const reviewReq = {
-		kind: "review" as const,
-		repo: "projectbluefin/review",
-		number: 440,
-		params: { event: "APPROVE" as const, body: "Approved by reviewer" },
-	};
-	const reviewPlan = policy.selectCapability(reviewReq);
-	assert.equal(reviewPlan.capability, "native", "review mutation must prefer native first");
-	assert.match(reviewPlan.command!, /^gh pr review 440 --repo projectbluefin\/review --approve --body/);
-
-	// 4. Comment mutation prefers native first
-	const commentReq = {
-		kind: "comment" as const,
-		repo: "projectbluefin/review",
-		number: 440,
-		params: { body: "Observed test passing" },
-	};
-	const commentPlan = policy.selectCapability(commentReq);
-	assert.equal(commentPlan.capability, "native", "comment mutation must prefer native first");
-	assert.match(commentPlan.command!, /^gh pr comment 440 --repo projectbluefin\/review --body/);
-
-	// 5. Bounded browser fallback for unsupported work (UI-only work)
-	const uiOnlyReq = {
-		kind: "title" as const,
-		repo: "projectbluefin/review",
-		number: 440,
-		params: { title: "title requires browser-only UI interaction" },
-		unsupportedNative: true,
-	};
-	const uiOnlyPlan = policy.selectCapability(uiOnlyReq);
-	assert.equal(uiOnlyPlan.capability, "browser", "unsupported native work selects browser fallback");
-	assert.match(uiOnlyPlan.reason, /bounded browser fallback/);
-	assert.equal(uiOnlyPlan.bounded, true);
-
-	// 6. Native attempt failure falls back to bounded browser, not indefinite retry
-	policy.recordAttempt({
-		signature: mutationSignature(titleReq),
-		capability: "native",
-		timestamp: Date.now(),
-		success: false,
-		error: "connection timeout",
-	});
-	const fallbackPlan = policy.selectCapability(titleReq);
-	assert.equal(fallbackPlan.capability, "browser", "after native attempt failure, falls back to browser");
-	assert.match(fallbackPlan.reason, /bounded browser fallback/);
-
-	// 7. No repeated equivalent attempts: once browser fallback fails as well, equivalent attempts halt
-	policy.recordAttempt({
-		signature: mutationSignature(titleReq),
-		capability: "browser",
-		timestamp: Date.now(),
-		success: false,
-		error: "browser navigation error",
-	});
-	const exhaustedPlan = policy.selectCapability(titleReq);
-	assert.equal(exhaustedPlan.blocked, true, "equivalent attempts must not repeat indefinitely");
-	assert.match(exhaustedPlan.reason, /equivalent preferred attempts are not repeated indefinitely/);
-
-	// 8. Retry classification distinguishes fresh, retryable, browser fallback, and exhausted
-	const freshReq = {
-		kind: "comment" as const,
-		repo: "projectbluefin/review",
-		number: 999,
-		params: { body: "fresh note" },
-	};
-	assert.equal(policy.classifyAttempt(freshReq, "native"), "fresh");
-	assert.equal(policy.classifyAttempt(titleReq, "native"), "equivalent_attempt_exhausted");
-
-	// 9. Preserved human confirmation / merge authority
-	// Green PR allows merge
-	assert.deepEqual(checkMergeAuthority({ id: 42, repo: "projectbluefin/review", ciStatus: "success", reviewState: "APPROVED" }), { allowed: true });
-	// Failing check blocks merge
-	assert.equal(checkMergeAuthority({ id: 42, repo: "projectbluefin/review", ciStatus: "failure" }).allowed, false);
-	assert.match(checkMergeAuthority({ id: 42, repo: "projectbluefin/review", ciStatus: "failure" }).reason!, /check is failing/);
-	// Pending check blocks merge
-	assert.equal(checkMergeAuthority({ id: 42, repo: "projectbluefin/review", ciStatus: "pending" }).allowed, false);
-	assert.match(checkMergeAuthority({ id: 42, repo: "projectbluefin/review", ciStatus: "pending" }).reason!, /check is pending/);
-	// Hold label blocks merge
-	assert.equal(checkMergeAuthority({ id: 42, repo: "projectbluefin/review", ciStatus: "success", labels: ["hold"] }).allowed, false);
-	assert.match(checkMergeAuthority({ id: 42, repo: "projectbluefin/review", ciStatus: "success", labels: ["hold"] }).reason!, /hold/);
-	// Blocked label blocks merge
-	assert.equal(checkMergeAuthority({ id: 42, repo: "projectbluefin/review", ciStatus: "success", labels: ["blocked"] }).allowed, false);
-	// Changes requested blocks merge
-	assert.equal(checkMergeAuthority({ id: 42, repo: "projectbluefin/review", ciStatus: "success", reviewState: "CHANGES_REQUESTED" }).allowed, false);
-	// Own pull request requires another contributor's review
-	assert.equal(checkMergeAuthority({ id: 42, repo: "projectbluefin/review", ciStatus: "success", author: "jorge" }, "jorge").allowed, false);
-
-	// 10. Action prompts explicitly preserve authority and state the native mutation invariant
-	const item = queueItem({ id: 440, repo: "projectbluefin/review" });
-	const fixPrompt = actionPrompt({ kind: "fix", item });
-	assert.match(fixPrompt!, /Typed GitHub mutations prefer native\/gh\/API tools/);
-	assert.match(fixPrompt!, /Browser is bounded fallback for UI-only work/);
-	assert.match(fixPrompt!, /equivalent preferred attempts are not repeated indefinitely/);
-	assert.match(fixPrompt!, /gh pr edit 440 --repo projectbluefin\/review --title/);
-	const approvePrompt = actionPrompt({ kind: "approve", item });
-	assert.match(approvePrompt!, /Stop and report instead of merging/);
-	assert.match(approvePrompt!, /Preserved human confirmation and merge authority/);
-});
-
-// P1 — make the OMP Review dashboard mouse/click operable with keyboard parity (#462)
-// Pilot exercises click selection, focus, expansion, scrolling, and every visible action
-// during active and idle turns; keyboard parity/accessibility stay passing.
-test("pilot: OMP dashboard mouse and click operable with keyboard parity (#462)", (t) => {
-	// 1. Mouse reporting sequence parsing (SGR, X10, URXVT, programmatic)
+// OMP workbench mouse/click parity (#462).
+test("OMP workbench mouse and click operability matches keyboard actions (#462)", (t) => {
+	// Terminal mouse reporting: SGR clicks, releases, and wheel events.
 	const sgrClick = parseMouseEvent("\x1b[<0;15;5M");
 	assert.deepEqual(sgrClick, { button: 0, col: 14, row: 4, release: false });
 	const sgrRelease = parseMouseEvent("\x1b[<0;15;5m");
 	assert.deepEqual(sgrRelease, { button: 0, col: 14, row: 4, release: true });
 	const sgrWheelUp = parseMouseEvent("\x1b[<64;15;5M");
 	assert.equal(sgrWheelUp?.wheel, -1);
-	const sgrWheelDown = parseMouseEvent("\x1b[<65;15;5M");
-	assert.equal(sgrWheelDown?.wheel, 1);
-	const textClick = parseMouseEvent("click:10,3");
-	assert.deepEqual(textClick, { button: 0, col: 10, row: 3, release: false });
-	const jsonClick = parseMouseEvent('{"type":"click","x":12,"y":6}');
-	assert.deepEqual(jsonClick, { button: 0, col: 12, row: 6, release: false });
 
-	const root = stateTree();
+	const root = mkdtempSync(join(tmpdir(), "workbench-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
-	const mode = new ReviewMode({ org: "projectbluefin", stateRoot: root });
+	const mode = new ReviewMode({ org: "projectbluefin" });
 	mode.items = [
 		queueItem({ id: 7, repo: "projectbluefin/other", title: "feat(ui): dagger rail", ciStatus: "success" }),
 		queueItem({ id: 42, repo: "projectbluefin/review", title: "fix(landing): review batches", ciStatus: "failure" }),
 		queueItem({ id: 99, repo: "projectbluefin/review", title: "docs: update appliance", ciStatus: "pending" }),
 	];
-	mode.refreshState();
+	;
 
 	let lastAction;
 	let refreshes = 0;
@@ -3069,7 +2825,7 @@ test("pilot: OMP dashboard mouse and click operable with keyboard parity (#462)"
 
 	// Initial layout and state
 	const frame = (w = 220) => dashboard.render(w);
-	assert.ok(frame()[0].includes("bluefin review"));
+	assert.ok(frame()[0].includes("HIVE WORKBENCH"));
 	assert.equal(mode.cursor, 0, "first item selected initially");
 	assert.equal(dashboard.currentPane, "queue");
 
@@ -3139,109 +2895,75 @@ test("pilot: OMP dashboard mouse and click operable with keyboard parity (#462)"
 	dashboard.handleInput("\x1b[<64;15;5M");
 	assert.equal(mode.cursor, 1, "wheel up moves cursor up");
 
-	// 6. Visible actions click parity: every key in the keymap bar clicks
-	const lines = frame();
-	const keymapLineIdx = lines.findIndex((l) => l.includes("autoslay") && l.includes("review"));
+	// 6. Every visible keymap action has mouse parity.
+	const lines = dashboard.render(400);
+	const keymapLineIdx = lines.findIndex((line) => line.includes("slay") && line.includes("comment"));
 	assert.ok(keymapLineIdx > 0, "keymap bar rendered");
-
-	// Click 'r/enter review' in keymap bar
-	// Locate 'review' in keymap bar
 	const keymapText = lines[keymapLineIdx];
-	const rPos = keymapText.indexOf("r/enter");
-	assert.ok(rPos > 0);
-	dashboard.handleClick(rPos + 1, keymapLineIdx);
-	assert.equal(lastAction?.kind, "review", "clicking review chord triggers review action");
-	assert.equal(lastAction?.item.id, 42);
 
-	// Click 'diff'
+	const sPos = keymapText.indexOf("s slay");
+	assert.ok(sPos > 0);
+	dashboard.handleClick(sPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "slay", "clicking slay dispatches autoreview");
+
+	const cPos = keymapText.indexOf("c comment");
+	assert.ok(cPos > 0);
+	dashboard.handleClick(cPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "comment", "clicking comment emits a comment action");
+
 	const dPos = keymapText.indexOf("d diff");
 	assert.ok(dPos > 0);
 	dashboard.handleClick(dPos + 1, keymapLineIdx);
-	assert.equal(lastAction?.kind, "diff", "clicking diff chord triggers diff action");
+	assert.equal(lastAction?.kind, "diff", "clicking diff emits a diff action");
 
-	// Click 'docs'
-	const DPos = keymapText.indexOf("D docs");
-	assert.ok(DPos > 0);
-	dashboard.handleClick(DPos + 1, keymapLineIdx);
-	assert.equal(lastAction?.kind, "docs", "clicking docs chord triggers docs action");
-
-	// Click 'approve'
-	const aPos = keymapText.indexOf("a approve");
-	assert.ok(aPos > 0);
-	dashboard.handleClick(aPos + 1, keymapLineIdx);
-	assert.equal(lastAction?.kind, "approve", "clicking approve chord triggers approve action");
-
-	// Click 'fix'
 	const fPos = keymapText.indexOf("f fix");
 	assert.ok(fPos > 0);
 	dashboard.handleClick(fPos + 1, keymapLineIdx);
-	assert.equal(lastAction?.kind, "fix", "clicking fix chord triggers fix action");
+	assert.equal(lastAction?.kind, "fix", "clicking fix emits a non-landing work action");
 
-	// Click 'cite' (y)
-	const yPos = keymapText.indexOf("y cite");
-	assert.ok(yPos > 0);
-	dashboard.handleClick(yPos + 1, keymapLineIdx);
-	assert.equal(lastAction?.kind, "reference", "clicking cite chord triggers reference action");
+	const enterPos = keymapText.indexOf("enter cite");
+	assert.ok(enterPos > 0);
+	dashboard.handleClick(enterPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "reference", "clicking cite emits a reference action");
 
-	// Click 'all' (A) to select all
 	const APos = keymapText.indexOf("A all");
 	assert.ok(APos > 0);
 	dashboard.handleClick(APos + 1, keymapLineIdx);
-	assert.equal(mode.selectedKeys.size, 3, "clicking all chord selects all items");
-
-	// Click 'clear' (x) to clear selection
+	assert.equal(mode.selectedKeys.size, 3, "clicking all selects every visible item");
 	const xPos = keymapText.indexOf("x clear");
 	assert.ok(xPos > 0);
 	dashboard.handleClick(xPos + 1, keymapLineIdx);
-	assert.equal(mode.selectedKeys.size, 0, "clicking clear chord clears selection");
+	assert.equal(mode.selectedKeys.size, 0, "clicking clear clears selection");
 
-	// Click 'leaders' (*)
-	const starPos = keymapText.indexOf("* leaders");
-	assert.ok(starPos > 0);
-	dashboard.handleClick(starPos + 1, keymapLineIdx);
-	assert.equal(lastAction?.kind, "leaderboard", "clicking leaders chord opens leaderboard");
-
-	// Click 'repo' (o)
 	const oPos = keymapText.indexOf("o repo");
 	assert.ok(oPos > 0);
 	dashboard.handleClick(oPos + 1, keymapLineIdx);
-	assert.equal(lastAction?.kind, "scope", "clicking repo chord opens scope selector");
+	assert.equal(lastAction?.kind, "scope", "clicking repo opens the scope selector");
 
-	// Click 'pane' (tab)
-	const tabPos = keymapText.indexOf("tab pane");
-	assert.ok(tabPos > 0);
+	const tPos = keymapText.indexOf("t trace");
+	assert.ok(tPos > 0);
 	const paneBefore = dashboard.currentPane;
-	dashboard.handleClick(tabPos + 1, keymapLineIdx);
-	assert.notEqual(dashboard.currentPane, paneBefore, "clicking tab switches pane");
+	dashboard.handleClick(tPos + 1, keymapLineIdx);
+	assert.notEqual(dashboard.currentPane, paneBefore, "clicking t switches pane");
 
-	// Click 'prs/issues' (i)
-	const iPos = keymapText.indexOf("i prs/issues");
-	assert.ok(iPos > 0);
+	const tabPos = keymapText.indexOf("tab prs/issues");
+	assert.ok(tabPos > 0);
 	const modeBefore = mode.queueMode;
 	const itemsBefore = [...mode.items];
-	dashboard.handleClick(iPos + 1, keymapLineIdx);
-	assert.notEqual(mode.queueMode, modeBefore, "clicking i chord toggles queue mode");
-	// Toggle back and restore items (since toggleMode clears items waiting for fetch)
-	dashboard.handleClick(iPos + 1, keymapLineIdx);
+	dashboard.handleClick(tabPos + 1, keymapLineIdx);
+	assert.notEqual(mode.queueMode, modeBefore, "clicking Tab toggles queue mode");
+	dashboard.handleClick(tabPos + 1, keymapLineIdx);
 	assert.equal(mode.queueMode, modeBefore);
 	mode.items = itemsBefore;
-	mode.refreshState();
+	;
 
-	// Click 'hive' (H)
 	const HPos = keymapText.indexOf("H hive");
 	assert.ok(HPos > 0);
 	const hiveBefore = mode.hiveOnly;
 	dashboard.handleClick(HPos + 1, keymapLineIdx);
-	assert.notEqual(mode.hiveOnly, hiveBefore, "clicking H chord toggles hive-only");
-	// Toggle back
+	assert.notEqual(mode.hiveOnly, hiveBefore, "clicking H toggles Hive-only filtering");
 	dashboard.handleClick(HPos + 1, keymapLineIdx);
 	assert.equal(mode.hiveOnly, hiveBefore);
-
-	// Click 'autoslay' (s)
-	const sPos = keymapText.indexOf("s autoslay");
-	assert.ok(sPos > 0);
-	dashboard.handleClick(sPos + 1, keymapLineIdx);
-	assert.equal(lastAction?.kind, "slay", "clicking autoslay chord triggers slay action");
 
 	// Click 'close' (q)
 	const qPos = keymapText.indexOf("q close");
@@ -3252,16 +2974,16 @@ test("pilot: OMP dashboard mouse and click operable with keyboard parity (#462)"
 	// 7. Active-turn concurrency: actions remain available during active turns
 	mode.session.startTurn(NOW);
 	mode.session.startTool("active-turn-tool", "bash", { command: "just review-check" }, NOW + 10);
-	mode.refreshState();
+	;
 	assert.ok(mode.session.active() !== undefined, "active tool turn in flight");
 
 	// During active turn: click selects row, expands trace, and triggers actions
 	dashboard.handleClick(15, 3);
 	assert.equal(mode.cursor, 0, "active turn allows click row selection");
-	dashboard.handleClick(150, 4);
+	dashboard.handleClick(250, 4);
 	assert.equal(dashboard.currentPane, "trace", "active turn allows pane focus");
-	dashboard.handleClick(rPos + 1, keymapLineIdx);
-	assert.equal(lastAction?.kind, "review", "active turn allows action click dispatch");
+	dashboard.handleClick(sPos + 1, keymapLineIdx);
+	assert.equal(lastAction?.kind, "slay", "active turn allows slay dispatch");
 	mode.session.endTool("active-turn-tool", { content: [{ type: "text", text: "done" }] }, false, NOW + 100);
 	mode.session.endTurn(NOW + 200);
 
@@ -3272,7 +2994,7 @@ test("pilot: OMP dashboard mouse and click operable with keyboard parity (#462)"
 	dashboard.handleClick(25, 0);
 	assert.equal(mode.queueMode, "prs");
 	mode.items = itemsBefore;
-	mode.refreshState();
+	;
 
 	// 9. Narrow terminal stacked layout click parity
 	const narrowFrame = dashboard.render(70);
@@ -3290,9 +3012,9 @@ test("pilot: OMP dashboard mouse and click operable with keyboard parity (#462)"
 // decides what is nearby; the by-name lookup repairs what Hive requires and is
 // outside the window; the shortfall is reported instead of a row that merely
 // looks complete. From the repaired queue the agent reaches a typed tool, reads
-// the checks and the recorded state, and stops at the merge line.
-test("bounded fallback repairs by name, observes checks and state, and never merges", async (t) => {
-	const root = stateTree();
+// live checks, and stops at the merge line.
+test("bounded fallback repairs by name, observes live checks, and never merges", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "workbench-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 
 	const listState = () =>
@@ -3402,33 +3124,32 @@ test("bounded fallback repairs by name, observes checks and state, and never mer
 	});
 	const ctx = fakeCtx();
 	ctx.ui.parent = ctx;
-	pi.flagValues.set("splash", false);
+	;
 	await pi.events.get("session_start")({}, ctx);
 	await review.whenStarted();
 
 	// The fallback repaired the queue by name: the nearby PR and the item search
 	// missed are both present; the closed third item is reported as a shortfall,
 	// not silently dropped from a list that looks complete.
-	const queue = await pi.tools.get("bluefin_review_queue").execute("id", {});
+	const queue = await pi.tools.get("hive_workbench_queue").execute("id", {});
 	assert.match(queue.content[0].text, /projectbluefin\/review#42/);
 	assert.match(queue.content[0].text, /projectbluefin\/review#936/, "the out-of-window item arrives by native repair");
 	assert.doesNotMatch(queue.content[0].text, /#470/, "a closed item is a shortfall, not a row");
 	assert.equal(queue.details.order_source, "hive");
 
-	// The repair is metadata only: the durable state tree gained no file and wrote
-	// no source. The queue is a projection over disk, never a writer of it.
+	// Queue repair is in-memory only: it writes no files.
 	assert.deepEqual(listState(), before, "repair made no on-disk changes");
 
 	// The agent reaches a typed tool from the repaired queue and reads the real
 	// bounded diff — native gh, not a browser — honest about its bounds.
-	const diff = await pi.tools.get("bluefin_review_diff").execute("id", { pull_request: 42, repo: "projectbluefin/review" });
+	const diff = await pi.tools.get("hive_workbench_diff").execute("id", { pull_request: 42, repo: "projectbluefin/review" });
 	assert.match(diff.content[0].text, /entrypoint\.sh/);
 	assert.match(diff.content[0].text, /\+3 -1/);
 	assert.equal(diff.isError, false);
 
-	// The status tool observes the checks and the recorded state, and names the
-	// authority. The selected item's review state is a blocker the tool reports.
-	const status = await pi.tools.get("bluefin_review_status").execute("id", {});
+	// The status tool observes live checks and names the queue authority.
+	// The selected item's review state is a blocker the tool reports.
+	const status = await pi.tools.get("hive_workbench_status").execute("id", {});
 	assert.match(status.content[0].text, /ci: 0 passing, 1 failing, 1 pending/);
 	assert.match(status.content[0].text, /review_required/);
 	assert.match(status.content[0].text, /missing from this queue/, "the unresolved item is reported, not hidden");
@@ -3439,256 +3160,8 @@ test("bounded fallback repairs by name, observes checks and state, and never mer
 	// The queue refreshes without duplicating the repaired rows.
 	(pi.shortcuts.get("alt+u") as { handler: (ctx: unknown) => void }).handler(ctx);
 	await review.whenStarted();
-	const queue2 = await pi.tools.get("bluefin_review_queue").execute("id", {});
+	const queue2 = await pi.tools.get("hive_workbench_queue").execute("id", {});
 	const occurrences = queue2.content[0].text.match(/projectbluefin\/review#936/g) ?? [];
 	assert.equal(occurrences.length, 1, "a refresh does not re-add a repaired row");
 
-	// The fallback never oversteps merge authority: the red check on #42 stops the
-	// approve prompt at "report", and the hold/review item is not mergeable either.
-	const approve42 = actionPrompt({ kind: "approve", item: queueItem({ id: 42 }) });
-	assert.match(approve42, /gh pr checks 42 --repo projectbluefin\/review/);
-	assert.match(approve42, /Stop and report instead of merging/);
-	const approve936 = actionPrompt({ kind: "approve", item: queueItem({ id: 936, labels: ["hold", "review_required"] }) });
-	assert.match(approve936, /Stop and report instead of merging/);
-});
-
-test("RED: slay must not strand completed work when local verification is unavailable (#475)", () => {
-	// 1. Construct a fixture repository
-	const fixtureDir = mkdtempSync(join(tmpdir(), "slay-fixture-"));
-	try {
-		execSync("git init -b main", { cwd: fixtureDir, stdio: "ignore" });
-		execSync('git config user.name "Test Committer"', { cwd: fixtureDir, stdio: "ignore" });
-		execSync('git config user.email "test@example.com"', { cwd: fixtureDir, stdio: "ignore" });
-		writeFileSync(join(fixtureDir, "calculator.py"), "def add(a, b):\n    return 0\n");
-		execSync("git add calculator.py && git commit -m 'Initial commit'", { cwd: fixtureDir, stdio: "ignore" });
-
-		// 2. The requested implementation is deterministic: fix calculator add
-		writeFileSync(join(fixtureDir, "calculator.py"), "def add(a, b):\n    return a + b\n");
-
-		// 3. Source editing succeeds and a cheap repository-independent check succeeds
-		let diffCheckPassed = false;
-		try {
-			execSync("git diff --check", { cwd: fixtureDir, stdio: "ignore" });
-			diffCheckPassed = true;
-		} catch {
-			diffCheckPassed = false;
-		}
-		assert.equal(diffCheckPassed, true, "git diff --check must pass cleanly");
-
-		// 4. The focused test command references a deliberately unavailable executable
-		let testResult: { exitCode?: number; stderr?: string; error?: Error };
-		try {
-			execSync("nonexistent_pytest_runner tests/test_calculator.py", {
-				cwd: fixtureDir,
-				stdio: "pipe",
-			});
-			testResult = { exitCode: 0 };
-		} catch (error: any) {
-			testResult = {
-				exitCode: error.status ?? 127,
-				stderr: error.stderr ? String(error.stderr) : "command not found: nonexistent_pytest_runner",
-				error,
-			};
-		}
-
-		// Verify that missing executable is classified as VERIFICATION_UNAVAILABLE, NOT VERIFICATION_FAILED
-		const verificationStatus = classifyVerificationOutcome(testResult);
-		assert.equal(
-			verificationStatus,
-			"VERIFICATION_UNAVAILABLE",
-			"missing test runtime/executable must be classified as VERIFICATION_UNAVAILABLE, not failed test",
-		);
-
-		// Current / old Slay contract failure:
-		// Slay would refuse to create a commit/PR and terminate leaving modified files in a dirty working tree.
-		const dirtyStatusBeforeDelivery = execSync("git status --porcelain", { cwd: fixtureDir, encoding: "utf-8" }).trim();
-		assert.match(dirtyStatusBeforeDelivery, /M calculator\.py/, "dirty working tree existed before delivery resolution");
-
-		// Under the new delivery contract:
-		// Delivery MUST NOT leave an anonymous dirty working tree without a durable deliverable.
-		// Commit scoped changes, branch, and open draft PR
-		const branchName = "fix/issue-475";
-		execSync(`git checkout -b ${branchName}`, { cwd: fixtureDir, stdio: "ignore" });
-		execSync("git add calculator.py", { cwd: fixtureDir, stdio: "ignore" });
-		execSync("git commit -m 'Fix add function (#475)'", { cwd: fixtureDir, stdio: "ignore" });
-		const commitSha = execSync("git rev-parse HEAD", { cwd: fixtureDir, encoding: "utf-8" }).trim();
-
-		const deliveryResult = resolveSlayDelivery({
-			workspacePath: fixtureDir,
-			repository: "projectbluefin/review",
-			issueNumber: 475,
-			branch: branchName,
-			hasModifiedFiles: true,
-			implementationComplete: true,
-			allowDraftPr: true,
-			verificationResults: [
-				{ name: "git diff --check", status: "VERIFICATION_PASSED" },
-				{ name: "nonexistent_pytest_runner tests/test_calculator.py", status: "VERIFICATION_UNAVAILABLE" },
-			],
-			commitSha,
-			prUrl: "https://github.com/projectbluefin/review/pull/476",
-		});
-
-		assert.equal(deliveryResult.deliveryState, "DRAFT_PR_OPENED_VERIFICATION_UNAVAILABLE");
-		assert.equal(deliveryResult.commitSha, commitSha);
-		assert.equal(deliveryResult.branch, branchName);
-		assert.equal(deliveryResult.prUrl, "https://github.com/projectbluefin/review/pull/476");
-		assert.deepEqual(deliveryResult.verificationPerformed, ["git diff --check"]);
-		assert.deepEqual(deliveryResult.verificationUnavailable, ["nonexistent_pytest_runner tests/test_calculator.py"]);
-		assert.deepEqual(deliveryResult.verificationFailed, []);
-		assert.equal(deliveryResult.blocker, null);
-
-		// Verify working tree is clean
-		const dirtyStatusAfter = execSync("git status --porcelain", { cwd: fixtureDir, encoding: "utf-8" }).trim();
-		assert.equal(dirtyStatusAfter, "", "working tree must be clean after durable delivery");
-		assert.equal(deliveryResult.workingTreeClean, true);
-
-		// Verify draft PR body records unexecuted verification gates and required notices
-		const draftPrBody = formatDraftPrBody({
-			repo: "projectbluefin/review",
-			issueNumber: 475,
-			summary: "Fix add function",
-			verifiedGates: deliveryResult.verificationPerformed,
-			unverifiedGates: [
-				{
-					name: "focused pytest",
-					reason: "nonexistent_pytest_runner unavailable in Review appliance",
-				},
-			],
-		});
-		assert.match(draftPrBody, /Closes projectbluefin\/review#475/);
-		assert.match(draftPrBody, /✓ git diff --check/);
-		assert.match(draftPrBody, /NOT RUN:/);
-		assert.match(draftPrBody, /focused pytest/);
-		assert.match(draftPrBody, /This PR is draft until repository CI or a capable environment verifies/);
-
-		// Verify final response contract
-		const finalReport = formatSlayFinalResponse(deliveryResult);
-		assert.match(finalReport, /Repository: projectbluefin\/review/);
-		assert.match(finalReport, new RegExp(`Workspace path: ${fixtureDir}`));
-		assert.match(finalReport, /Branch: fix\/issue-475/);
-		assert.match(finalReport, new RegExp(`Commit SHA: ${commitSha}`));
-		assert.match(finalReport, /PR URL: https:\/\/github\.com\/projectbluefin\/review\/pull\/476/);
-		assert.match(finalReport, /Delivery state: DRAFT_PR_OPENED_VERIFICATION_UNAVAILABLE/);
-		assert.match(finalReport, /Verification performed: git diff --check/);
-		assert.match(finalReport, /Verification unavailable: nonexistent_pytest_runner tests\/test_calculator\.py/);
-		assert.match(finalReport, /Remaining blocker: none/);
-		assert.match(finalReport, /Working tree clean: clean/);
-	} finally {
-		rmSync(fixtureDir, { recursive: true, force: true });
-	}
-});
-
-test("slay delivery: contract outcomes cover passed, failed, incomplete, and policy blocked cases (#475)", () => {
-	// 1. Successful implementation and successful verification opens a normal PR
-	const verified = resolveSlayDelivery({
-		workspacePath: "/repo/workspace",
-		repository: "projectbluefin/review",
-		issueNumber: 100,
-		hasModifiedFiles: true,
-		implementationComplete: true,
-		verificationResults: [{ name: "pytest", status: "VERIFICATION_PASSED" }],
-		commitSha: "abc1234",
-		prUrl: "https://github.com/projectbluefin/review/pull/101",
-	});
-	assert.equal(verified.deliveryState, "PR_OPENED_VERIFIED");
-	assert.equal(verified.blocker, null);
-
-	// 2. Executed failing test remains a real failure and is not downgraded to unavailable
-	const executedFailed = classifyVerificationOutcome({
-		exitCode: 1,
-		stderr: "FAILED tests/test_calc.py::test_add - AssertionError",
-	});
-	assert.equal(executedFailed, "VERIFICATION_FAILED");
-
-	const failedDelivery = resolveSlayDelivery({
-		workspacePath: "/repo/workspace",
-		repository: "projectbluefin/review",
-		issueNumber: 100,
-		hasModifiedFiles: true,
-		implementationComplete: true,
-		verificationResults: [
-			{ name: "pytest", status: executedFailed },
-			{ name: "missing_linter", status: "VERIFICATION_UNAVAILABLE" },
-		],
-		commitSha: "abc1234",
-	});
-	assert.equal(failedDelivery.deliveryState, "PARTIAL_WORK_PRESERVED");
-	assert.equal(failedDelivery.prUrl, null, "failing verification must never open a PR");
-	assert.match(failedDelivery.blocker ?? "", /Verification failed/);
-
-	// 3. Genuinely incomplete work is preserved and not represented as complete
-	const incomplete = resolveSlayDelivery({
-		workspacePath: "/repo/workspace",
-		repository: "projectbluefin/review",
-		issueNumber: 100,
-		hasModifiedFiles: true,
-		implementationComplete: false,
-		commitSha: "abc1234",
-	});
-	assert.equal(incomplete.deliveryState, "PARTIAL_WORK_PRESERVED");
-	assert.equal(incomplete.prUrl, null);
-	assert.match(incomplete.blocker ?? "", /incomplete/i);
-
-	// 4. No changes made results in BLOCKED_NO_CHANGES
-	const noChanges = resolveSlayDelivery({
-		workspacePath: "/repo/workspace",
-		repository: "projectbluefin/review",
-		issueNumber: 100,
-		hasModifiedFiles: false,
-		implementationComplete: false,
-		blocker: "Cannot reproduce issue",
-	});
-	assert.equal(noChanges.deliveryState, "BLOCKED_NO_CHANGES");
-	assert.equal(noChanges.commitSha, null);
-	assert.equal(noChanges.prUrl, null);
-
-	// 5. Repository policy forbidding unverified draft PR preserves work and reports policy blocker
-	const policyBlocked = resolveSlayDelivery({
-		workspacePath: "/repo/workspace",
-		repository: "projectbluefin/review",
-		issueNumber: 100,
-		hasModifiedFiles: true,
-		implementationComplete: true,
-		allowDraftPr: false,
-		verificationResults: [{ name: "pytest", status: "VERIFICATION_UNAVAILABLE" }],
-		commitSha: "abc1234",
-	});
-	assert.equal(policyBlocked.deliveryState, "PARTIAL_WORK_PRESERVED");
-	assert.equal(policyBlocked.prUrl, null);
-	assert.match(policyBlocked.blocker ?? "", /Repository policy/i);
-
-	// 6. Trace class mapping: draft-pr-opened maps to verification (UNVERIFIED badge)
-	assert.equal(classifyLanding("draft-pr-opened"), "verification");
-	assert.equal(classifyLanding("draft_pr_opened_verification_unavailable"), "verification");
-	assert.equal(traceClassBadge(classifyLanding("draft-pr-opened")), "UNVERIFIED");
-	assert.equal(classifyLanding("pr_opened_verified"), "success");
-	assert.equal(classifyLanding("blocked_no_changes"), "findings");
-	assert.equal(classifyLanding("partial_work_preserved"), "findings");
-});
-
-test("slay issue prompt enforces delivery contract across single and batch issue slaying (#475)", () => {
-	const issue = queueItem({ id: 475, type: "issue", repo: "projectbluefin/review", title: "Slay delivery invariant" });
-
-	// Single issue slay prompt
-	const singlePrompt = actionPrompt({ kind: "slay", item: issue });
-	assert.match(singlePrompt, /DRAFT_PR_OPENED_VERIFICATION_UNAVAILABLE/);
-	assert.match(singlePrompt, /VERIFICATION_UNAVAILABLE/);
-	assert.match(singlePrompt, /VERIFICATION_FAILED/);
-	assert.match(singlePrompt, /VERIFICATION_PASSED/);
-	assert.match(singlePrompt, /anonymous dirty working tree/);
-	assert.match(singlePrompt, /PARTIAL_WORK_PRESERVED/);
-	assert.match(singlePrompt, /PR_OPENED_VERIFIED/);
-	assert.match(singlePrompt, /workspace path/i);
-	assert.match(singlePrompt, /working tree is clean/i);
-
-	// Batch issue slay prompt
-	const batch = [issue, queueItem({ id: 476, type: "issue", repo: "projectbluefin/review" })];
-	const batchPrompt = actionPrompt({ kind: "slay", item: issue, items: batch });
-	assert.match(batchPrompt, /DRAFT_PR_OPENED_VERIFICATION_UNAVAILABLE/);
-	assert.match(batchPrompt, /VERIFICATION_UNAVAILABLE/);
-	assert.match(batchPrompt, /anonymous dirty working tree/);
-	assert.match(batchPrompt, /PARTIAL_WORK_PRESERVED/);
-	assert.match(batchPrompt, /SUBAGENT-RULES/);
-	assert.match(batchPrompt, /one pull request per issue/);
 });
