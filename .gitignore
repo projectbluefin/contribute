@@ -5,13 +5,9 @@
 image/bluefin-operations/node_modules/
 
 
-# tests/image-audit.sh --report writes generated audit reports; they are
-# per-run evidence, never source.
-image-audit-report.md
 __pycache__/
 
-# tests/dashboard-contract.sh builds a pinned Textual venv here to drive the
-# dashboard pilot; it is a build artifact, never source.
+# Local test caches are build artifacts, never source.
 .cache/
 .agents/
 

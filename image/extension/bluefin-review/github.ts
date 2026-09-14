@@ -148,9 +148,6 @@ export function parseScope(input: string, defaultOrg: string): QueueScope | unde
 	return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(trimmed) ? { kind: "repo", value: trimmed } : undefined;
 }
 
-export function describeScope(scope: QueueScope): string {
-	return scope.kind === "org" ? scope.value : scope.value;
-}
 
 export function searchExpression(mode: QueueMode, scope: QueueScope): string {
 	const kind = mode === "prs" ? "is:pr" : "is:issue";
@@ -250,14 +247,14 @@ function toReviewState(value?: string | null): ReviewState {
 }
 
 function toQueueItem(node: SearchNode, mode: QueueMode): QueueItem | undefined {
-	if (typeof node.number !== "number") return undefined;
+	if (typeof node.number !== "number" || !node.repository?.nameWithOwner) return undefined;
 	const updated = node.updatedAt ? Date.parse(node.updatedAt) : Number.NaN;
 	return {
 		id: node.number,
 		type: mode === "prs" ? "pr" : "issue",
-		repo: node.repository?.nameWithOwner ?? DEFAULT_ORG,
+		repo: node.repository.nameWithOwner,
 		title: node.title ?? "(untitled)",
-		author: node.author?.login ?? "ghost",
+		author: node.author?.login ?? "unknown",
 		url: node.url ?? "",
 		updatedAt: Number.isNaN(updated) ? 0 : updated,
 		draft: node.isDraft === true,

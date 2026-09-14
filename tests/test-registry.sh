@@ -2,12 +2,9 @@
 # tests/test-registry.sh
 #
 # Every executable test under tests/ must be reachable from
-# .github/workflows/validate.yml, either because the workflow runs it directly
-# or because a script the workflow runs invokes it. Seven suites
-# (capacity_contract.py, review_cache_contract.py, review_engine_contract.py,
-# review_receipt_contract.py, review_snapshot_contract.py,
-# lab-broker-contract.py, review-exec-broker-contract.py) were committed and
-# then never executed by CI. This check makes that state fail the build.
+# `.github/workflows/validate.yml`, either directly or through a test runner the
+# workflow names. This prevents focused contracts from being committed without
+# ever running in CI.
 
 set -euo pipefail
 
@@ -26,9 +23,8 @@ fail() {
   exit 1
 }
 
-# A test is "reachable" when the workflow names it, or when any file the
-# workflow already reaches names it. One hop covers the shape this repo uses:
-# validate.yml -> tests/dashboard-contract.sh -> the venv-only contracts.
+# A test is "reachable" when the workflow names it, or when a named test runner
+# invokes it. One hop covers this repository's shell-wrapper structure.
 declare -a roots=()
 while IFS= read -r name; do
   roots+=("$name")

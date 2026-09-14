@@ -34,13 +34,14 @@ require_before() {
 require_heading
 require_before '^## +(Start here|Quick start)([[:space:]]|$)' '^## +What this is for([[:space:]]|$)'
 
-for command in contribute review-doctor review-queue review-container review-stop; do
+for command in contribute review-doctor review-queue review-appliance review-container review-stop; do
   require_text "just $command"
 done
 
-require_text 'BLUEFIN_REVIEW_BACKEND=codex just review-queue'
+require_text "\`review-queue\` delegates to \`review-appliance\`"
 require_text 'REVIEW_DETACH=1'
 require_text 'just review-stop'
+require_text 'podman run --runtime=krun'
 
 if [[ "$failures" -ne 0 ]]; then
   printf '%d README onboarding assertion(s) failed.\n' "$failures" >&2

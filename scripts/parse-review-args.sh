@@ -10,7 +10,6 @@
 #   --repo owner/repo
 #   --issues / issues
 #   --all / all
-#   --autoslay / autoslay / slay
 #   and any mixed combination.
 #
 # Populates PARSED_REVIEW_ARGS array with the resulting arguments.
@@ -86,14 +85,6 @@ parse_review_args() {
       ;;
     all)
       out_args+=(--all)
-      i=$((i + 1))
-      ;;
-    --autoslay)
-      out_args+=(--autoslay)
-      i=$((i + 1))
-      ;;
-    autoslay | slay)
-      out_args+=(--autoslay)
       i=$((i + 1))
       ;;
     --skip-repo | --profile | --extension | --model | --effort)

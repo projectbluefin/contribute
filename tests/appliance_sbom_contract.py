@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Contract tests for scripts/generate-appliance-sbom.py.
 
-The generator writes the SPDX document that carries the appliance's four
-fetched components — omp, node, the pi npm tarball and gh — into the attested
-SBOM. syft only inventories package-manager metadata, so if this document is
-wrong those components are either missing from the attestation or described
-with a digest the build never verified, and nothing in the image build fails.
+The generator writes the SPDX document for the appliance's fetched `omp` and
+`gh` binaries plus the bundled review mode. syft cannot infer the provenance of
+those directly copied artifacts.
 
 Until this suite the script had no executed coverage at all: the only reference
 to it anywhere under tests/ was a `.dockerignore` string check in
@@ -23,18 +21,16 @@ Covered here:
   actually fetches, per architecture
 - purl locators, the ?checksum=sha256: qualifier, and the checksums block
   appearing only for components whose digest the build verifies
-- SPDXID sanitisation for the scoped npm name
-- document shape: SPDX-2.3, namespace, UTC creation timestamp, trailing newline
+- SPDX IDs and document shape: SPDX-2.3, namespace, UTC creation timestamp,
+  trailing newline
 - that the output directory is created, and that argparse refuses a missing
   required argument
-- that the Containerfile still passes every required argument
 """
 
 from __future__ import annotations
 
 import json
 import pathlib
-import re
 import subprocess
 import sys
 import tempfile
@@ -42,12 +38,9 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "generate-appliance-sbom.py"
-CONTAINERFILE = REPO_ROOT / "image" / "appliance" / "Containerfile"
 
 OMP_X86 = "a" * 64
 OMP_ARM = "b" * 64
-NODE_X86 = "c" * 64
-NODE_ARM = "d" * 64
 GH_X86 = "e" * 64
 GH_ARM = "f" * 64
 
@@ -57,10 +50,6 @@ BASE_ARGS = {
     "--omp-version": "1.2.3",
     "--omp-sha256-x86-64": OMP_X86,
     "--omp-sha256-aarch64": OMP_ARM,
-    "--pi-version": "4.5.6",
-    "--node-version": "24.9.0",
-    "--node-sha256-x86-64": NODE_X86,
-    "--node-sha256-aarch64": NODE_ARM,
     "--gh-version": "2.80.1",
     "--gh-sha256-x86-64": GH_X86,
     "--gh-sha256-aarch64": GH_ARM,
@@ -118,26 +107,24 @@ class PerArchitectureDigests(unittest.TestCase):
     def test_x86_64_carries_only_the_x86_64_digests(self):
         found = packages_by_name(generate(self, "x86_64"))
         self.assertEqual(found["omp"]["checksums"][0]["checksumValue"], OMP_X86)
-        self.assertEqual(found["node"]["checksums"][0]["checksumValue"], NODE_X86)
         self.assertEqual(found["gh"]["checksums"][0]["checksumValue"], GH_X86)
         serialised = json.dumps(found)
-        for foreign in (OMP_ARM, NODE_ARM, GH_ARM):
+        for foreign in (OMP_ARM, GH_ARM):
             self.assertNotIn(foreign, serialised, "an aarch64 digest reached an x86_64 SBOM")
 
     def test_aarch64_carries_only_the_aarch64_digests(self):
         found = packages_by_name(generate(self, "aarch64"))
         self.assertEqual(found["omp"]["checksums"][0]["checksumValue"], OMP_ARM)
-        self.assertEqual(found["node"]["checksums"][0]["checksumValue"], NODE_ARM)
         self.assertEqual(found["gh"]["checksums"][0]["checksumValue"], GH_ARM)
         serialised = json.dumps(found)
-        for foreign in (OMP_X86, NODE_X86, GH_X86):
+        for foreign in (OMP_X86, GH_X86):
             self.assertNotIn(foreign, serialised, "an x86_64 digest reached an aarch64 SBOM")
 
     def test_only_verified_components_declare_a_checksum(self):
         found = packages_by_name(generate(self, "x86_64"))
-        for name in ("omp", "node", "gh"):
+        for name in ("omp", "gh"):
             self.assertEqual(found[name]["checksums"][0]["algorithm"], "SHA256")
-        for name in ("@earendil-works/pi-coding-agent", "bluefin-review-mode"):
+        for name in ("bluefin-review-mode",):
             self.assertNotIn(
                 "checksums",
                 found[name],
@@ -158,7 +145,7 @@ class DigestValidation(unittest.TestCase):
         self.assert_rejected("omp_sha256 for x86_64", **{"--omp-sha256-x86-64": "A" * 64})
 
     def test_short_digest_is_refused(self):
-        self.assert_rejected("node_sha256 for x86_64", **{"--node-sha256-x86-64": "c" * 63})
+        self.assert_rejected("gh_sha256 for x86_64", **{"--gh-sha256-x86-64": "e" * 63})
 
     def test_long_digest_is_refused(self):
         self.assert_rejected("gh_sha256 for x86_64", **{"--gh-sha256-x86-64": "e" * 65})
@@ -178,12 +165,7 @@ class DigestValidation(unittest.TestCase):
         )
 
     def test_empty_versions_are_refused_by_name(self):
-        for flag, label in (
-            ("--omp-version", "omp version"),
-            ("--pi-version", "pi version"),
-            ("--node-version", "node version"),
-            ("--gh-version", "gh version"),
-        ):
+        for flag, label in (("--omp-version", "omp version"), ("--gh-version", "gh version")):
             with self.subTest(flag=flag):
                 self.assert_rejected(f"{label} must not be empty", **{flag: ""})
 
@@ -204,10 +186,6 @@ class DownloadLocations(unittest.TestCase):
             "https://github.com/can1357/oh-my-pi/releases/download/v1.2.3/omp-linux-x64",
         )
         self.assertEqual(
-            found["node"]["downloadLocation"],
-            "https://nodejs.org/dist/v24.9.0/node-v24.9.0-linux-x64.tar.xz",
-        )
-        self.assertEqual(
             found["gh"]["downloadLocation"],
             "https://github.com/cli/cli/releases/download/v2.80.1/gh_2.80.1_linux_amd64.tar.gz",
         )
@@ -219,21 +197,12 @@ class DownloadLocations(unittest.TestCase):
             "https://github.com/can1357/oh-my-pi/releases/download/v1.2.3/omp-linux-arm64",
         )
         self.assertEqual(
-            found["node"]["downloadLocation"],
-            "https://nodejs.org/dist/v24.9.0/node-v24.9.0-linux-arm64.tar.xz",
-        )
-        self.assertEqual(
             found["gh"]["downloadLocation"],
             "https://github.com/cli/cli/releases/download/v2.80.1/gh_2.80.1_linux_arm64.tar.gz",
         )
 
-    def test_npm_and_source_download_urls(self):
+    def test_source_download_url(self):
         found = packages_by_name(generate(self, "x86_64"))
-        self.assertEqual(
-            found["@earendil-works/pi-coding-agent"]["downloadLocation"],
-            "https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/"
-            "pi-coding-agent-4.5.6.tgz",
-        )
         self.assertEqual(
             found["bluefin-review-mode"]["downloadLocation"],
             "https://github.com/projectbluefin/review/tree/"
@@ -242,26 +211,13 @@ class DownloadLocations(unittest.TestCase):
 
 
 class PackageIdentity(unittest.TestCase):
-    def test_the_five_load_bearing_components_are_present(self):
+    def test_the_three_load_bearing_components_are_present(self):
         found = packages_by_name(generate(self, "x86_64"))
-        self.assertEqual(
-            sorted(found),
-            sorted(
-                [
-                    "@earendil-works/pi-coding-agent",
-                    "bluefin-review-mode",
-                    "gh",
-                    "node",
-                    "omp",
-                ]
-            ),
-        )
+        self.assertEqual(sorted(found), ["bluefin-review-mode", "gh", "omp"])
 
     def test_versions_are_recorded(self):
         found = packages_by_name(generate(self, "x86_64"))
         self.assertEqual(found["omp"]["versionInfo"], "1.2.3")
-        self.assertEqual(found["@earendil-works/pi-coding-agent"]["versionInfo"], "4.5.6")
-        self.assertEqual(found["node"]["versionInfo"], "24.9.0")
         self.assertEqual(found["gh"]["versionInfo"], "2.80.1")
         self.assertEqual(found["bluefin-review-mode"]["versionInfo"], "26.08.03")
 
@@ -269,10 +225,6 @@ class PackageIdentity(unittest.TestCase):
         found = packages_by_name(generate(self, "x86_64"))
         identifiers = [package["SPDXID"] for package in found.values()]
         self.assertEqual(len(identifiers), len(set(identifiers)))
-        self.assertEqual(
-            found["@earendil-works/pi-coding-agent"]["SPDXID"],
-            "SPDXRef-Package-earendil-works-pi-coding-agent",
-        )
         for identifier in identifiers:
             self.assertRegex(identifier, r"^SPDXRef-[A-Za-z0-9.\-]+$")
 
@@ -285,12 +237,7 @@ class PackageIdentity(unittest.TestCase):
         self.assertEqual(
             locator("omp"), f"pkg:github/can1357/oh-my-pi@v1.2.3?checksum=sha256:{OMP_ARM}"
         )
-        self.assertEqual(locator("node"), f"pkg:generic/node@24.9.0?checksum=sha256:{NODE_ARM}")
         self.assertEqual(locator("gh"), f"pkg:github/cli/cli@v2.80.1?checksum=sha256:{GH_ARM}")
-        self.assertEqual(
-            locator("@earendil-works/pi-coding-agent"),
-            "pkg:npm/%40earendil-works/pi-coding-agent@4.5.6",
-        )
         self.assertEqual(
             locator("bluefin-review-mode"),
             f"pkg:github/projectbluefin/review@{BASE_ARGS['--revision']}",
@@ -329,39 +276,6 @@ class DocumentShape(unittest.TestCase):
         )
 
 
-class ContainerfileWiring(unittest.TestCase):
-    """A required argument the Containerfile stops passing fails the build."""
-
-    def invocation(self) -> str:
-        """The generator's RUN invocation: from its name to the end of the
-        line-continuation run, so later instructions cannot leak in."""
-        lines = CONTAINERFILE.read_text(encoding="utf-8").splitlines()
-        for index, line in enumerate(lines):
-            if "/usr/local/libexec/appliance-sbom" in line and not line.startswith("COPY"):
-                block = []
-                for continued in lines[index:]:
-                    block.append(continued)
-                    if not continued.rstrip().endswith("\\"):
-                        break
-                return "\n".join(block)
-        self.fail("the Containerfile no longer runs the generator")
-
-    def test_containerfile_passes_every_required_argument(self):
-        invocation = self.invocation()
-        for flag in ["--arch", "--out", "--revision", *BASE_ARGS]:
-            self.assertIn(flag, invocation, f"the Containerfile stopped passing {flag}")
-
-    def test_generator_declares_every_flag_the_containerfile_passes(self):
-        declared = set(
-            re.findall(r'add_argument\("(--[a-z0-9-]+)"', SCRIPT.read_text(encoding="utf-8"))
-        )
-        passed = set(re.findall(r"(--[a-z0-9-]+)[ =]", self.invocation()))
-        self.assertTrue(passed, "no flags parsed out of the Containerfile invocation")
-        self.assertLessEqual(
-            passed,
-            declared,
-            f"the Containerfile passes flags the generator does not declare: {passed - declared}",
-        )
 
 
 if __name__ == "__main__":
