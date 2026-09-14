@@ -46,9 +46,13 @@ priority signal belongs on the local side of that seam, never on Hive's.
 
 ## Defer model choice to OMP
 
-This repository does not pin, map, filter, or select models or thinking effort.
-The user chooses both through their active OMP configuration. Shipped companion
-agents omit model and effort fields and inherit OMP's resolved choice.
+The shipped appliances do not pin, map, filter, or select models or thinking
+effort. The user chooses both through their active OMP configuration. Shipped
+companion agents omit model and effort fields and inherit OMP's resolved choice.
+
+For repository development, `.omp/config.yml` pins subagent models and effort
+and defines model-role mappings. It leaves the interactive model to the user
+and is not copied into either runtime image.
 
 ## Inspect live state; preserve active work
 
