@@ -30,7 +30,8 @@ export type DashboardAction =
 	| { kind: "reference"; item: QueueItem; items?: QueueItem[] }
 	| { kind: "scope" }
 	| { kind: "snapshot" }
-	| { kind: "leaderboard" };
+	| { kind: "leaderboard" }
+	| { kind: "ci_mode" };
 
 export const DASHBOARD_KEYS: readonly RailKey[] = [
 	{ chord: "s", label: "autoslay" },
@@ -825,6 +826,10 @@ export class ReviewDashboard {
 			case "y":
 				this.done({ kind: "reference", item, items });
 				return;
+			case "C":
+				this.mode.toggleViewMode();
+				this.tui.requestRender();
+				return;
 			default:
 				break;
 		}
@@ -909,7 +914,16 @@ export class ReviewDashboard {
 		const parts = [
 			this.painter.bold(this.painter.fg("accent", `${GLYPH.hex} bluefin review`)),
 			this.painter.fg("dim", GLYPH.logDashed.trim()),
-			this.painter.bold(this.painter.fg("text", this.mode.queueMode === "prs" ? "PULL REQUESTS" : "ISSUES")),
+			this.painter.bold(
+				this.painter.fg(
+					"text",
+					this.mode.viewMode === "ci"
+						? "CI MONITOR"
+						: this.mode.queueMode === "prs"
+							? "PULL REQUESTS"
+							: "ISSUES",
+				),
+			),
 			this.painter.fg("text", this.mode.position()),
 			this.painter.fg("dim", GLYPH.dot),
 			this.painter.fg("dim", this.mode.scopeLabel()),
