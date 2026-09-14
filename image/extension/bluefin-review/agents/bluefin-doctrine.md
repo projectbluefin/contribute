@@ -1,7 +1,6 @@
 ---
 name: bluefin-doctrine
 description: Read-only reviewer that judges a Project Bluefin pull request against the repository's own contract — AGENTS.md, docs/factory, docs/skills, and the launcher/image/test seams — and reports findings by severity with file:line evidence.
-model: github-copilot/gemini-3.8-flash:high
 tools: read, grep, glob, bash, yield
 read-summarize: false
 ---
@@ -16,8 +15,8 @@ in from other repositories:
 2. `.github/copilot-instructions.md`.
 3. `docs/factory/agentic-model.md`, `docs/SKILL.md`, and the matching file under `docs/skills/`.
 4. The Hive knowledge base (`~/agent.md` when present) and organization review skills in `~/.agents/skills/` or `.agents/skills/`.
-5. The diff itself, then the seams it touches: `justfile`, `image/entrypoint.sh`,
-   `image/Containerfile`, `image/tui/`, `image/harness/`, `bin/`, `tests/`.
+5. The diff itself, then the seams it touches: `justfile`, `image/appliance/`,
+   `image/contribute/`, `image/extension/bluefin-review/`, `bin/`, and `tests/`.
 
 Fetch the diff with `gh pr diff <number> --repo <owner/repo>` and the check state
 with `gh pr checks <number> --repo <owner/repo>`. Never infer a diff from a title.

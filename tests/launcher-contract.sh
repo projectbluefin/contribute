@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Contract for launcher argument parsing and Brew/SIF and source launcher parity.
+# Contract for review argument parsing and OCI/source launcher parity.
 #
 # Verifies that:
 #   1. scripts/parse-review-args.sh parses all shorthand forms and mixed combinations.
-#   2. bin/bluefin review forwards parsed flags to the SIF container rather than prompt text.
-#   3. bin/omp-review forwards identical parsed flags to omp.
-#   4. Brew/SIF and source launchers have complete argument parity.
+#   2. bin/bluefin review runs the OCI appliance through libkrun.
+#   3. bin/omp-review forwards identical parsed flags to OMP.
+#   4. Container and source launchers preserve argument parity.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,6 +26,17 @@ assert_eq() {
   if [[ "$actual" != "$expected" ]]; then
     fail "${label}: expected '${expected}', got '${actual}'"
   fi
+}
+arg_after() {
+  local line="$1" wanted="$2" previous="" part
+  for part in $line; do
+    if [[ "$previous" == "$wanted" ]]; then
+      printf '%s\n' "$part"
+      return 0
+    fi
+    previous="$part"
+  done
+  return 1
 }
 
 # --- 1. Parser unit tests across all forms and mixed combinations -------------
@@ -55,9 +66,6 @@ test_cases=(
   "--issues|--issues"
   "all|--all"
   "--all|--all"
-  "autoslay|--autoslay"
-  "slay|--autoslay"
-  "--autoslay|--autoslay"
   "bluefin|--repo bluefin"
   "bluefin #123|--repo bluefin --pr 123"
   "bluefin#123|--repo bluefin --pr 123"
@@ -84,24 +92,66 @@ for case in "${test_cases[@]}"; do
   actual="${PARSED_REVIEW_ARGS[*]:-}"
   assert_eq "$actual" "$expected" "parse_review_args '$input'"
 done
+parse_review_args "--extension=/tmp/review extension"
+assert_eq "${#PARSED_REVIEW_ARGS[@]}" "1" "single argument with whitespace"
+assert_eq "${PARSED_REVIEW_ARGS[0]}" "--extension=/tmp/review extension" "literal extension path"
 
 # Verify standalone execution of parse-review-args.sh
 standalone_out="$("${repo_root}/scripts/parse-review-args.sh" projectbluefin/review#463 --issues | tr '\n' ' ' | sed 's/ $//')"
 assert_eq "$standalone_out" "--repo projectbluefin/review --pr 463 --issues" "standalone parse-review-args.sh"
 
-# --- 2. Hermetic test of bin/bluefin review (Brew / SIF launcher) --------------
+# --- 2. Hermetic test of bin/bluefin review (KVM OCI launcher) ----------------
 
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
-mkdir -p "$scratch/bin"
+mkdir -p "$scratch/bin" "$scratch/home"
+mock_podman_log="$scratch/podman.log"
+kvm="$scratch/kvm"
+touch "$kvm"
+chmod 0666 "$kvm"
+cat >"$scratch/bin/podman" <<EOF
+#!/usr/bin/env bash
+[[ "\${1:-}" == info ]] && exit 0
+if [[ "\${1:-} \${2:-} \${3:-}" == "system connection list" ]]; then
+  [[ "\${FAKE_REMOTE_DEFAULT:-}" != 1 ]] || printf 'remote\tssh://engine.example.test/run/podman.sock\ttrue\n'
+  exit 0
+fi
+printf '%s\n' "\$*" >>"$mock_podman_log"
+[[ -z "\${FAKE_PODMAN_DELAY:-}" ]] || sleep "\$FAKE_PODMAN_DELAY"
+exit 0
+EOF
+chmod +x "$scratch/bin/podman"
+cat >"$scratch/bin/krun" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
 mock_apptainer_log="$scratch/apptainer.log"
 cat >"$scratch/bin/apptainer" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$mock_apptainer_log"
+previous=""
+for arg in "\$@"; do
+  [[ "\$previous" != --home ]] || runtime_home="\${arg%%:*}"
+  if [[ "\$previous" == --pwd && "\$arg" == /home/bluefin/workspace ]]; then
+    [[ -d "\$runtime_home/workspace" ]] || exit 19
+  fi
+  previous="\$arg"
+done
+if [[ "\${EXPECT_APPTAINER_CREDENTIALS:-}" == 1 ]]; then
+  injected=()
+  for name in GH_TOKEN OPENAI_API_KEY; do
+    source_name="APPTAINERENV_\${name}"
+    [[ -v "\$source_name" ]] && injected+=("\$name=\${!source_name}")
+  done
+  env -i "\${injected[@]}" /bin/bash -c '
+    [[ "\$GH_TOKEN" == mock-token && "\$OPENAI_API_KEY" == test-provider-token ]]
+  ' || exit 19
+fi
 exit 0
 EOF
 chmod +x "$scratch/bin/apptainer"
+chmod +x "$scratch/bin/krun"
 
 cat >"$scratch/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -113,37 +163,64 @@ exit 1
 EOF
 chmod +x "$scratch/bin/gh"
 
-mock_sif="$scratch/bluefin-review.sif"
-touch "$mock_sif" && chmod +x "$mock_sif"
-
-export BLUEFIN_REVIEW_SIF="$mock_sif"
 export PATH="$scratch/bin:$PATH"
+export HOME="$scratch/home"
+export REVIEW_TEST_KVM_DEVICE="$kvm"
+export GH_TOKEN=mock-token GITHUB_TOKEN=mock-token
+unset HIVE_HUB
 
 assert_bluefin_review() {
   local input="$1"
   local expected_flags="$2"
-  rm -f "$mock_apptainer_log"
+  : >"$mock_podman_log"
 
   # shellcheck disable=SC2086
   "${repo_root}/bin/bluefin" review $input >/dev/null 2>&1 || fail "bin/bluefin review failed for: $input"
 
-  [[ -f "$mock_apptainer_log" ]] || fail "bin/bluefin review did not invoke apptainer for: $input"
-  local apptainer_call
-  apptainer_call="$(cat "$mock_apptainer_log")"
+  [[ -f "$mock_podman_log" ]] || fail "bin/bluefin review did not invoke podman for: $input"
+  local podman_call
+  podman_call="$(cat "$mock_podman_log")"
+  [[ "$podman_call" == *"run --runtime=krun --rm --interactive --tty"* ]] || fail "review did not use the krun OCI runtime: $podman_call"
+  [[ "$podman_call" == *"--name bluefin-review-"* ]] || fail "review did not use an isolated instance name: $podman_call"
+  [[ "$podman_call" == *":/home/bluefin:rw"* ]] || fail "review did not use target-specific state: $podman_call"
 
-  # apptainer run --home ... "$sif" [FLAGS...]
-  # Verify that the expected flags were passed after "$mock_sif"
-  local passed_flags="${apptainer_call#*"$mock_sif"}"
+  local image="ghcr.io/projectbluefin/review:stable" passed_flags
+  passed_flags="${podman_call#*"$image"}"
   passed_flags="$(echo "$passed_flags" | xargs)"
-
   assert_eq "$passed_flags" "$expected_flags" "bin/bluefin review $input flags"
-  # Invariant: no shorthand reaches the container as bare positional prompt text
   if [[ "$passed_flags" == *"projectbluefin/review"* && "$passed_flags" != *"--repo projectbluefin/review"* ]]; then
-    fail "shorthand reached apptainer as prompt text: $passed_flags"
+    fail "shorthand reached the appliance as prompt text: $passed_flags"
   fi
 }
 
-assert_bluefin_review "projectbluefin/review" "--repo projectbluefin/review"
+mv "$scratch/bin/krun" "$scratch/krun"
+: >"$mock_apptainer_log"
+fallback_output="$(EXPECT_APPTAINER_CREDENTIALS=1 OPENAI_API_KEY=test-provider-token REVIEW_TEST_KVM_DEVICE="$scratch/missing-kvm" "${repo_root}/bin/bluefin" review projectbluefin/review 2>&1)" || fail "review Apptainer fallback lost credentials"
+[[ "$fallback_output" == *"using the isolated Apptainer fallback"* ]] || fail "review fallback warning is missing"
+fallback_call="$(cat "$mock_apptainer_log")"
+[[ "$fallback_call" == *"run --containall"* ]] || fail "review fallback did not use Apptainer containment"
+[[ "$fallback_call" == *"docker://ghcr.io/projectbluefin/review:stable --repo projectbluefin/review"* ]] || fail "review fallback used the wrong image or scope"
+[[ "$fallback_call" != *mock-token* && "$fallback_call" != *test-provider-token* ]] || fail "fallback leaked credentials into argv"
+mv "$scratch/krun" "$scratch/bin/krun"
+: >"$mock_podman_log"
+: >"$mock_apptainer_log"
+fallback_output="$(FAKE_REMOTE_DEFAULT=1 "${repo_root}/bin/bluefin" review projectbluefin/review 2>&1)" || fail "default remote connection fallback failed"
+[[ "$fallback_output" == *"remote Podman engines are unsupported"* ]] || fail "default remote engine was not diagnosed"
+[[ ! -s "$mock_podman_log" ]] || fail "packaged launcher sent host bind mounts to a remote engine"
+[[ -s "$mock_apptainer_log" ]] || fail "default remote connection did not use local fallback"
+
+: >"$mock_podman_log"
+FAKE_PODMAN_DELAY=0.1 "${repo_root}/bin/bluefin" review projectbluefin/review >/dev/null 2>&1 &
+review_one_pid=$!
+FAKE_PODMAN_DELAY=0.1 "${repo_root}/bin/bluefin" review projectbluefin/repo2 >/dev/null 2>&1 &
+review_two_pid=$!
+wait "$review_one_pid" "$review_two_pid"
+mapfile -t concurrent_review_calls <"$mock_podman_log"
+assert_eq "${#concurrent_review_calls[@]}" "2" "concurrent review launch count"
+first_repo_call="${concurrent_review_calls[0]}"
+second_repo_call="${concurrent_review_calls[1]}"
+[[ "$(arg_after "$first_repo_call" --name)" != "$(arg_after "$second_repo_call" --name)" ]] || fail "concurrent reviews collided on container name"
+[[ "$(arg_after "$first_repo_call" --volume)" != "$(arg_after "$second_repo_call" --volume)" ]] || fail "concurrent reviews collided on state volume"
 assert_bluefin_review "projectbluefin/review #463" "--repo projectbluefin/review --pr 463"
 assert_bluefin_review "projectbluefin/review#463" "--repo projectbluefin/review --pr 463"
 assert_bluefin_review "--issues projectbluefin/review" "--issues --repo projectbluefin/review"
@@ -187,7 +264,45 @@ assert_omp_review "projectbluefin/review#463" "--repo projectbluefin/review --pr
 assert_omp_review "--issues projectbluefin/review" "--issues --repo projectbluefin/review"
 assert_omp_review "projectbluefin/review#463 --issues" "--repo projectbluefin/review --pr 463 --issues"
 
-# --- 4. Parity test: Brew/SIF and source launchers produce identical flags ----
+# --- 4. Contributor aliases launch independent KVM appliances -----------------
+mkdir -p "$HOME/.config/hive"
+printf 'HIVE_REGISTRATION_TOKEN=test\nHIVE_HUB=https://hive.example.test\n' >"$HOME/.config/hive/contributor.env"
+printf 'HIVE_REGISTRATION_TOKEN=one\nHIVE_HUB=https://hive.example.test\n' >"$HOME/.config/hive/contributor.owner-repo.env"
+printf 'HIVE_REGISTRATION_TOKEN=two\nHIVE_HUB=https://hive.example.test\n' >"$HOME/.config/hive/contributor.owner-repo2.env"
+chmod 0600 "$HOME/.config/hive/"contributor*.env
+export GH_TOKEN=mock-token
+
+: >"$mock_podman_log"
+"${repo_root}/bin/bluefin-contribute" >/dev/null 2>&1 || fail "bluefin-contribute failed"
+contribute_alias_call="$(cat "$mock_podman_log")"
+[[ "$contribute_alias_call" == *"run --runtime=krun --rm --interactive --tty"* ]] || fail "contribute alias did not use krun"
+[[ "$contribute_alias_call" == *"ghcr.io/projectbluefin/contribute:stable"* ]] || fail "contribute alias used the wrong image"
+
+: >"$mock_podman_log"
+FAKE_PODMAN_DELAY=0.1 "${repo_root}/bin/bluefin" contribute owner/repo >/dev/null 2>&1 &
+contribute_one_pid=$!
+FAKE_PODMAN_DELAY=0.1 "${repo_root}/bin/bluefin" contribute owner/repo2 >/dev/null 2>&1 &
+contribute_two_pid=$!
+wait "$contribute_one_pid" "$contribute_two_pid"
+mapfile -t concurrent_contribute_calls <"$mock_podman_log"
+assert_eq "${#concurrent_contribute_calls[@]}" "2" "concurrent contribute launch count"
+first_contribute_call="${concurrent_contribute_calls[0]}"
+second_contribute_call="${concurrent_contribute_calls[1]}"
+[[ "$(arg_after "$first_contribute_call" --name)" != "$(arg_after "$second_contribute_call" --name)" ]] || fail "contributor appliances must have unique container names"
+[[ "$(arg_after "$first_contribute_call" --volume)" != "$(arg_after "$second_contribute_call" --volume)" ]] || fail "contributor appliances must have isolated state volumes"
+[[ "$first_contribute_call$second_contribute_call" == *"contributor.owner-repo.env:/home/bluefin/.config/hive/contributor.env:ro,z"* ]] || fail "repo contributor did not select its Hive registration"
+[[ "$first_contribute_call$second_contribute_call" == *"contributor.owner-repo2.env:/home/bluefin/.config/hive/contributor.env:ro,z"* ]] || fail "repo2 contributor used the wrong registration"
+
+mv "$scratch/bin/krun" "$scratch/krun"
+: >"$mock_apptainer_log"
+fallback_output="$(EXPECT_APPTAINER_CREDENTIALS=1 OPENAI_API_KEY=test-provider-token "${repo_root}/bin/bluefin" contribute owner/repo 2>&1)" || fail "contributor Apptainer fallback lost credentials"
+[[ "$fallback_output" == *"using the isolated Apptainer fallback"* ]] || fail "contributor fallback warning is missing"
+fallback_call="$(cat "$mock_apptainer_log")"
+[[ "$fallback_call" == *"run --containall"* ]] || fail "contributor fallback did not use Apptainer containment"
+[[ "$fallback_call" == *"docker://ghcr.io/projectbluefin/contribute:stable"* ]] || fail "contributor fallback used the wrong image"
+mv "$scratch/krun" "$scratch/bin/krun"
+
+# --- 5. Parity test: KVM container and source launchers use identical flags ---
 
 for case in "${test_cases[@]}"; do
   input="${case%%|*}"

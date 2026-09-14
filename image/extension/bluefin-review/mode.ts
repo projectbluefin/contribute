@@ -17,28 +17,15 @@ import {
 	fetchQueue,
 	orgScope,
 } from "./github.ts";
-import { type HiveSnapshot, type HiveWorkItem, EMPTY_HIVE, fetchHive, fetchHiveKnowledge } from "./hive.ts";
+import { type HiveSnapshot, type HiveWorkItem, EMPTY_HIVE, fetchHive, fetchHiveKnowledge, fetchHiveMe } from "./hive.ts";
 import { type PrioritizedQueue, type Priority, itemKey, prioritize } from "./priority.ts";
-import {
-	type StateSnapshot,
-	buildPipelineSpans,
-	hasRecordedFindings,
-	isItemTerminalBlocked,
-	queueKey,
-	readStateSnapshot,
-	snapshotSignature,
-	stateRoot,
-} from "./state.ts";
 import { SessionTrace } from "./session.ts";
-import type { Span, TraceClass } from "./trace.ts";
 
 export interface ReviewModeOptions {
 	org: string;
-	stateRoot?: string;
 	token?: string;
 	fetchImpl?: typeof fetch;
 	env?: NodeJS.ProcessEnv;
-	skipRepos?: readonly string[];
 }
 /**
  * Most items one dispatch may carry.
@@ -49,6 +36,23 @@ export interface ReviewModeOptions {
  */
 export const BATCH_LIMIT = 25;
 
+/** A contiguous slice of work targeting a single repository. */
+export interface RepositoryWave {
+	readonly repo: string;
+	readonly items: readonly QueueItem[];
+}
+
+export interface WorkbenchBatchProgress {
+	readonly state: "running" | "paused" | "blocked" | "complete";
+	readonly repository: string;
+	readonly wave: number;
+	readonly waves: number;
+	readonly completedItems: number;
+	readonly totalItems: number;
+	readonly runningJobs: number;
+	readonly failedJobs: number;
+}
+
 /** Shape persisted to the session so a resumed session reopens where it left off. */
 export interface PersistedSelection {
 	mode: QueueMode;
@@ -58,11 +62,11 @@ export interface PersistedSelection {
 	hiveOnly?: boolean;
 	hiveLevel?: string;
 	scope?: QueueScope;
+	paused?: boolean;
 }
 
 export class ReviewMode {
 	readonly org: string;
-	readonly stateRoot: string;
 
 	queueMode: QueueMode = "prs";
 	scope: QueueScope;
@@ -77,8 +81,9 @@ export class ReviewMode {
 	fetchedAt = 0;
 	loading = false;
 	selectedKeys = new Set<string>();
+	paused = false;
+	batchProgress?: WorkbenchBatchProgress;
 
-	snapshot: StateSnapshot;
 	hive: HiveSnapshot = EMPTY_HIVE;
 	readonly session = new SessionTrace();
 
@@ -86,16 +91,12 @@ export class ReviewMode {
 	private fetchImpl?: typeof fetch;
 	private env: NodeJS.ProcessEnv;
 	private inflight?: AbortController;
-	/** Hive-ranked keys this scope wanted but GitHub would not resolve. */
-	private hiveMissing = 0;
-	private snapshotSignature = "";
 	private ranked: PrioritizedQueue = { items: [], priorities: new Map(), source: "local", hiveRanked: 0 };
 	skipRepos: Set<string>;
 
 	constructor(options: ReviewModeOptions) {
 		this.org = options.org;
 		this.scope = orgScope(options.org);
-		this.stateRoot = options.stateRoot ?? stateRoot();
 		this.token = options.token;
 		this.fetchImpl = options.fetchImpl;
 		this.env = options.env ?? process.env;
@@ -103,18 +104,13 @@ export class ReviewMode {
 			.split(",")
 			.map((s) => s.trim().toLowerCase())
 			.filter(Boolean);
-		const optionsSkip = (options.skipRepos ?? []).map((s) => s.trim().toLowerCase()).filter(Boolean);
-		this.skipRepos = new Set([...envSkip, ...optionsSkip]);
-		this.snapshot = { root: this.stateRoot, runs: [], reviewEvents: [], landingEvents: [], receipts: new Map() };
+		this.skipRepos = new Set(envSkip);
 	}
 
 	setToken(token: string | undefined): void {
 		this.token = token;
 	}
 
-	hasToken(): boolean {
-		return Boolean(this.token);
-	}
 
 	/** Credential and transport for one-off calls that bypass the queue poll. */
 	tokenOptions(): FetchOptions {
@@ -137,8 +133,6 @@ export class ReviewMode {
 		this.ranked = { items: [], priorities: new Map(), source: "local", hiveRanked: 0 };
 		this.queueError = undefined;
 		this.queueTruncated = false;
-		this.fetchedAt = 0;
-		this.hiveMissing = 0;
 	}
 
 	/** Why this item sits where it sits. */
@@ -166,11 +160,7 @@ export class ReviewMode {
 	 * refetch, a hub poll, a new receipt on disk — ends by calling it.
 	 */
 	reprioritize(now = Date.now()): void {
-		this.ranked = prioritize(this.items, {
-			hive: this.hive,
-			hasFindings: (key) => hasRecordedFindings(this.snapshot, key),
-			now,
-		});
+		this.ranked = prioritize(this.items, { hive: this.hive, now });
 	}
 
 	/**
@@ -260,7 +250,7 @@ export class ReviewMode {
 
 	selectedKey(): string | undefined {
 		const item = this.selected();
-		return item ? queueKey(item.repo, item.id) : undefined;
+		return item ? itemKey(item) : undefined;
 	}
 
 	move(delta: number): void {
@@ -289,9 +279,20 @@ export class ReviewMode {
 		this.cursor = 0;
 		return this.hiveOnly;
 	}
+	setPaused(paused: boolean): void {
+		this.paused = paused;
+	}
+	togglePaused(): boolean {
+		this.paused = !this.paused;
+		return this.paused;
+	}
+	setBatchProgress(progress: WorkbenchBatchProgress | undefined): void {
+		this.batchProgress = progress;
+	}
 	toggleMode(): QueueMode {
 		this.queueMode = this.queueMode === "prs" ? "issues" : "prs";
 		this.items = [];
+		this.cursor = 0;
 		this.selectedKeys.clear();
 		return this.queueMode;
 	}
@@ -324,6 +325,53 @@ export class ReviewMode {
 		for (const item of visible.slice(0, limit)) this.selectedKeys.add(itemKey(item));
 		return this.selectedKeys.size;
 	}
+	/**
+	 * Toggles selection of all visible items in the current selected repository.
+	 * Leaves selections in other repositories untouched.
+	 * Respects global BATCH_LIMIT.
+	 */
+	selectCurrentRepository(limit = BATCH_LIMIT): number {
+		const current = this.selected();
+		if (!current) return this.selectedKeys.size;
+		const repo = current.repo;
+		const repoVisible = this.visibleItems().filter((item) => item.repo === repo);
+		if (repoVisible.length === 0) return this.selectedKeys.size;
+		const allRepoSelected = repoVisible.every((item) => this.selectedKeys.has(itemKey(item)));
+		if (allRepoSelected) {
+			for (const item of repoVisible) {
+				this.selectedKeys.delete(itemKey(item));
+			}
+			return this.selectedKeys.size;
+		}
+		const availableSlots = Math.max(0, limit - this.selectedKeys.size);
+		let added = 0;
+		for (const item of repoVisible) {
+			const key = itemKey(item);
+			if (!this.selectedKeys.has(key)) {
+				if (added >= availableSlots) break;
+				this.selectedKeys.add(key);
+				added += 1;
+			}
+		}
+		return this.selectedKeys.size;
+	}
+
+	/**
+	 * Partition items into contiguous repository waves without moving any item
+	 * ahead of work Hive ranked before it.
+	 */
+	repositoryWaves(items: readonly QueueItem[] = this.chosenItems()): RepositoryWave[] {
+		const waves: Array<{ repo: string; items: QueueItem[] }> = [];
+		for (const item of items) {
+			const previous = waves.at(-1);
+			if (previous?.repo === item.repo) {
+				previous.items.push(item);
+				continue;
+			}
+			waves.push({ repo: item.repo, items: [item] });
+		}
+		return waves;
+	}
 
 	clearSelected(): void {
 		this.selectedKeys.clear();
@@ -334,47 +382,7 @@ export class ReviewMode {
 		return this.visibleItems().filter((item) => this.selectedKeys.has(`${item.repo}#${item.id}`));
 	}
 
-	/**
-	 * Items available for slay execution: visible items first, falling back to
-	 * unranked items in local priority order when no Hive-ranked items exist.
-	 */
-	slayableItems(): QueueItem[] {
-		const chosen = this.chosenItems();
-		if (chosen.length > 0) return chosen;
-		this.refreshState();
-		// A block is only current against the head and activity the queue just read;
-		// without that comparison every blocked item is excluded forever.
-		const actionable = (item: QueueItem) =>
-			!isItemTerminalBlocked(this.snapshot, itemKey(item), { headSha: item.headSha, updatedAt: item.updatedAt });
-		const actionableVisible = this.visibleItems().filter(actionable);
-		if (actionableVisible.length > 0) return actionableVisible;
-		// Fallback: when Hive-only filter leaves 0 items, fall back to unranked items
-		let base = this.ranked.items.length === this.items.length ? this.ranked.items : this.items;
-		if (this.skipRepos.size > 0) {
-			base = base.filter((item) => {
-				const repoLower = item.repo.toLowerCase();
-				const shortName = repoLower.includes("/") ? repoLower.split("/")[1]! : repoLower;
-				return !this.skipRepos.has(repoLower) && !this.skipRepos.has(shortName);
-			});
-		}
-		return base.filter(actionable);
-	}
 
-	/**
-	 * Re-read durable appliance state.
-	 *
-	 * Returns whether anything actually changed, so a poll that finds the same
-	 * bytes does not cost a terminal repaint.
-	 */
-	refreshState(): boolean {
-		this.snapshot = readStateSnapshot(this.stateRoot);
-		const signature = snapshotSignature(this.snapshot);
-		if (signature === this.snapshotSignature) return false;
-		this.snapshotSignature = signature;
-		// Findings are a priority signal, so a new receipt reorders the queue.
-		this.reprioritize();
-		return true;
-	}
 
 	/**
 	 * Ask the hub what the project needs first.
@@ -392,6 +400,10 @@ export class ReviewMode {
 	 */
 	async getHiveKnowledge(signal?: AbortSignal): Promise<string | undefined> {
 		return await fetchHiveKnowledge({ env: this.env, signal, fetchImpl: this.fetchImpl });
+	}
+
+	async getHiveMe(signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
+		return await fetchHiveMe({ env: this.env, signal, fetchImpl: this.fetchImpl });
 	}
 
 	/**
@@ -439,7 +451,7 @@ export class ReviewMode {
 			this.items = [...result.items, ...missing];
 			this.reprioritize();
 			if (previousKey) {
-				const index = this.visibleItems().findIndex((item) => queueKey(item.repo, item.id) === previousKey);
+				const index = this.visibleItems().findIndex((item) => itemKey(item) === previousKey);
 				this.cursor = index >= 0 ? index : Math.min(this.cursor, Math.max(0, this.visibleItems().length - 1));
 			}
 			return result;
@@ -462,20 +474,12 @@ export class ReviewMode {
 		options: FetchOptions,
 		controller: AbortController,
 	): Promise<QueueItem[]> {
-		if (this.inflight !== controller || controller.signal.aborted) return [];
-		if (!this.hive.online) {
-			this.hiveMissing = 0;
-			return [];
-		}
+		if (this.inflight !== controller || controller.signal.aborted || !this.hive.online) return [];
 		const present = new Set(fetched.map(itemKey));
 		const wanted = [...this.hive.ranks.keys()].filter((key) => !present.has(key) && this.inScope(key));
-		if (wanted.length === 0) {
-			this.hiveMissing = 0;
-			return [];
-		}
+		if (wanted.length === 0) return [];
 		const result = await fetchItemsByKey(wanted, this.queueMode, options);
 		if (this.inflight !== controller || controller.signal.aborted) return [];
-		this.hiveMissing = wanted.length - result.items.length;
 		return result.items;
 	}
 
@@ -494,26 +498,9 @@ export class ReviewMode {
 	 */
 	hiveCoverage(): { present: number; total: number } {
 		const total = [...this.hive.ranks.keys()].filter((key) => this.inScope(key)).length;
-		return { present: Math.max(0, total - this.hiveMissing), total };
+		return { present: this.hiveRankedCount(), total };
 	}
 
-	/** Durable pipeline trace for the selected item. */
-	pipelineSpans(now: number): Span[] {
-		const item = this.selected();
-		if (!item) return [];
-		const spans = this.tracePipeline(queueKey(item.repo, item.id), item.title, now);
-		// The root names the one a maintainer acts on: the pull request's own checks.
-		// A run-state failure (workspace mismatch, agent tool, unavailable verification)
-		// is a different class on its own span, so a workspace mismatch never reads as a
-		// PR check failure. Queue status here derives from PR state, not the run log.
-		if (spans[0] && item.ciStatus === "failure") spans[0].cls = "pr-check" as TraceClass;
-		return spans;
-	}
-
-	/** Durable pipeline trace for an arbitrary `owner/repo#number`. */
-	tracePipeline(key: string, title: string, now: number): Span[] {
-		return buildPipelineSpans(key, title, this.snapshot, now);
-	}
 
 	/** CI histogram across the visible queue, for the headline counters. */
 	ciTally(): { success: number; failure: number; pending: number; unknown: number } {
@@ -545,6 +532,7 @@ export class ReviewMode {
 			hiveOnly: this.hiveOnly,
 			hiveLevel: this.hiveLevel,
 			scope: this.scope,
+			paused: this.paused ? true : undefined,
 		};
 	}
 
@@ -558,6 +546,7 @@ export class ReviewMode {
 		if (typeof persisted.hiveOnly === "boolean") this.hiveOnly = persisted.hiveOnly;
 		if (typeof persisted.hiveLevel === "string") this.hiveLevel = persisted.hiveLevel;
 		if (typeof persisted.id === "number") this.selectById(persisted.repo, persisted.id);
+		if (typeof persisted.paused === "boolean") this.paused = persisted.paused;
 	}
 }
 

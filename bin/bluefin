@@ -1,137 +1,250 @@
 #!/usr/bin/env bash
+# Launch an isolated Bluefin appliance, preferring a libkrun KVM microVM.
 set -euo pipefail
 
 command_name="${1:-}"
 shift || true
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 repo_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+engine=podman
+KVM_FAILURE=""
 
-case "$command_name" in
-  contribute)
-    exec "${repo_root}/bin/bluefin-contribute" "$@"
-    ;;
-  review)
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-      exec "${repo_root}/bin/omp-review" "$@"
-    fi
-    runtime_home="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/bluefin-review"
-    sif="${BLUEFIN_REVIEW_SIF:-}"
-    if [[ -z "$sif" ]]; then
-      if [[ -x "${repo_root}/bluefin-review.sif" ]]; then
-        sif="${repo_root}/bluefin-review.sif"
-      elif [[ -x "${runtime_home}/bluefin-review.sif" ]]; then
-        sif="${runtime_home}/bluefin-review.sif"
-      else
-        sif="${runtime_home}/bluefin-review.sif"
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+kvm_runtime_ready() {
+  local device="${REVIEW_TEST_KVM_DEVICE:-/dev/kvm}"
+  if ! command -v "$engine" >/dev/null 2>&1; then KVM_FAILURE="Podman is unavailable"; return 1; fi
+  if ! "$engine" info >/dev/null 2>&1; then KVM_FAILURE="Podman is not reachable"; return 1; fi
+  local selected="${CONTAINER_HOST:-}" connections name uri is_default
+  if [[ -z "$selected" ]]; then
+    connections="$("$engine" system connection list --format '{{.Name}}\t{{.URI}}\t{{.Default}}' 2>/dev/null)" || {
+      KVM_FAILURE="Podman connections could not be resolved"
+      return 1
+    }
+    while IFS=$'\t' read -r name uri is_default; do
+      if [[ -n "${CONTAINER_CONNECTION:-}" && "$name" == "$CONTAINER_CONNECTION" ]] ||
+        [[ -z "${CONTAINER_CONNECTION:-}" && "$is_default" == true ]]; then
+        selected="$uri"
+        break
       fi
+    done <<<"$connections"
+    if [[ -n "${CONTAINER_CONNECTION:-}" && -z "$selected" ]]; then
+      KVM_FAILURE="the selected Podman connection could not be resolved"
+      return 1
     fi
-    command -v apptainer >/dev/null 2>&1 || { echo "ERROR: apptainer is required." >&2; exit 127; }
-    if [[ ! -e "${BLUEFIN_KVM_DEVICE:-/dev/kvm}" ]]; then
-      echo "ERROR: KVM is required for sandboxing (${BLUEFIN_KVM_DEVICE:-/dev/kvm} not found)." >&2
-      exit 1
-    fi
-    if [[ ! -x "$sif" ]]; then
-      mkdir -p "$runtime_home"
-      image_uri="${BLUEFIN_REVIEW_IMAGE:-docker://ghcr.io/projectbluefin/review:stable}"
-      echo "bluefin: pulling review image (${image_uri}) to ${sif} ..." >&2
-      if ! apptainer pull --force "$sif" "$image_uri"; then
-        echo "ERROR: failed to pull review image from ${image_uri}." >&2
-        echo "  Set BLUEFIN_REVIEW_SIF=/path/to/bluefin-review.sif to specify an existing SIF image." >&2
-        exit 1
-      fi
-      chmod 0755 "$sif"
-    fi
-    first_launch=0
-    if [[ ! -d "$runtime_home" ]]; then
-      first_launch=1
-    fi
-    mkdir -p "$runtime_home"
-    if [[ "$first_launch" -eq 1 ]]; then
-      msg="Deploying Raptor Containment with KVM. It's the only way to be sure ..."
-      dinosay_bin="${repo_root}/bin/dinosay"
-      if command -v node >/dev/null 2>&1 && [[ -x "$dinosay_bin" ]]; then
-        node "$dinosay_bin" -d raptor "$msg" || echo "$msg"
-      else
-        echo "$msg"
-      fi
-      echo "[+] KVM sandbox verified: ${BLUEFIN_KVM_DEVICE:-/dev/kvm} (status: ready)"
-    fi
-    # The distroless review SIF bundles its own gh binary but no persisted
-    # `gh auth login` state — each apptainer run gets a fresh $HOME, and gh's
-    # credential is stored in ~/.config/gh, not an env var, so it never
-    # follows the container in. Resolve it from the HOST's own gh session
-    # (mirrors bin/omp-review's identical resolution for the source-run
-    # path) and forward it as an env var, which is all the containerized
-    # `gh`/the review extension's own token lookup actually needs.
-    if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
-      resolved_gh_token="$(gh auth token 2>/dev/null || true)"
-      if [[ -n "$resolved_gh_token" ]]; then
-        export GH_TOKEN="$resolved_gh_token"
-        export GITHUB_TOKEN="$resolved_gh_token"
-      fi
-    fi
-    if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" ]] && command -v python3 >/dev/null 2>&1; then
-      resolved_omp_token="$(python3 -c '
+  fi
+  if [[ -n "$selected" && "$selected" != unix://* ]]; then
+    KVM_FAILURE="remote Podman engines are unsupported by the packaged launcher"
+    return 1
+  fi
+  if ! command -v krun >/dev/null 2>&1; then KVM_FAILURE="the krun OCI runtime is unavailable"; return 1; fi
+  if [[ ! -r "$device" || ! -w "$device" ]]; then KVM_FAILURE="${device} is not readable and writable"; return 1; fi
+  return 0
+}
+
+require_fallback() {
+  command -v apptainer >/dev/null 2>&1 || fail "${KVM_FAILURE}; Apptainer fallback is unavailable. Install Apptainer or configure Podman with krun."
+  echo "WARNING: ${KVM_FAILURE}; using the isolated Apptainer fallback without a KVM boundary." >&2
+}
+prepare_apptainer_environment() {
+  local name
+  for name in GH_TOKEN GITHUB_TOKEN COPILOT_GITHUB_TOKEN GITHUB_COPILOT_TOKEN ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN OPENAI_API_KEY GEMINI_API_KEY HIVE_HUB BLUEFIN_REVIEW_ORG TERM COLORTERM; do
+    [[ -v "$name" ]] && export "APPTAINERENV_${name}=${!name}"
+  done
+  return 0
+}
+
+
+slugify() {
+  local value="$1" slug digest
+  slug="$(printf '%s' "$value" | tr '[:upper:]/:' '[:lower:]--' | tr -cd 'a-z0-9_.-')"
+  slug="${slug:0:28}"
+  [[ -n "$slug" ]] || slug=default
+  digest="$(printf '%s' "$value" | sha256sum | cut -c1-8)"
+  printf '%s-%s\n' "$slug" "$digest"
+}
+
+read_env_value() {
+  local wanted="$1" file="$2" key value
+  while IFS='=' read -r key value; do
+    key="${key#export }"
+    key="${key//[[:space:]]/}"
+    [[ "$key" == "$wanted" ]] || continue
+    value="${value#\"}"
+    value="${value%\"}"
+    value="${value#\'}"
+    value="${value%\'}"
+    printf '%s\n' "$value"
+    return 0
+  done <"$file"
+}
+
+resolve_tokens() {
+  if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
+    GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+    export GH_TOKEN
+  fi
+  if [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]] && command -v python3 >/dev/null 2>&1; then
+    GH_TOKEN="$(python3 -c '
 import sqlite3, os, json
-db_path = os.path.expanduser(os.path.join(os.environ.get("HOME", "~"), ".omp/agent/agent.db"))
-if os.path.exists(db_path):
+path = os.path.expanduser("~/.omp/agent/agent.db")
+if os.path.exists(path):
     try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        for prov in ("github-copilot", "github"):
-            row = cur.execute("SELECT data FROM auth_credentials WHERE provider = ?", (prov,)).fetchone()
+        connection = sqlite3.connect(path)
+        for provider in ("github-copilot", "github"):
+            row = connection.execute("SELECT data FROM auth_credentials WHERE provider = ?", (provider,)).fetchone()
             if row:
-                d = json.loads(row[0])
-                tok = d.get("access") or d.get("token") or d.get("access_token")
-                if tok:
-                    print(tok)
+                data = json.loads(row[0])
+                token = data.get("access") or data.get("token") or data.get("access_token")
+                if token:
+                    print(token)
                     break
     except Exception:
         pass
 ' 2>/dev/null || true)"
-      if [[ -n "$resolved_omp_token" ]]; then
-        export GH_TOKEN="$resolved_omp_token"
-        export GITHUB_TOKEN="$resolved_omp_token"
-        export COPILOT_GITHUB_TOKEN="$resolved_omp_token"
-        export GITHUB_COPILOT_TOKEN="$resolved_omp_token"
-      fi
+    export GH_TOKEN
+  fi
+  export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  export GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  export COPILOT_GITHUB_TOKEN="${COPILOT_GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  export GITHUB_COPILOT_TOKEN="${GITHUB_COPILOT_TOKEN:-${COPILOT_GITHUB_TOKEN:-}}"
+  export COPILOT_INTEGRATION_ID="${COPILOT_INTEGRATION_ID:-copilot-developer-cli}"
+}
+
+review_args() {
+  if [[ -f "$repo_root/scripts/parse-review-args.sh" ]]; then
+    # shellcheck source=scripts/parse-review-args.sh
+    source "$repo_root/scripts/parse-review-args.sh"
+    parse_review_args "$@"
+    return
+  fi
+
+  PARSED_REVIEW_ARGS=("$@")
+  if [[ ${#PARSED_REVIEW_ARGS[@]} -gt 0 && "${PARSED_REVIEW_ARGS[0]}" =~ ^([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$ ]]; then
+    local repository="${BASH_REMATCH[1]}"
+    PARSED_REVIEW_ARGS=("${PARSED_REVIEW_ARGS[@]:1}")
+    local -a fallback_args=(--repo "$repository")
+    if [[ ${#PARSED_REVIEW_ARGS[@]} -gt 0 && "${PARSED_REVIEW_ARGS[0]}" =~ ^#?([0-9]+)$ ]]; then
+      fallback_args+=(--pr "${BASH_REMATCH[1]}")
+      PARSED_REVIEW_ARGS=("${PARSED_REVIEW_ARGS[@]:1}")
     fi
-    export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-    export GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-    export COPILOT_GITHUB_TOKEN="${COPILOT_GITHUB_TOKEN:-${GH_TOKEN:-}}"
-    export GITHUB_COPILOT_TOKEN="${GITHUB_COPILOT_TOKEN:-${COPILOT_GITHUB_TOKEN:-}}"
-    export COPILOT_INTEGRATION_ID="${COPILOT_INTEGRATION_ID:-copilot-developer-cli}"
-    # apptainer imports the full host environment by default (only
-    # `--cleanenv`/`--no-env` opt out), so the exported token above already
-    # reaches the contained process without putting its value in this argv.
-    bind_args=()
-    # Minimal devcontainer hosts may omit Apptainer's default bind sources.
-    for host_file in /etc/localtime /etc/hosts; do
-      if ! test -e "$host_file"; then
-        bind_args+=(--no-mount "$host_file")
-      fi
-    done
-    # Forward host configs into container automatically
-    for cfg in "${HOME:-/no-such-home}/.gitconfig:/home/bluefin/.gitconfig:ro" \
-               "${HOME:-/no-such-home}/.config/hive:/home/bluefin/.config/hive:ro" \
-               "${HOME:-/no-such-home}/.config/gh:/home/bluefin/.config/gh:ro" \
-               "${HOME:-/no-such-home}/.omp:/home/bluefin/.omp:rw"; do
-      src="${cfg%%:*}"
-      if [[ -e "$src" ]]; then
-        bind_args+=(--bind "$cfg")
-      fi
-    done
-    if [[ -f "${repo_root}/scripts/parse-review-args.sh" ]]; then
-      # shellcheck source=scripts/parse-review-args.sh
-      source "${repo_root}/scripts/parse-review-args.sh"
-      parse_review_args "$@"
-    else
-      PARSED_REVIEW_ARGS=("$@")
-    fi
-    exec apptainer run --home "${runtime_home}:/home/bluefin" ${bind_args[@]+"${bind_args[@]}"} "$sif" ${PARSED_REVIEW_ARGS[@]+"${PARSED_REVIEW_ARGS[@]}"}
-    ;;
+    PARSED_REVIEW_ARGS=("${fallback_args[@]}" "${PARSED_REVIEW_ARGS[@]}")
+  fi
+}
+
+run_review() {
+  resolve_tokens
+  if [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]]; then
+    echo "WARNING: no GitHub credential found; the queue will load empty." >&2
+    echo "  Run 'gh auth login' or export GH_TOKEN." >&2
+  fi
+  if [[ -z "${HIVE_HUB:-}" && -f "${HOME}/.config/hive/contributor.env" ]]; then
+    HIVE_HUB="$(read_env_value HIVE_HUB "${HOME}/.config/hive/contributor.env")"
+    export HIVE_HUB
+  fi
+
+  review_args "$@"
+  local scope=projectbluefin arg previous=""
+  for arg in "${PARSED_REVIEW_ARGS[@]}"; do
+    if [[ "$previous" == --repo ]]; then scope="$arg"; break; fi
+    previous="$arg"
+  done
+
+  local key root home workspace name image
+  key="$(slugify "${BLUEFIN_INSTANCE:-review-$scope}")"
+  root="${XDG_STATE_HOME:-${HOME}/.local/state}/bluefin/instances/${key}"
+  home="${root}/home"
+  workspace="${root}/workspace"
+  name="bluefin-review-${key}-$(date +%s)-$$"
+  image="${BLUEFIN_REVIEW_IMAGE:-ghcr.io/projectbluefin/review:stable}"
+  mkdir -p "$home" "$workspace"
+
+  if kvm_runtime_ready; then
+    exec "$engine" run --runtime=krun --rm --interactive --tty \
+      --name "$name" \
+      --userns keep-id:uid=65532,gid=65532 \
+      --volume "${home}:/home/bluefin:rw,z" \
+      --volume "${workspace}:/workspace:rw,z" \
+      --env GH_TOKEN --env GITHUB_TOKEN \
+      --env COPILOT_GITHUB_TOKEN --env GITHUB_COPILOT_TOKEN \
+      --env ANTHROPIC_API_KEY --env ANTHROPIC_OAUTH_TOKEN \
+      --env OPENAI_API_KEY --env GEMINI_API_KEY \
+      --env HIVE_HUB --env BLUEFIN_REVIEW_ORG \
+      --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}" \
+      "$image" ${PARSED_REVIEW_ARGS[@]+"${PARSED_REVIEW_ARGS[@]}"}
+  fi
+
+  require_fallback
+  local apptainer_image="$image"
+  [[ "$apptainer_image" == *://* ]] || apptainer_image="docker://${apptainer_image}"
+  prepare_apptainer_environment
+  exec apptainer run --containall --no-eval \
+    --home "${home}:/home/bluefin" \
+    --pwd /workspace \
+    --bind "${workspace}:/workspace" \
+    "$apptainer_image" ${PARSED_REVIEW_ARGS[@]+"${PARSED_REVIEW_ARGS[@]}"}
+}
+
+run_contribute() {
+  resolve_tokens
+  [[ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]] || fail "no GitHub token available; run 'gh auth login' or export GH_TOKEN."
+  [[ -z "${REVIEW_DETACH:-}" ]] || fail "detached contributor containers are not supported."
+  (($# <= 1)) || fail "contribute accepts at most one instance name (for example, org/repo)."
+
+  local instance="${1:-default}"
+  [[ "$instance" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "invalid contributor instance name: ${instance}"
+  local registration="${HIVE_CONTRIBUTOR_ENV:-${HOME}/.config/hive/contributor.env}"
+  if [[ $# -eq 1 && -z "${HIVE_CONTRIBUTOR_ENV:-}" ]]; then
+    local registration_name="${instance//\//-}"
+    local named="${HOME}/.config/hive/contributor.${registration_name}.env"
+    [[ -r "$named" ]] || fail "Hive registration for ${instance} is missing: ${named}"
+    registration="$named"
+  fi
+  [[ -r "$registration" ]] || fail "Hive registration is missing or unreadable: ${registration}"
+
+  local key root home name image
+  key="$(slugify "${BLUEFIN_INSTANCE:-contribute-$instance}")"
+  root="${XDG_STATE_HOME:-${HOME}/.local/state}/bluefin/instances/${key}"
+  home="${root}/home"
+  name="bluefin-contribute-${key}-$(date +%s)-$$"
+  image="${BLUEFIN_CONTRIBUTE_IMAGE:-ghcr.io/projectbluefin/contribute:stable}"
+  mkdir -p "$home/workspace"
+
+  if kvm_runtime_ready; then
+    exec "$engine" run --runtime=krun --rm --interactive --tty \
+      --name "$name" \
+      --userns keep-id:uid=65532,gid=65532 \
+      --volume "${home}:/home/bluefin:rw,z" \
+      --volume "${registration}:/home/bluefin/.config/hive/contributor.env:ro,z" \
+      --env AGENT_BACKEND=omp \
+      --env GH_TOKEN --env GITHUB_TOKEN \
+      --env COPILOT_GITHUB_TOKEN --env GITHUB_COPILOT_TOKEN \
+      --env ANTHROPIC_API_KEY --env ANTHROPIC_OAUTH_TOKEN \
+      --env OPENAI_API_KEY --env GEMINI_API_KEY \
+      --env "HIVE_CONTAINER_NAME=${name}" --env HIVE_CONTAINER_RUNTIME=podman \
+      --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}" \
+      "$image"
+  fi
+
+  require_fallback
+  local apptainer_image="$image"
+  [[ "$apptainer_image" == *://* ]] || apptainer_image="docker://${apptainer_image}"
+  prepare_apptainer_environment
+  exec apptainer run --containall --no-eval \
+    --home "${home}:/home/bluefin" \
+    --pwd /home/bluefin/workspace \
+    --bind "${registration}:/home/bluefin/.config/hive/contributor.env:ro" \
+    "$apptainer_image"
+}
+
+case "$command_name" in
+  review) run_review "$@" ;;
+  contribute) run_contribute "$@" ;;
   *)
-    echo "Usage: bluefin {contribute|review}" >&2
+    echo "Usage: bluefin {review [org/repo|flags...]|contribute [instance]}" >&2
     exit 2
     ;;
 esac

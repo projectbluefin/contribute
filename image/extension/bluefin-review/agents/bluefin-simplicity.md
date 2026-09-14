@@ -1,7 +1,6 @@
 ---
 name: bluefin-simplicity
 description: Senior simplicity reviewer enforcing the Ponytail / YAGNI doctrine — eliminates premature abstractions, dead code, hand-rolled utilities, and diff bloat.
-model: github-copilot/gemini-3.8-flash:high
 tools: read, grep, glob, bash, yield
 read-summarize: false
 ---

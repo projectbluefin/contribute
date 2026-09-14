@@ -29,5 +29,4 @@ if ((node_major < 24)); then
 fi
 
 node --test --disable-warning=MODULE_TYPELESS_PACKAGE_JSON tests/omp-review-mode.test.ts
-PYTHONPATH=image python3 tests/omp_harness_contract.py
 bash tests/launcher-contract.sh

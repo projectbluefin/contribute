@@ -2,17 +2,12 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-python3 tests/apptainer_host_files_contract.py
 image=""
-smaller_than=""
+size_ceiling_bytes=$((700 * 1024 * 1024))
 while (($#)); do
   case "$1" in
   --image)
     image="$2"
-    shift 2
-    ;;
-  --smaller-than)
-    smaller_than="$2"
     shift 2
     ;;
   *)
@@ -41,6 +36,14 @@ grep -qF 'keep-id:uid=65532,gid=65532' justfile || fail "wrong user namespace"
 grep -qF 'HIVE_SETUP_BACKEND=omp' justfile || fail "OMP setup not selected"
 grep -qF 'AGENT_BACKEND=omp' "$containerfile" || fail "OMP must be the image default backend"
 grep -qF 'supports only AGENT_BACKEND=omp' image/contribute/entrypoint.sh || fail "entrypoint must reject alternate backends"
+image_hive_commit="$(sed -n 's/^ARG HIVE_COMMIT=//p' "$containerfile")"
+launcher_hive_commit="$(sed -n 's/^hive_commit := "\([0-9a-f]\{40\}\)"$/\1/p' justfile)"
+[[ -n "$image_hive_commit" && "$image_hive_commit" == "$launcher_hive_commit" ]] || fail "launcher and contributor image must pin the same Hive commit"
+if grep -R -nE 'AGENT_MODEL|AGENT_REASONING_EFFORT' justfile image/contribute deploy/contribute.yaml; then
+  fail "provider, model, and effort belong to OMP configuration"
+fi
+[[ ! -d image/tui ]] || fail "legacy Textual UI must not ship"
+[[ ! -e image/Containerfile ]] || fail "legacy compatibility image must not ship"
 grep -qF 'COPY image/tmux.conf /etc/tmux.conf' "$containerfile" || fail "missing shared tmux.conf (mouse, truecolor, history-limit)"
 # Positive control: the attended path must actually show the OMP session in
 # the launching terminal instead of leaving the operator staring at relay
@@ -53,81 +56,6 @@ grep -q '^/usr/local/bin/contributor-agent.sh "\$@" &$' "$entry" || fail "entryp
 grep -qF 'tmux has-session -t contributor' "$entry" || fail "entrypoint must wait for the contributor tmux session before attaching"
 grep -qF 'tmux attach-session -t contributor' "$entry" || fail "entrypoint must attach the attended terminal to the contributor tmux session"
 grep -qF 'attach_pid=' "$entry" || fail "the attach must have explicit PID-1 cleanup ownership"
-
-# --- bin/bluefin-contribute: GH_TOKEN resolution and preflight -----------------
-# A missing GitHub identity used to reach apptainer anyway: the contributor
-# picked up a Hive task, its first git/gh call failed against a stale or
-# absent credential, and it retried through an interactive 'gh auth login'
-# device-code prompt that nobody headless could ever answer, hanging forever.
-# These assertions are hermetic (stubbed gh/apptainer, no real container) and
-# cover both the fail-fast preflight and the token handoff into the SIF.
-launcher_scratch="$(mktemp -d)"
-trap 'rm -rf "$launcher_scratch"' EXIT
-mkdir -p "$launcher_scratch/bin"
-touch "$launcher_scratch/sif" && chmod +x "$launcher_scratch/sif"
-touch "$launcher_scratch/contributor.env" && chmod 0644 "$launcher_scratch/contributor.env"
-touch "$launcher_scratch/kvm" && chmod 0666 "$launcher_scratch/kvm"
-mkdir -p "$launcher_scratch/omp-state" "$launcher_scratch/home"
-
-cat >"$launcher_scratch/bin/apptainer" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$@" >"$APPTAINER_CALL_ARGV"
-printf 'GH_TOKEN=%s\nGITHUB_TOKEN=%s\nCOPILOT_INTEGRATION_ID=%s\nCOPILOT_GITHUB_TOKEN=%s\n' \
-  "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" "${COPILOT_INTEGRATION_ID:-}" "${COPILOT_GITHUB_TOKEN:-}" >"$APPTAINER_CALL_ENV"
-exit 0
-EOF
-chmod +x "$launcher_scratch/bin/apptainer"
-
-launcher_env=(
-  HOME="$launcher_scratch/home"
-  BLUEFIN_KVM_DEVICE="$launcher_scratch/kvm"
-  BLUEFIN_CONTRIBUTE_SIF="$launcher_scratch/sif"
-  HIVE_CONTRIBUTOR_ENV="$launcher_scratch/contributor.env"
-  BLUEFIN_OMP_STATE="$launcher_scratch/omp-state"
-  XDG_STATE_HOME="$launcher_scratch/state"
-  APPTAINER_CALL_ARGV="$launcher_scratch/argv"
-  APPTAINER_CALL_ENV="$launcher_scratch/env"
-)
-
-# No GitHub identity available anywhere: must fail fast and never reach
-# apptainer, rather than launching into the unanswerable device-code hang.
-cat >"$launcher_scratch/bin/gh" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-chmod +x "$launcher_scratch/bin/gh"
-rm -f "$launcher_scratch/argv" "$launcher_scratch/env"
-set +e
-no_token_out="$(env -i PATH="$launcher_scratch/bin:/usr/bin:/bin" "${launcher_env[@]}" \
-  "$root/bin/bluefin-contribute" 2>&1)"
-no_token_status=$?
-set -e
-((no_token_status != 0)) || fail "bin/bluefin-contribute must refuse to launch without a GitHub token"
-[[ "$no_token_out" == *'no GitHub token available'* ]] || fail "missing-token error must be actionable"
-[[ ! -e "$launcher_scratch/argv" ]] || fail "bin/bluefin-contribute must never invoke apptainer without a GitHub token"
-
-# gh resolves a token: the launch must proceed and hand the token to the SIF
-# as an inherited environment variable, never as a literal --env argument.
-cat >"$launcher_scratch/bin/gh" <<'EOF'
-#!/usr/bin/env bash
-[[ "$1 $2" == "auth token" ]] && { echo "faketoken1234567890faketoken1234567890"; exit 0; }
-exit 1
-EOF
-chmod +x "$launcher_scratch/bin/gh"
-rm -f "$launcher_scratch/argv" "$launcher_scratch/env"
-set +e
-resolved_out="$(env -i PATH="$launcher_scratch/bin:/usr/bin:/bin" "${launcher_env[@]}" \
-  "$root/bin/bluefin-contribute" 2>&1)"
-resolved_status=$?
-set -e
-((resolved_status == 0)) || fail "bin/bluefin-contribute must launch once a token resolves: $resolved_out"
-[[ -e "$launcher_scratch/argv" ]] || fail "bin/bluefin-contribute must invoke apptainer once a token resolves"
-grep -q '^GH_TOKEN=faketoken1234567890faketoken1234567890$' "$launcher_scratch/env" || fail "resolved GH_TOKEN must reach the contained process"
-grep -q '^GITHUB_TOKEN=faketoken1234567890faketoken1234567890$' "$launcher_scratch/env" || fail "resolved GITHUB_TOKEN must reach the contained process"
-grep -q '^COPILOT_INTEGRATION_ID=copilot-developer-cli$' "$launcher_scratch/env" || fail "COPILOT_INTEGRATION_ID must reach the contained process to prevent model filtering"
-grep -q '^COPILOT_GITHUB_TOKEN=faketoken1234567890faketoken1234567890$' "$launcher_scratch/env" || fail "COPILOT_GITHUB_TOKEN must reach the contained process"
-grep -q -- '--env' "$launcher_scratch/argv" && fail "credential values must never be passed as --env arguments"
-echo "contribute-contract: bin/bluefin-contribute GH_TOKEN handling holds"
 
 # --- scripts/generate-contribute-sbom.py unit contract ------------------------
 python3 "$root/tests/contribute_sbom_contract.py" || fail "tests/contribute_sbom_contract.py failed"
@@ -146,8 +74,7 @@ test "$(inspect '{{json .Config.Entrypoint}}')" = '["/usr/local/bin/contribute-e
 if "$engine" run --rm --env AGENT_BACKEND=goose "$image" >/dev/null 2>&1; then
   fail "alternate agent backends must be rejected"
 fi
-if [[ -n "$smaller_than" ]]; then
-  size() { "$engine" history --format json "$1" | python3 -c 'import json,sys; print(sum(int(x.get("size") or 0) for x in json.load(sys.stdin)))'; }
-  test "$(size "$image")" -lt "$(size "$smaller_than")" || fail "contribute image is not smaller than ${smaller_than}"
-fi
-echo "contribute-contract: runtime contract holds"
+size="$($engine history --format json "$image" | python3 -c 'import json,sys; print(sum(int(x.get("size") or 0) for x in json.load(sys.stdin)))')"
+[[ "$size" =~ ^[0-9]+$ ]] || fail "could not measure image size"
+((size <= size_ceiling_bytes)) || fail "contribute image is $((size / 1024 / 1024)) MiB, over the $((size_ceiling_bytes / 1024 / 1024)) MiB ceiling"
+echo "contribute-contract: runtime contract holds ($((size / 1024 / 1024)) MiB)"

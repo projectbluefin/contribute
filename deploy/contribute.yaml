@@ -35,8 +35,6 @@ spec:
           image: ghcr.io/projectbluefin/contribute:stable
           imagePullPolicy: Always
           env:
-            - name: AGENT_BACKEND
-              value: omp
             - name: GH_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -48,6 +46,30 @@ spec:
                 secretKeyRef:
                   name: contribute-secret
                   key: GITHUB_COPILOT_TOKEN
+                  optional: true
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: contribute-secret
+                  key: ANTHROPIC_API_KEY
+                  optional: true
+            - name: ANTHROPIC_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: contribute-secret
+                  key: ANTHROPIC_OAUTH_TOKEN
+                  optional: true
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: contribute-secret
+                  key: OPENAI_API_KEY
+                  optional: true
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: contribute-secret
+                  key: GEMINI_API_KEY
                   optional: true
           resources:
             requests: {cpu: "500m", memory: "1Gi"}
