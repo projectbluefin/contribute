@@ -1,5 +1,5 @@
 #!/usr/bin/bash
-# The SIF is an immutable appliance: omp configuration that makes sense on a
+# The image is an immutable appliance: omp configuration that makes sense on a
 # developer workstation must not silently become appliance startup policy.
 set -eu
 
@@ -15,7 +15,7 @@ case "${1:-}" in
 update)
   cat >&2 <<'EOF'
 Bluefin Review is an immutable appliance and cannot update itself.
-Replace the SIF with the newer release asset, or pull a newer container image.
+Pull a newer container image and launch it to update.
 EOF
   exit 2
   ;;
@@ -28,7 +28,7 @@ EOF
   cat <<'EOF'
 
 Appliance lifecycle:
-  This image/SIF is immutable. Replace it to update; `omp update` is disabled.
+  This image is immutable. Replace it to update; `omp update` is disabled.
   Host OMP profiles and their MCP servers are isolated by default. Set
   BLUEFIN_REVIEW_INHERIT_OMP_CONFIG=1 to explicitly use the host `review` profile.
 EOF

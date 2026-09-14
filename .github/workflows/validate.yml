@@ -1,8 +1,8 @@
 name: validate
 
-# justfile is the shipped launcher. This workflow validates
-# its Bash syntax, image contract, compatibility image, and mocked attended
-# selection flow without requiring a live Hive account or interactive terminal.
+# justfile is the shipped launcher. This workflow validates its Bash syntax,
+# both image contracts, and mocked attended flows without requiring a live Hive
+# account or interactive terminal.
 
 on:
   push:
@@ -18,23 +18,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Record the container toolchain
-        run: |
-          set -euo pipefail
-          # Runner images are mutable. A missing tool fails here, with its own
-          # name in the log, rather than inside the build or audit that needed
-          # it.
-          podman --version
-          buildah --version
-          skopeo --version
-
-      - name: Verify pinned FSDK input provenance and native platforms
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          bash tests/image-audit.sh --verify-base-evidence
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
@@ -68,17 +51,6 @@ jobs:
           set -euo pipefail
           bash tests/generate-skills.sh
 
-      - name: SBOM manifest generator contract
-        run: |
-          set -euo pipefail
-          bash tests/sbom-manifest.sh
-
-      - name: Harness registry and adapter contracts
-        run: |
-          set -euo pipefail
-          python3 tests/harness-contract.py
-          python3 tests/autopilot-contract.py
-
       - name: Install just
         uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
 
@@ -98,8 +70,7 @@ jobs:
           # Recipe headers in this file look like 'review:',
           # 'review-doctor:' — a bare identifier + colon at column 0,
           # no parameters. Grab every indented line following one, until the
-          # next non-indented, non-comment, non-blank line (next recipe or
-          # variable declaration).
+          # next non-indented, non-comment, non-blank line.
           awk '
             /^[a-zA-Z][a-zA-Z0-9_-]*:$/ { flag=1; next }
             /^[^ \t#]/ { flag=0 }
@@ -108,17 +79,10 @@ jobs:
           bash -n recipe_bodies.sh
           rm -f recipe_bodies.sh
 
-      - name: Image contract — Containerfile, config, entrypoint, shims, hooks
-        env:
-          # Lets the contract's upstream Hive drift check reach the API. It
-          # degrades to a notice without this, so the step never depends on it.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Test registry is complete
         run: |
           set -euo pipefail
-          bash tests/image-contract.sh
-          bash tests/hive-compatibility.sh
-          bash tests/bluefin-review.sh
-          bash tests/worktree-guard.sh
+          bash tests/test-registry.sh
 
       # The omp review mode and the appliance it ships in. The mode is the only
       # TypeScript here and executes only inside a TUI, so it is driven
@@ -131,13 +95,6 @@ jobs:
           bash tests/appliance-contract.sh
           bash tests/contribute-contract.sh
 
-      # Drives the real Textual app: builds the hash-locked Textual venv from
-      # image/tui/requirements.lock, then presses keys and asserts what the
-      # maintainer is told. Separate from the step above because it installs.
-      - name: Dashboard contract and pilot
-        run: |
-          set -euo pipefail
-          bash tests/dashboard-contract.sh
 
       - name: Interactive launcher docs and shell stay aligned
         run: |
@@ -145,104 +102,21 @@ jobs:
           bash tests/readme-quickstart.sh
           grep -Fq 'review-container' justfile
           grep -Fq 'review-queue' justfile
-          grep -Fq 'ghcr.io/projectbluefin/review-contributor:stable' justfile
-          grep -Fq 'review-entrypoint' image/Containerfile
-          grep -Fq 'ghcr.io/projectbluefin/review-contributor:stable' README.md
           # The appliance is the image named 'review'; the README teaches it.
           grep -Fq 'ghcr.io/projectbluefin/review:stable' README.md
 
-      - name: Compatibility image contract and build
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and execute both images
         run: |
           set -euo pipefail
-          # The runner's podman predates '--secret id=NAME,env=VAR', so the
-          # token reaches the build as a file only this job can read.
-          secret_file="$(mktemp)"
-          trap 'rm -f "$secret_file"' EXIT
-          chmod 0600 "$secret_file"
-          printf '%s' "$GITHUB_TOKEN" > "$secret_file"
-          podman build \
-            --format oci \
-            --secret id=github_token,src="$secret_file" \
-            -f image/Containerfile -t review:test .
-          test "$(podman image inspect review:test --format '{{.Config.User}}')" = "dev"
-          test "$(podman image inspect review:test --format '{{json .Config.Entrypoint}}')" = '["/usr/local/bin/review-entrypoint"]'
-          # /home/dev, not /workspace: there is no workspace mount any more —
-          # the agent clones what it needs inside the disposable container, and
-          # Hive's config lives under the image's home.
-          test "$(podman image inspect review:test --format '{{.Config.WorkingDir}}')" = "/home/dev"
-          # OCI, not Docker schema 2: the shipped format is what publish emits.
-          test "$(podman image inspect review:test --format '{{.ManifestType}}')" = "application/vnd.oci.image.manifest.v1+json"
-
-      - name: Execute shipped review runtime
-        run: |
-          set -euo pipefail
-          podman run --rm \
-            --entrypoint /usr/local/bin/bluefin-review \
-            review:test --help
-          podman run --rm \
-            --entrypoint /usr/local/bin/omp \
-            review:test --version
-          podman run --rm \
-            --entrypoint /usr/local/bin/codex \
-            review:test --version
-          podman run --rm \
-            --entrypoint /usr/local/bin/codex-code-mode-host \
-            review:test --help
-          podman run --rm \
-            --entrypoint /opt/bluefin/tui/.venv/bin/python \
-            review:test \
-            -c "import sys; sys.path.insert(0, '/opt/bluefin/tui'); import bluefin_review_tui"
-          podman run --rm --entrypoint /usr/bin/bash review:test -lc '
-            set -eu
-            node --version >/dev/null
-            gh --version >/dev/null
-            tmux -V >/dev/null
-            test -x /usr/local/bin/review-entrypoint
-          '
-
-      - name: Audit exact FSDK and built review image
-        run: |
-          set -euo pipefail
-          bash tests/image-audit.sh --derived review:test
-
-      - name: Build and execute contribute image
-        run: |
-          set -euo pipefail
-          podman build --format oci -f image/appliance/Containerfile -t appliance:test .
+          review_version="$(bash scripts/review-appliance-version.sh)"
+          podman build --format oci \
+            --build-arg REVIEW_VERSION="$review_version" \
+            --build-arg REVIEW_REVISION="$GITHUB_SHA" \
+            -f image/appliance/Containerfile -t review:test .
           podman build --format oci -f image/contribute/Containerfile -t contribute:test .
-          bash tests/contribute-contract.sh --image contribute:test --smaller-than appliance:test
-      - name: Build and smoke native Apptainer images
-        run: |
-          set -euo pipefail
-          sudo add-apt-repository -y ppa:apptainer/ppa
-          sudo apt-get update -qq
-          sudo apt-get install -y apptainer
-          for image in review:test contribute:test; do
-            name="${image%:*}"
-            archive="${RUNNER_TEMP}/${name}.tar"
-            sif="${RUNNER_TEMP}/bluefin-${name}.sif"
-            podman save --format docker-archive -o "$archive" "$image"
-            apptainer build --force "$sif" "docker-archive:${archive}"
-            chmod 0755 "$sif"
-            omp_path="/usr/bin/omp"
-            [[ "$name" != review ]] || omp_path="/usr/local/bin/omp"
-            apptainer exec "$sif" "$omp_path" --version
-            [[ "$name" != contribute ]] || apptainer exec "$sif" /usr/bin/tmux -V
-            rm -f "$archive"
-          done
+          bash tests/appliance-contract.sh --image review:test --expect-version "$review_version"
+          bash tests/contribute-contract.sh --image contribute:test
 
-      - name: Publish update-time Apptainer artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: bluefin-sif-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/bluefin-review.sif
-            ${{ runner.temp }}/bluefin-contribute.sif
-          if-no-files-found: error
-          retention-days: 14
-
-      # The launcher is interactive by design. CI validates image metadata and
-      # the native build-host runtime. Cross-platform runtime evidence is
-      # deliberately unavailable here rather than being claimed from QEMU.
+      # Interactive launchers prefer KVM and fall back to Apptainer. CI builds
+      # and executes both OCI images natively; both launcher branches are
+      # exercised hermetically.

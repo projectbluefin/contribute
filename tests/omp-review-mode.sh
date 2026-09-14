@@ -28,6 +28,5 @@ if ((node_major < 24)); then
   exit 1
 fi
 
-node --test --disable-warning=MODULE_TYPELESS_PACKAGE_JSON tests/omp-review-mode.test.ts
-PYTHONPATH=image python3 tests/omp_harness_contract.py
+node --test --disable-warning=MODULE_TYPELESS_PACKAGE_JSON tests/omp-review-mode.test.ts tests/blueberry_mode.test.ts tests/pr_reader.test.ts
 bash tests/launcher-contract.sh

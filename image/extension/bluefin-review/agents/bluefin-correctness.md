@@ -1,7 +1,6 @@
 ---
 name: bluefin-correctness
 description: Specialized correctness and systems logic reviewer — analyzes diffs for functional defects, runtime errors, silent error paths, concurrency hazards, and broken invariants.
-model: github-copilot/gemini-3.8-flash:high
 tools: read, grep, glob, bash, yield
 read-summarize: false
 ---

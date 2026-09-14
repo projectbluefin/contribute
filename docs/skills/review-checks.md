@@ -1,85 +1,57 @@
 ---
 name: review-checks
-version: "1.1"
-last_updated: 2026-09-09
+version: "2.0"
+last_updated: 2026-09-14
 id: review-checks
-one_line_purpose: Maintain the five review check specifications and consolidated review scope.
+one_line_purpose: Maintain the OMP workbench review agents and policy seam.
 entry_point: docs/skills/review-checks.md
 category: ci-ops
 status: active
-tags: [checks, review, subagents, doctrine]
-description: "Maintains the five image-owned review check definitions (bluefin-doctrine, security, correctness, test-coverage, simplicity) and review scope. Use when changing review checks or review doctrine."
+tags: [checks, review, subagents, doctrine, omp]
+description: "Maintains the review agents shipped by the OMP workbench. Use when changing review doctrine, specialist responsibilities, or orchestration prompts."
 metadata:
   type: reference
-  context7-sources: [/addyosmani/agent-skills]
+  context7-sources: []
 ---
 
-# Review Checks
+# Review Agents
 
-> The container ships five specialized review check definitions under
-> `/opt/bluefin/review-scope/.agents/checks/`. They are folded into a single consolidated prompt.
+The appliance ships companion agent definitions under
+`image/extension/bluefin-review/agents/`. OMP discovers and runs them directly;
+there is no Python harness, consolidated review-scope overlay, or alternate
+backend adapter.
 
-## When to Use
+## Agents
 
-Load this when editing, adding, or evaluating review check definitions in
-`image/review-scope/checks/`.
+- `bluefin-doctrine`: repository policy and project-specific invariants.
+- `bluefin-correctness`: observable correctness and failure behavior.
+- `bluefin-security`: trust boundaries, credentials, and unsafe mutations.
+- `bluefin-test-coverage`: valuable behavioral coverage and missing regressions.
+- `bluefin-simplicity`: duplication, dead machinery, and avoidable complexity.
+- `bluefin-ci-triage`: live CI failure analysis.
+- `bluefin-queue-triage`: Hive-ordered queue analysis.
+- `bluefin-reviewer`: coordinates the specialist findings into a human-facing
+  review draft.
 
-## When Not to Use
+Keep generic Hive queue mechanics out of these files. Bluefin vocabulary and
+policy belong here or in `policy.ts`; OMP owns agent execution and workflowz.
 
-Do not load this for maintainer TUI cockpit navigation (`review-dashboard.md`).
+## Rules
 
-## The Five Specialized Checks
-
-The review scope deploys five distinct check subagents:
-
-| Check | Responsibility |
-|---|---|
-| `bluefin-doctrine` | Enforces claimed scope, repository conventions, reviewable sizing, and consistency across implementation, tests, and durable documentation. |
-| `security` | Detects high-confidence exploitable vulnerabilities, unsafe operations, credential leaks, and privilege-boundary failures. |
-| `correctness` | Finds functional defects, silent error paths, boundary mistakes, concurrency hazards, and resource leaks. |
-| `test-coverage` | Flags changed behavior lacking deterministic regression, negative, boundary, fidelity, or isolation test coverage. |
-| `simplicity` | Enforces the Ponytail / YAGNI doctrine: flags premature abstractions, dead code, hand-rolled standard tools, and diff bloat. |
-
-## Review Scope and Prompt Consolidation
-
-1. Unlike older orchestrators that spawned concurrent subprocesses per check
-   file, current backends (Codex and OMP) use a consolidated single-pass review.
-2. `image/bin/bluefin-review`'s `run_review()` and `review_instructions()` (and
-   `image/tui/review_receipt.py`'s `_review_scope_doctrine()`) read
-   `/opt/bluefin/review-scope/.agents/REVIEW.md` and all `.agents/checks/*.md`
-   definitions directly and fold their text into one consolidated prompt sent
-   to the selected backend.
-3. This architecture change replaces subprocess orchestration with a single
-   evidenced review pass that evaluates all five check criteria against the
-   diff in unified context.
-4. Bluefin review doctrine is supplied without modifying the target repository
-   checkout.
-5. In the maintainer cockpit, evidenced findings are remediated through
-   `[$]` (slay), which dispatches the fixer behind its typed gate and
-   durable run record.
-
-## Core Process
-
-1. Author each check with clear, non-overlapping evaluation criteria.
-2. Mandate concrete file and line citations for every reported finding.
-3. Require evidence-first reporting: state what could not be verified.
-4. Keep check prompts focused so subagent token windows remain lean.
-
-## Common Rationalizations
-
-| Rationalization | Reality |
-|---|---|
-| "Checks should run as separate background agents." | A single consolidated prompt evaluates all criteria in unified context without the overhead of external subprocess orchestration. |
-| "Style issues belong in checks." | Linters handle style. Review checks focus on high-confidence correctness, security, and doctrine. |
-## Red Flags
-
-- Omitting check files from container builds.
-- Checks that produce unevidenced recommendations without line citations.
-- Modifying repository-local files to inject check doctrine.
+1. Agent definitions omit provider, model, and effort. OMP resolves the user's
+   active choice for every companion agent.
+2. Review agents read evidence and return findings. They never approve or merge.
+3. The coordinator must preserve specialist evidence and surface uncertainty;
+   it must not turn absence of evidence into approval.
+4. Prompts reference live queue items and bounded diffs, never static queue
+   snapshots.
+5. Delete a specialist when its responsibility is fully duplicated by OMP or
+   another agent; do not preserve wrappers for compatibility.
 
 ## Verification
 
 ```bash
-podman run --rm --entrypoint /bin/ls ghcr.io/projectbluefin/review:stable /opt/bluefin/review-scope/.agents/checks/
-# Verifies all 5 check files are present
+bash tests/omp-review-mode.sh
+bash tests/appliance-contract.sh
+git diff --check
 ```

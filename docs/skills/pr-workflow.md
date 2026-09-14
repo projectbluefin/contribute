@@ -137,9 +137,9 @@ Write `skip-ci` without brackets.
 
 ## Test By Running, Not Grepping
 
-Source-text greps prove text exists, not that features work. Drive real execution
-via Textual pilot tests (`App.run_test()`). Reserve grep assertions strictly
-for proving absence of forbidden powers.
+Source-text greps prove text exists, not that features work. Exercise visible
+behavior through the foreground OMP workbench; reserve grep assertions for
+proving absence of forbidden powers.
 
 ## Verification
 
@@ -153,7 +153,8 @@ git diff --check
 just --list
 bash scripts/check-skill-frontmatter.sh
 bash tests/generate-skills.sh
-bash tests/image-contract.sh
+bash tests/appliance-contract.sh
+bash tests/contribute-contract.sh
 bash tests/just-onboarding.sh
 ```
 `pre-commit run --all-files` runs all contributor hygiene checks, ShellCheck
