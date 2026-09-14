@@ -1,10 +1,9 @@
 /**
  * The live omp turn, as a Dagger trace.
  *
- * omp already emits turn and tool-execution events; this projects them into the
- * same span shape the durable pipeline uses, so the dashboard shows what the agent
- * is doing right now above what the appliance recorded earlier — one visual
- * language for both.
+ * OMP already emits turn and tool-execution events; this projects them into a
+ * Dagger-style span tree for the workbench. No parallel execution history is
+ * reconstructed from another runtime.
  *
  * Bounded by construction: only the last `MAX_TURNS` turns are kept, each turn
  * keeps its tool spans, and each tool span keeps a short log tail.

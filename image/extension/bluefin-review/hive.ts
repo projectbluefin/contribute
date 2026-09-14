@@ -1,15 +1,9 @@
 /**
  * Hive, read-only.
  *
- * When a hub is configured, Hive owns what matters and in what order. This
- * module reads that order and nothing else: it never assigns, never completes,
- * never re-sorts, and never writes. The maintainer still decides what to review
- * and what to merge; Hive decides what the project needs first, and the queue
- * follows it.
- *
- * The endpoints and the rank semantics mirror the Textual dashboard
- * (`image/tui/bluefin_review_tui.py`) so both surfaces agree about priority
- * rather than inventing two orders for the same hub.
+ * When configured, Hive owns priority, claims, and assignment. This module
+ * projects those authoritative reads into the OMP workbench; it never assigns,
+ * completes, reorders, or mutates work.
  */
 
 import { execFileSync } from "node:child_process";
@@ -44,8 +38,6 @@ export interface HiveSnapshot {
 	configured: boolean;
 	online: boolean;
 	actionableItems?: number;
-	workers?: string;
-	reviewers?: string;
 	items: HiveWorkItem[];
 	triage: HiveTriageGroup[];
 	/** `owner/repo#number` → position in Hive's order. */
@@ -370,16 +362,6 @@ export async function fetchHive(options: HiveFetchOptions = {}): Promise<HiveSna
 			configured: true,
 			online: true,
 			actionableItems: typeof status.actionable_items === "number" ? status.actionable_items : undefined,
-			workers: typeof status.active_contributors === "number" && typeof status.total_registered === "number"
-				? `${status.active_contributors}/${status.total_registered}`
-				: (status.contributorPool && typeof (status.contributorPool as Record<string, unknown>).active === "number"
-					? `${(status.contributorPool as Record<string, unknown>).active}/${(status.contributorPool as Record<string, unknown>).registered || 0}`
-					: undefined),
-			reviewers: typeof status.active_contributors === "number" && typeof status.total_registered === "number"
-				? `${status.active_contributors}/${status.total_registered}`
-				: (status.contributorPool && typeof (status.contributorPool as Record<string, unknown>).active === "number"
-					? `${(status.contributorPool as Record<string, unknown>).active}/${(status.contributorPool as Record<string, unknown>).registered || 0}`
-					: undefined),
 			items: mergeWorkItems(queue, triageItems),
 			triage: groups,
 			ranks: buildRankMap(queue, triageItems),

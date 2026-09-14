@@ -1,10 +1,9 @@
 /**
  * Span model and Dagger-style tree renderer.
  *
- * A span is one step of work with a status and a clock. Everything the dashboard
- * shows — a review pipeline reconstructed from durable state, a live omp turn, the
- * findings inside a receipt — is projected into this shape and drawn by one
- * renderer, so a Bluefin trace and an agent turn read identically.
+ * A span is one step of OMP work with a status and a clock. Live turns and
+ * workflowz tool calls are projected into this shape and drawn by one renderer.
+ * No parallel execution history is reconstructed from another runtime.
  *
  * Rendering is pure: it takes spans, a `Painter`, and a width, and returns rows.
  * No TUI, no clock, no filesystem. The dashboard owns cursor, expansion, and time.
@@ -22,75 +21,13 @@ import {
 } from "./glyphs.ts";
 import { truncateToWidth } from "./width.ts";
 
-/**
- * Why a span is red, if it is. The failure taxonomy of issue #465.
- *
- * The visual `SpanStatus` only says "failed" or "not"; this says *what* failed
- * so the five classes the invariant names never read the same: a real PR check,
- * an unavailable verification, a review-environment failure, an agent/tool
- * failure, and a cancellation. Non-failure spans carry their own value too
- * (`success`, `findings`, `running`, `pending`), so the taxonomy is the single
- * reason a span carries rather than a second boolean next to `status`.
- */
-export type TraceClass =
-	| "pending"
-	| "running"
-	| "success"
-	| "cached"
-	| "findings"
-	/** Work was cancelled on purpose — normal, not a failure. */
-	| "cancelled"
-	/** A GitHub check on the pull request failed — the one a maintainer acts on. */
-	| "pr-check"
-	/** Verification evidence is unavailable or incomplete (workspace mismatch, #471). */
-	| "verification"
-	/** The review/workspace environment failed, not the PR's own checks. */
-	| "environment"
-	/** An agent tool execution failed. */
-	| "tool";
+/** Why an OMP span needs a visible badge. */
+export type TraceClass = "cancelled" | "tool";
 
-/**
- * The visible right-hand badge for a class. Empty for the non-failure classes,
- * which need no label: a green check and a cancelled span already say what they
- * mean. A failure class always renders its tag so the taxonomy is seen, not
- * inferred from a shared red `✘`.
- */
-export const TRACE_CLASS_LABEL: Record<TraceClass, string> = {
-	pending: "",
-	running: "",
-	success: "",
-	cached: "CACHED",
-	findings: "",
-	cancelled: "CANCELLED",
-	"pr-check": "CHECK",
-	verification: "UNVERIFIED",
-	environment: "WORKSPACE",
-	tool: "TOOL",
-};
-
-/** Badge text for a span's class, or "" when the class needs no label. */
 export function traceClassBadge(cls?: TraceClass): string {
-	return cls ? TRACE_CLASS_LABEL[cls] : "";
-}
-
-/**
- * The visual `SpanStatus` a class renders as. Every failure class collapses to
- * `failure` (a red `✘` either way) and `cancelled` to `skipped`; the taxonomy
- * lives in `cls`, not in a fifth shade of red. This keeps the icon vocabulary
- * stable while the reason a span failed becomes distinct.
- */
-export function classStatus(cls: TraceClass): SpanStatus {
-	switch (cls) {
-		case "cancelled":
-			return "skipped";
-		case "pr-check":
-		case "verification":
-		case "environment":
-		case "tool":
-			return "failure";
-		default:
-			return cls;
-	}
+	if (cls === "cancelled") return "CANCELLED";
+	if (cls === "tool") return "TOOL";
+	return "";
 }
 
 export interface Span {
@@ -100,17 +37,10 @@ export interface Span {
 	/** Dim trailing context: author, reason, counts. */
 	detail?: string;
 	status: SpanStatus;
-	/**
-	 * Why a span is red, if it is. The failure taxonomy of issue #465: the visual
-	 * `status` only says "failed", this says *what* failed so a real PR check,
-	 * an unavailable verification, a review-environment failure, an agent/tool
-	 * failure, and a cancellation never read the same. Rendered as a badge.
-	 */
+	/** Why a terminal span ended abnormally. */
 	cls?: TraceClass;
 	startedAt?: number;
 	endedAt?: number;
-	/** Right-hand badge, e.g. `CACHED` or `ERROR`. Folded with the class label. */
-	badge?: string;
 	/** Streamed output; tailed under the span while it is expanded. */
 	logs?: string[];
 	children?: Span[];
@@ -162,15 +92,7 @@ function isExpanded(span: Span, expansion?: ReadonlyMap<string, boolean>): boole
 	return explicit ?? defaultExpanded(span);
 }
 
-/** Deepest running descendant, used for the one-line status rail. */
-export function activeSpan(span: Span): Span | undefined {
-	if (span.status !== "running") return undefined;
-	for (const child of span.children ?? []) {
-		const active = activeSpan(child);
-		if (active) return active;
-	}
-	return span;
-}
+
 
 function renderSpanRow(span: Span, prefix: string, options: TreeOptions): string {
 	const { painter, now, frame = 0 } = options;
@@ -190,10 +112,7 @@ function renderSpanRow(span: Span, prefix: string, options: TreeOptions): string
 		const text = ` ${formatDuration(elapsed)}`;
 		line += painter.fg(span.status === "running" ? "warning" : "dim", text);
 	}
-	// The class label is the failure taxonomy made visible: a span that is merely
-	// "failed" still says *why*, so a workspace mismatch never masquerades as a
-	// PR check failure. An explicit badge (e.g. `CACHED`) wins when set.
-	const badge = span.badge ?? traceClassBadge(span.cls);
+	const badge = traceClassBadge(span.cls);
 	if (badge) line += painter.fg(role, ` ${badge}`);
 	if (span.detail) line += painter.fg("dim", ` ${GLYPH.dot} ${span.detail}`);
 

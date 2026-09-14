@@ -1,14 +1,15 @@
 # The review appliance
 
-`ghcr.io/projectbluefin/review` is one container that reviews Project Bluefin
-pull requests. It has no host dependencies beyond a container engine, and it is
-the same on your laptop, a maintainer's workstation, and a cluster node.
+`ghcr.io/projectbluefin/review` is one OCI image that reviews Project Bluefin
+pull requests. The `bluefin` launcher prefers a dedicated libkrun microVM and
+falls back cleanly to an isolated Apptainer container when KVM is unavailable.
 
 ```bash
-podman run --rm -it \
+podman run --runtime=krun --rm -it \
+  --name "bluefin-review-example-$(date +%s)-$$" \
   --userns keep-id:uid=65532,gid=65532 \
-  --volume bluefin-review-home:/home/bluefin \
-  --volume "$PWD:/workspace:rw,z" \
+  --volume bluefin-review-example-home:/home/bluefin \
+  --volume bluefin-review-example-workspace:/workspace \
   --env GH_TOKEN \
   ghcr.io/projectbluefin/review:stable
 ```
@@ -21,13 +22,11 @@ The base is `ghcr.io/projectbluefin/base` — Project Bluefin's distroless FSDK
 image: glibc, CA certificates, tzdata, and the full terminfo database including
 `xterm-ghostty`. No shell, no package manager, no distro userland.
 
-On top of it sit exactly four fetched artifacts and one staged closure:
+On top of it sit exactly two fetched artifacts and one staged closure:
 
 | Component | Why it is here |
 | --- | --- |
 | `omp` | The agent. A single Bun executable with its own embedded runtime; the image's entrypoint. |
-| `pi` | The upstream coding-agent CLI, available for direct use. |
-| `node` | Present only to execute `pi`. `omp` does not use it. |
 | `gh` | The appliance reviews, approves and merges through it. |
 | `bash`, `git`, `python3`, and eleven utilities | The shell `omp`'s `bash` tool spawns, Python runtime, and what a shell one-liner assumes exists. |
 
@@ -49,16 +48,17 @@ if one appears.
 
 ### What is deliberately absent
 
-`ssh` — the appliance talks to GitHub over HTTPS with a token. `strip` — stripping `omp` produces a binary that still runs and
-silently reports Bun's version instead of its own, which is worse than the 8 MiB
-it saves.
+`pi` and `node` — OMP is the sole agent runtime and embeds Bun. `ssh` — the
+appliance talks to GitHub over HTTPS with a token. `strip` — stripping `omp`
+produces a binary that still runs and silently reports Bun's version instead of
+its own, which is worse than the 8 MiB it saves.
 
 ## Versioning
 
 FSDK's scheme with one component added: `<fsdk-series>.<tool-revision>`.
 
 ```
-ghcr.io/projectbluefin/base:26.08.0   +   image/appliance/REVISION = 3   ->   26.08.03
+ghcr.io/projectbluefin/base:26.08.0   +   image/appliance/REVISION = 6   ->   26.08.06
 ```
 
 The series is never written down twice. `scripts/review-appliance-version.sh`
@@ -71,23 +71,23 @@ Published tags:
 
 | Tag | Meaning |
 | --- | --- |
-| `26.08.03` | Immutable. The publish workflow refuses to overwrite an existing one. |
+| `26.08.06` | Immutable. The publish workflow refuses to overwrite an existing one. |
 | `stable` | Moving alias for the newest published build. |
 | `sha-<commit>` | Immutable, published for every build including branches. |
 
-The OCI image and the release SIF are replaced, never updated in place. The
-appliance disables omp's startup update check, and `omp update` at the appliance
-entrypoint exits with instructions to pull a newer image or download a newer
-SIF. This keeps the version printed by the running artifact identical to the
-version that was verified and published.
+OCI tags are replaced, never updated in place. The appliance disables omp's
+startup update check, and `omp update` exits with instructions to pull a newer
+image. This keeps the running artifact identical to what was verified and
+published.
 
 ## Running it
 
-State lives under `/home/bluefin`: sessions, logs, caches, the model credential,
-and the review receipts the trace pane reads. **Mount a named volume there or
-every run starts blank** — including the provider sign-in below. `/workspace` is
-the working directory; mount the repository you are reviewing, or nothing if you
-are only working through the GitHub API.
+State lives under `/home/bluefin`: OMP sessions, logs, caches, provider
+credentials, and workbench batch intent. The launcher derives a persistent
+volume from the selected repository and a unique container name per invocation,
+so `bluefin review org/repo` and `bluefin review org/repo2` can run concurrently
+without sharing session or workspace state. Set `BLUEFIN_INSTANCE` to split the
+same target.
 
 ### First run signs in
 
@@ -98,9 +98,11 @@ launch goes straight to the queue. Skip the wizard entirely by passing a key the
 provider accepts from the environment:
 
 ```bash
-podman run --rm -it \
+podman run --runtime=krun --rm -it \
+  --name bluefin-review-example \
   --userns keep-id:uid=65532,gid=65532 \
-  --volume bluefin-review-home:/home/bluefin \
+  --volume bluefin-review-example-home:/home/bluefin \
+  --volume bluefin-review-example-workspace:/workspace \
   --env GH_TOKEN --env ANTHROPIC_API_KEY \
   ghcr.io/projectbluefin/review:stable
 ```
@@ -109,21 +111,25 @@ podman run --rm -it \
 `GITHUB_COPILOT_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `HIVE_HUB`
 through by name, and resolves `GH_TOKEN` from `gh auth token` when it is unset.
 
-The appliance uses its own `bluefin-review-appliance` omp profile. In
-particular, an Apptainer launch does not inherit MCP servers from a host omp
-profile, so host entries that depend on binaries absent from the distroless SIF
-cannot make startup noisy or unusable. Missing optional MCPs are therefore not
-startup requirements. To deliberately reuse the host `review` profile,
-including its MCP configuration, set `BLUEFIN_REVIEW_INHERIT_OMP_CONFIG=1` for
-that invocation. The appliance never edits the host configuration.
+The appliance uses its own `bluefin-review-appliance` OMP profile. Host OMP
+configuration is not mounted by default, so host MCP entries cannot make the
+appliance noisy or unusable. To deliberately provide host configuration, mount
+it into the target-specific home and set `BLUEFIN_REVIEW_INHERIT_OMP_CONFIG=1`.
+The appliance never edits host configuration directly.
+The immutable invocation overlay enables fresh workflowz agents, caps task
+concurrency at four and recursion at one, isolates task worktrees without
+auto-applying them, uses a one-hour task deadline and a bounded request budget,
+keeps tool intent traces out of model context, and selects low text verbosity.
+OMP resolves every model and effort choice from the user's active configuration;
+the appliance and its agents impose no model mapping or filtering.
 
 ### The agents it carries
 
-`bluefin-doctrine` and `bluefin-ci-triage` ship inside the image under
-`/usr/share/bluefin/review/extension/agents` and are discovered by omp as task
-agents. Both pin `github-copilot/gemini-3.8-flash` — triage at the default
-effort, doctrine review at high — because they run on machines that have no
-project configuration to resolve a role alias against.
+The agent definitions under `/usr/share/bluefin/review/extension/agents` ship
+with the image and are discovered by OMP directly. They cover doctrine,
+correctness, security, test coverage, simplicity, CI triage, queue triage, and
+coordinated review. They deliberately omit model and effort fields, leaving both
+choices to the user's active OMP configuration.
 
 ### Hive decides the order
 
@@ -132,8 +138,8 @@ With `HIVE_HUB` set — or a registration mounted at
 queue and triage view, in Hive's positions. The appliance only reads: it never
 assigns, completes, or reprioritizes anything, because that is Hive's job and
 the maintainer's. Without a hub the queue is classified from live GitHub
-evidence instead, using the same action vocabulary as the Textual dashboard.
-The header always names which one ran.
+evidence using the policy layer's action vocabulary. The header always names
+which authority ordered the queue.
 
 Hive's queued work is in the queue whether or not a GitHub search would have
 found it. The search covers what is recent; anything Hive ranked is then
@@ -143,40 +149,24 @@ queue that is short because Hive's work could not be resolved on GitHub — a
 closed item, a repository the token cannot read — is visibly different from a
 queue that is short because Hive has little to do.
 
-On an issue, `s` means ship it: implement what the issue asks, run the smallest
-test covering the change, and open a pull request that closes it. Review and
-merge stay with a human, and an issue that cannot be finished gets an evidenced
-finding instead of a pull request.
-
 ### Working the backlog down
 
-The loop is narrow, select, dispatch, and it is three keys:
+The loop is select, group, and dispatch:
 
-1. `L` steps the queue through Hive's own triage stages — `triaging`, `ready`,
-   `implementing`, `reviewing`, `closed` — and back to all of it. `/` narrows
-   further by title, repository, author, label or number.
-2. `A` selects every row the filters left on screen, up to 25. Pressing it on a
-   fully selected slice clears it.
-3. `s` dispatches the slice. Issues become one pull request each; pull requests
-   get the landing pass.
+1. `Tab` switches pull-request and issue mode. `L` steps through Hive's own
+   stages; `/` filters by title, repository, author, label, or number.
+2. `Space` toggles one item, `Alt-B` selects the focused repository, and `A`
+   selects the filtered slice up to the bounded batch limit.
+3. `b` dispatches the selection. The extension preserves Hive order, partitions
+   by repository, and asks workflowz to run one bounded workpool per repository.
+4. `p` pauses admission of later repository waves without pretending to suspend
+   agents already running.
 
-A dispatched slice is worked concurrently across items up to the subagent
-concurrency ceiling, and each repository lane consolidates and lands changes
-cleanly. Twenty-five is the selection ceiling because the wave is real
-concurrency across items, not an unbounded list.
-The detail pane names the contributor whose worker holds an item right now, from
-Hive's live contributor state. Two people burning the same queue down do not
-need to negotiate; they can see what is already taken.
-
-### Issue implementation admission
-
-Queue-derived issue implementation in `projectbluefin/review` is gated on fresh,
-explicit GitHub admission: dispatching an implementation action (`slay`, `fix`, `docs`)
-requires a fresh GraphQL read confirming the exact `3-clanker-queue` label and the
-absence of `hold` and `blocked`. Any closed, unadmitted, held, blocked, unreadable,
-or incompletely read issue refuses dispatch for the entire batch. Direct human
-instructions outside the queue workflow remain a separate authority path; browsing
-unadmitted backlog issues remains available.
+Issue implementation in managed repositories is gated on a fresh GitHub read
+of the policy layer's admission and denial labels. Any closed, unadmitted,
+held, blocked, unreadable, or incompletely read issue rejects the whole batch.
+The dispatched agents may prepare changes and pull requests, but they never
+approve or merge.
 
 Credentials are inherited by name (`--env GH_TOKEN`), never passed as arguments
 and never baked into a layer. The mode resolves a token from `GH_TOKEN`,
@@ -185,8 +175,8 @@ and never baked into a layer. The mode resolves a token from `GH_TOKEN`,
 Arguments reach `omp` directly, so the mode's flags work as documented:
 
 ```bash
-podman run --rm -it … ghcr.io/projectbluefin/review:stable --pr 1284
-podman run --rm -it … ghcr.io/projectbluefin/review:stable --issues
+podman run --runtime=krun --rm -it … ghcr.io/projectbluefin/review:stable --pr 1284
+podman run --runtime=krun --rm -it … ghcr.io/projectbluefin/review:stable --issues
 ```
 
 The image runs as uid `65532` with a matching `/etc/passwd` entry, because a
@@ -216,6 +206,6 @@ the attested SBOM would describe an image whose load-bearing parts are invisible
 The publish workflow ingests it through syft's `sbom-cataloger` and attaches the
 result as an attestation.
 
-On minimal Linux hosts, the packaged launcher automatically skips missing host
-timezone and hosts files when preparing runtime mounts; no root access, fake
-files, or manual Apptainer options are required.
+The packaged launcher prefers rootless Podman's `krun` OCI runtime and
+read/write access to `/dev/kvm`. If any KVM prerequisite is unavailable, it
+reports the reason and uses the installed Apptainer fallback.

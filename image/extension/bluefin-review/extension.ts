@@ -1,69 +1,84 @@
 /**
- * Bluefin review mode for omp: wiring only.
+ * Hive Workbench extension wiring.
  *
- * Everything here is registration and dispatch — the model lives in `mode.ts`,
- * the pixels in `rail.ts` and `dashboard.ts`. Kept free of `@earendil-works/pi-tui`
- * imports so the whole mode can be driven headlessly by the contract test; the
- * `index.ts` adapter injects the real key matcher.
- *
- * Keyboard only. No slash commands.
+ * Hive owns queue authority and assignments. OMP owns sessions, tools, and
+ * workflowz execution. This file only joins those seams to the workbench UI.
  */
 
 import { type DashboardAction, ReviewDashboard } from "./dashboard.ts";
 import type { QueueItem } from "./github.ts";
-import { DEFAULT_ORG, fetchIssueAdmission, parseScope, resolveToken } from "./github.ts";
+import { DEFAULT_ORG, fetchIssueAdmission, fetchItemsByKey, parseScope, resolveToken } from "./github.ts";
 import type { Priority } from "./priority.ts";
-import { BATCH_LIMIT, ReviewMode, type PersistedSelection } from "./mode.ts";
-import { themePainter } from "./paint.ts";
-import { type RailKey, ReviewHitlist, ReviewRail, statusSegment, tmuxReviewStatusBar } from "./rail.ts";
+import { ReviewMode, type PersistedSelection } from "./mode.ts";
+import { workbenchPainter } from "./paint.ts";
+import { type RailKey, ReviewRail, statusSegment } from "./rail.ts";
 import type { KeyMatcher } from "./keys.ts";
 import { type ToolHost, registerTools } from "./tools.ts";
-import { BluefinAnsiSplash } from "./splash.ts";
-import { HiveLeaderboardComponent } from "./leaderboard.ts";
 import { hiveFailureStatus } from "./hive.ts";
-export {
-	type MutationKind,
-	type MutationCapability,
-	type MutationRequest,
-	type MutationPlan,
-	type RetryClassification,
-	type MergeAuthorityCheckItem,
-	type MergeAuthorityResult,
-	MutationCapabilityPolicy,
-	generateNativeCommand,
-	mutationSignature,
-	checkMergeAuthority,
+import { GENERIC_WORKBENCH_POLICY, managedPolicyFor, type WorkbenchPolicy } from "./policy.ts";
+import {
+	commentInvocation,
+	createCommentActionPlan,
+	renderCommentActionPlan,
+	validateCommentActionPlan,
+	type CommentActionPlan,
+	type CommentTargetSnapshot,
 } from "./mutations.ts";
 export {
-	type SlayDeliveryState,
-	type VerificationStatus,
-	type SlayDeliveryResult,
-	type SlayDeliveryOptions,
-	SLAY_DELIVERY_STATES,
-	VERIFICATION_STATUSES,
-	classifyVerificationOutcome,
-	resolveSlayDelivery,
-	formatSlayFinalResponse,
-	formatDraftPrBody,
-} from "./state.ts";
-export const STATE_ENTRY = "com.projectbluefin.review.selection";
+	type CommentTargetSnapshot,
+	type CommentActionPlan,
+	type CommentPlanValidation,
+	type NativeInvocation,
+	createCommentActionPlan,
+	renderCommentActionPlan,
+	validateCommentActionPlan,
+	commentInvocation,
+} from "./mutations.ts";
+export {
+	BLUEFIN_POLICY,
+	GENERIC_WORKBENCH_POLICY,
+	managedPolicyFor,
+	type ManagedRepoPolicy,
+	type WorkbenchPolicy,
+} from "./policy.ts";
+export const STATE_ENTRY = "com.hive.workbench.selection";
+export const BATCH_ENTRY = "com.hive.workbench.batch";
+export const COMMENT_ENTRY = "com.hive.workbench.comment";
 
-/** Queue refetch cadence. GitHub search is rate limited; the state poll is local. */
+export type RepositoryBatchKind = "review" | "fix" | "diff";
+export type RepositoryBatchState = "running" | "paused" | "blocked" | "complete";
+
+export interface PersistedRepositoryBatch {
+	readonly version: 1;
+	readonly id: string;
+	readonly kind: RepositoryBatchKind;
+	readonly waves: ReadonlyArray<{ readonly repo: string; readonly items: readonly QueueItem[] }>;
+	readonly currentWave: number;
+	readonly completedItems: number;
+	readonly totalItems: number;
+	readonly state: RepositoryBatchState;
+	readonly startedAt: number;
+	readonly waveStartedAt: number;
+	readonly error?: string;
+}
+
+export interface PersistedCommentResult {
+	readonly version: 1;
+	readonly state: "previewed" | "confirmed" | "complete" | "failed" | "aborted";
+	readonly plan: CommentActionPlan;
+	readonly receipts?: readonly string[];
+	readonly error?: string;
+}
+
+/** Queue refetch cadence. GitHub search is rate limited. */
 const QUEUE_POLL_MS = 60_000;
-const STATE_POLL_MS = 2_000;
 // Hive's queue moves with the project, not with the terminal. Polling it on the
 // queue's cadence keeps one hub request per refresh instead of one per repaint.
 const HIVE_POLL_MS = 120_000;
 
 export const RAIL_KEYS: readonly RailKey[] = [
-	{ chord: "alt+s", label: "autoslay" },
-	{ chord: "alt+b", label: "dashboard" },
-	{ chord: "alt+j/k", label: "next/prev" },
-	{ chord: "alt+x", label: "select" },
-	{ chord: "alt+i", label: "prs/issues" },
-	{ chord: "alt+o", label: "repo" },
+	{ chord: "alt+b", label: "workbench" },
 	{ chord: "alt+u", label: "refresh" },
-	{ chord: "alt+y", label: "cite" },
 ];
 
 export interface ExtensionOptions {
@@ -72,15 +87,17 @@ export interface ExtensionOptions {
 	org?: string;
 	fetchImpl?: typeof fetch;
 	env?: NodeJS.ProcessEnv;
+	policy?: WorkbenchPolicy;
 }
 
 /** Loose structural types: the extension must build without omp's declarations. */
 interface UiLike {
 	notify(message: string, level?: "info" | "warning" | "error"): void;
 	input(title: string, placeholder?: string): Promise<string | undefined>;
+	confirm(title: string, message: string): Promise<boolean>;
+	editor(title: string, prefill?: string): Promise<string | undefined>;
 	setStatus(key: string, value: string | undefined): void;
 	setWidget(key: string, content: unknown, options?: { placement?: string }): void;
-	setFooter?(factory: ((tui: unknown, theme: unknown, footerData: unknown) => { render(width: number): string[]; invalidate?(): void; dispose?(): void }) | undefined): void;
 	setTitle(title: string): void;
 	pasteToEditor(text: string): void;
 	custom<T>(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: T) => void) => unknown, options?: unknown): Promise<T>;
@@ -91,10 +108,15 @@ interface CtxLike {
 	hasUI: boolean;
 	ui: UiLike;
 	sessionManager?: { getBranch(): Array<{ type?: string; customType?: string; data?: unknown }> };
+	getAsyncJobSnapshot?(): {
+		running: Array<{ id: string; status: string; startTime: number }>;
+		recent: Array<{ id: string; status: string; startTime: number }>;
+	};
 }
 
 /** The slice of omp's `ExtensionAPI` this mode uses. */
 export interface ReviewExtensionHost {
+	exec(command: string, args: string[], options?: { timeout?: number }): Promise<{ stdout: string; stderr: string; code: number; killed: boolean }>;
 	zod: unknown;
 	setLabel(label: string): void;
 	on(event: string, handler: (event: unknown, ctx: CtxLike) => unknown): void;
@@ -106,82 +128,33 @@ export interface ReviewExtensionHost {
 	appendEntry(customType: string, data?: unknown): void;
 }
 
-function readPersisted(ctx: CtxLike): PersistedSelection | undefined {
-	let latest: PersistedSelection | undefined;
+function readLatestCustom<T>(ctx: CtxLike, customType: string): T | undefined {
+	let latest: T | undefined;
 	for (const entry of ctx.sessionManager?.getBranch() ?? []) {
-		if (entry.type === "custom" && entry.customType === STATE_ENTRY && entry.data) {
-			latest = entry.data as PersistedSelection;
-		}
+		if (entry.type === "custom" && entry.customType === customType && entry.data) latest = entry.data as T;
 	}
 	return latest;
 }
 
-/**
- * A managed repository and its own admission vocabulary.
- *
- * Admission is a per-repository policy, not a single hardcoded special case:
- * each enrolled repository names the labels that admit an issue and the labels
- * that deny it. The set of enrolled repositories is exact — `owner/repo` match
- * only, no org-wide enrollment, no wildcards, no repository-local config.
- */
-export interface ManagedRepoPolicy {
-	/** Exact `owner/repo`. Enrollment is by exact match only. */
-	repository: string;
-	/** Labels that must all be present for an issue to be admitted. */
-	requiredLabels: readonly string[];
-	/** Labels that deny admission whenever present. */
-	deniedLabels: readonly string[];
+function readPersisted(ctx: CtxLike): PersistedSelection | undefined {
+	return readLatestCustom<PersistedSelection>(ctx, STATE_ENTRY);
 }
 
-/**
- * The explicit set of repositories whose issue implementation is gated on a
- * fresh fail-closed admission read.
- *
- * Exactly enrolled by `owner/repo`; every other repository keeps today's
- * explicit-human behavior (no admission read). V1 ships the single repository
- * #485 commissioned plus one further managed repository with a different
- * vocabulary, so the policy is exercised as a policy rather than a constant.
- */
-export const MANAGED_REPOSITORIES: readonly ManagedRepoPolicy[] = [
-	{ repository: "projectbluefin/review", requiredLabels: ["3-clanker-queue"], deniedLabels: ["hold", "blocked"] },
-	{ repository: "projectbluefin/documentation", requiredLabels: ["3-docs-queue"], deniedLabels: ["hold"] },
-];
-
-/**
- * The admission policy for a repository, or undefined when it is unmanaged.
- *
- * Enrollment is exact, so an unmanaged repository — including one whose name is
- * a prefix of a managed one — returns no policy and keeps the human path.
- */
-export function managedPolicyFor(repo: string): ManagedRepoPolicy | undefined {
-	return MANAGED_REPOSITORIES.find((policy) => policy.repository === repo);
+function readPersistedBatch(ctx: CtxLike): PersistedRepositoryBatch | undefined {
+	return readLatestCustom<PersistedRepositoryBatch>(ctx, BATCH_ENTRY);
 }
 
-/**
- * Slay delivery invariant (#475): Never strand completed implementation in
- * an anonymous dirty working tree because repository verification tooling is
- * unavailable in the Review appliance. Classify missing tooling separately from
- * a failing test.
- */
-export const SLAY_DELIVERY_RULE =
-	"Every Slay run that modifies a repository must terminate in a durable, discoverable delivery state. Completed implementation must never be left only as an anonymous dirty working tree because repository-local verification tooling is unavailable. Classify verification into three states: VERIFICATION_PASSED (focused test executed and passed), VERIFICATION_FAILED (test executed and returned failure; never downgrade a real test failure to unavailable), and VERIFICATION_UNAVAILABLE (required toolchain or runtime is missing, e.g. python, pytest, poetry, uv, cargo, rustc, ruby, bundle, mvn, gradle, or node command not found; a missing executable is not evidence that tests fail). Inability to execute local verification because the appliance lacks the runtime does NOT mean implementation is unfinished. Outcomes: (1) If implementation is complete and verification passed: commit scoped changes, push, and open a normal pull request against the default branch (PR_OPENED_VERIFIED). (2) If implementation is complete but repository verification tooling is unavailable: commit scoped changes, push, and open a draft pull request with --draft (DRAFT_PR_OPENED_VERIFICATION_UNAVAILABLE). The draft PR body must explicitly state what verification succeeded (e.g. git diff --check), what verification was not run and why (naming the missing runtime/tool), state that repository CI will provide authoritative verification, include Closes <owner/repo>#<number>, and must never claim unexecuted tests passed or be auto-merged. If repository policy forbids opening unverified draft PRs, preserve the branch and commit durably and report that policy as the blocker. (3) If implementation is genuinely incomplete or unsafe: do not represent it as complete; if no useful implementation exists, report no changes and an evidenced blocker (BLOCKED_NO_CHANGES); if useful partial work exists but cannot safely be proposed as a PR, preserve a named branch and commit durably (PARTIAL_WORK_PRESERVED) and report its exact location. The final response must always explicitly report: repository, workspace path, branch, commit SHA, PR URL, verification performed, verification unavailable or failed, remaining blocker, and whether the working tree is clean.";
+function readPersistedComment(ctx: CtxLike): PersistedCommentResult | undefined {
+	return readLatestCustom<PersistedCommentResult>(ctx, COMMENT_ENTRY);
+}
+
 
 /**
- * Classify whether a DashboardAction constitutes an implementation action.
- * Write-capable issue actions ('slay', 'fix', 'docs') must be gated on admission.
- * Read-only actions ('review', 'diff', 'reference', 'scope', 'close',
- * 'leaderboard', 'snapshot') and merge actions ('approve') do not implement
- * issue changes and are not gated by this admission check.
+ * Fix is the only workbench action that can modify a checkout. Review and diff
+ * are read-only; comment is executed through its own confirmed mutation plan.
  */
 export function isImplementationAction(action: DashboardAction): boolean {
-	switch (action.kind) {
-		case "slay":
-		case "fix":
-		case "docs":
-			return true;
-		default:
-			return false;
-	}
+	return action.kind === "fix";
 }
 /**
  * Prompts the action keys send. Each one names the evidence the agent must use.
@@ -192,34 +165,12 @@ export function isImplementationAction(action: DashboardAction): boolean {
  * is not told the link cannot honor it.
  */
 export function actionPrompt(action: DashboardAction, priority?: Priority): string | undefined {
-	const autonomousRule = "This is an automated review and landing tool: execute all actions end-to-end autonomously in a continuous loop. Never ask the user for confirmation, permission, or interactive prompts to proceed. Once a batch or queue item is complete, immediately request the next assignment from the queue or advance to the next item so the loop runs continuously without stopping.";
-	const mutationRule = "Typed GitHub mutations prefer native/gh/API tools. Browser is bounded fallback for UI-only work; equivalent preferred attempts are not repeated indefinitely. Preserved human confirmation and merge authority: stop and report instead of merging if any check is failing or pending.";
-	// A turn spent asleep is a turn billed for nothing: the queue re-dispatches on
-	// its own, so an unfinished check is reported and released, never waited on.
-	const noPollRule = "Never sleep or run polling loops: read CI status once, re-kick a completed failure if warranted, and if checks are still running or the pull request is policy-blocked, report the exact status and stop rather than waiting.";
-	// Context is the bill. Anything a command prints stays in the transcript and is
-	// re-sent on every later turn, so one unbounded diff early costs its size times
-	// the remaining turn count. Measured: 91% of tokens spent were re-sent context,
-	// and 80% of `gh pr view` calls re-read a pull request the agent had already read.
-	const evidenceRule = "Evidence is bounded and read once. Fetch each pull request's state a single time with a minimal field set (`gh pr view <n> --repo <r> --json number,state,isDraft,mergeable,mergeStateStatus,headRefOid,statusCheckRollup,reviewDecision`) and reuse what you already fetched instead of re-running it; re-read only after you push a commit. List changed files with `gh pr diff <n> --repo <r> --name-only` and pull a full patch or a `--log-failed` run log only for the specific file or failing job you must judge. Never paste a whole diff, log, or JSON blob into your report — cite file:line and the one failing step.";
-	// The queue already fetched CI, mergeability, review decision and draft for every
-	// row. Sending those few fields costs ~20 tokens per item and removes the first
-	// `gh pr view` each agent would otherwise run — the call that was 80% redundant.
-	//
-	// The caveat is part of the value, not a separate paragraph. A parent that fans
-	// this batch out to subagents copies the item lines and drops the surrounding
-	// prose — observed live: all seven children received the bracketed state and none
-	// received the rule qualifying it. So the words that make a snapshot unsafe to
-	// mutate on travel inside the brackets, where nothing can separate them from it.
-	const snapshotRule = "Each item carries the queue's own last read in brackets. Treat it as triage evidence: use it to decide what needs doing and do not re-fetch it to confirm. Before any approve, merge, label, or push, revalidate the head and checks live, because a snapshot describes a commit that may no longer be current.";
-	// `merge=dirty` is work, not a verdict. Merging the base back into the pull
-	// request is a repair inside its own branch, and it is what a maintainer
-	// expects slaying a conflicted pull request to do. Only a wrong target branch
-	// is unfixable from the branch, and the queue reports that separately.
-	const conflictRule = "A conflicting merge base (`merge=dirty`) is a repair you perform, not a reason to stop. In a scratch workdir, check the pull request out, `git fetch origin <base>` and `git merge origin/<base>`, resolve each conflicted hunk on its merits keeping both sides' intent, run the smallest existing test covering the conflicted files, then push the merge to the pull request's branch and continue the landing pass. Never rebase the branch, never resolve with `--ours` or `--theirs`, and never force-push. Report it blocked only when the branch genuinely cannot be repaired — no push access to the fork, or two sides make incompatible decisions a human must arbitrate — and say which.";
-	const hive = priority?.hiveRank === undefined ? ` ${autonomousRule}` : ` This is Hive-prioritized work (${priority.reason}); keep the linked issue's intent in view and reference it in what you report. ${autonomousRule}`;
+	if (action.kind === "close" || action.kind === "scope" || action.kind === "comment" || action.kind === "reference") {
+		return undefined;
+	}
+
+	const selected = action.items && action.items.length > 0 ? action.items : [action.item];
 	const cite = (item: QueueItem) => `${item.repo}#${item.id} (${item.title})`;
-	/** The queue's own last read, carrying the caveat that makes it safe to act on. */
 	const stateOf = (item: QueueItem) => {
 		const parts = [
 			item.ciStatus ? `ci=${item.ciStatus}` : "",
@@ -227,89 +178,44 @@ export function actionPrompt(action: DashboardAction, priority?: Priority): stri
 			item.reviewState === "unknown" ? "" : `review=${item.reviewState}`,
 			item.draft ? "draft" : "",
 		].filter(Boolean);
-		return parts.length > 0 ? ` [queue read: ${parts.join(" ")} — revalidate head live before mutating]` : "";
+		return parts.length > 0 ? ` [queue read: ${parts.join(" ")} — revalidate live before mutating]` : "";
 	};
-	const batch = "items" in action && action.items && action.items.length > 1 ? action.items : undefined;
-	if (batch) {
-		// Group items by repository to minimize context-switching and cross-repo tool churn
-		const repoGroups = new Map<string, QueueItem[]>();
-		for (const it of batch) {
-			const list = repoGroups.get(it.repo) ?? [];
-			list.push(it);
-			repoGroups.set(it.repo, list);
-		}
-		const isCrossRepo = repoGroups.size > 1;
+	const authority = priority?.hiveRank === undefined
+		? "Hive did not rank this item; do not infer priority."
+		: `Hive ranked this work (${priority.reason}); preserve that intent.`;
+	const evidence = "Evidence is bounded and read once. Start with `gh pr diff <n> --repo <r> --name-only`; inspect only relevant hunks or failing logs, and cite file:line evidence. Never sleep or poll. Treat `merge=dirty` as repair work: merge the base into the branch, resolve deliberately, and never rebase, force-push, or choose `--ours`/`--theirs` wholesale. Revalidate live state before any comment, label, assignment, close, or push.";
+	const finish = "Report one terminal outcome per item, then stop. The Hive workbench owns the next repository wave. Never approve or merge.";
 
-		let list: string;
-		if (isCrossRepo) {
-			const sections: string[] = [];
-			for (const [repo, items] of repoGroups.entries()) {
-				const lines = items.map((it) => `  - #${it.id} (${it.title}): ${it.url}${stateOf(it)}`).join("\n");
-				sections.push(`Repository \`${repo}\` (${items.length} item${items.length > 1 ? "s" : ""}):\n${lines}`);
-			}
-			list = sections.join("\n\n");
-		} else {
-			list = batch.map((it) => `- ${cite(it)}: ${it.url}${stateOf(it)}`).join("\n");
-		}
-
-		const crossRepoHeader = isCrossRepo
-			? `These ${batch.length} items span ${repoGroups.size} repositories (${[...repoGroups.keys()].join(", ")}).`
-			: "";
-
-		// The point of selecting a slice is to spend one wall clock on all of it.
-		// A batch worked top to bottom is a list, not a batch, and a backlog that
-		// only moves at one item per turn never comes down.
-		// Dispatch one subagent per individual issue or PR, capped at a maximum of 7 concurrent
-		// subagents at any time (queue remaining items and dispatch as running slots free up).
-		// Observed live: the parent copied each item line but dropped the surrounding
-		// rules, so seven subagents ran without them. A rule a parent must paraphrase
-		// is a rule that does not arrive; give it a delimited block to copy instead.
-		const subagentBrief = `${evidenceRule} ${noPollRule} ${conflictRule} Skip formatters, linters, and project-wide suites; run only the smallest existing test covering what changed. ${SLAY_DELIVERY_RULE} The bracketed queue read travels with your item: it is triage evidence, and you revalidate head and checks live before any approve, merge, label, or push.`;
-		const fanOut = `Work all ${batch.length} items with ONE subagent per issue/PR, capped at a maximum of 7 concurrent subagents at any time (queue remaining items and dispatch as running subagents complete; review/landing agents do not count against the 7 cap). Each subagent owns exactly its assigned item and its bracketed queue read. A subagent that stops instead of waiting frees its concurrency slot. Every subagent prompt MUST end with the block between the markers below, copied verbatim — do not summarise or omit it:\n<<<SUBAGENT-RULES\n${subagentBrief}\nSUBAGENT-RULES>>>\nReport per item — what you did, the evidence, and the outcome.`;
-
-		const protocol = `${snapshotRule}\n\n${conflictRule}\n\n${fanOut}\n\n${mutationRule}\n\n${autonomousRule}`;
+	if (selected.length > 1) {
+		const repository = selected[0]!.repo;
+		if (selected.some((item) => item.repo !== repository)) return undefined;
+		const list = selected.map((item) => `- ${cite(item)}: ${item.url}${stateOf(item)}`).join("\n");
+		const workflow = action.kind === "fix"
+			? "workflowz this repository wave with one fresh isolated agent() handle per issue or pull request. Do not share a checkout or conversation between write-capable items."
+			: "workflowz this repository wave with one fresh workpool item per issue or pull request. Do not reuse a worker across repositories.";
+		const rules = `<<<SUBAGENT-RULES\n${evidence} ${finish}\nSUBAGENT-RULES>>>`;
 		switch (action.kind) {
 			case "review":
-				return `Review the following ${batch.length} selected items grouped by repository for efficiency:\n\n${list}\n\n${crossRepoHeader ? `${crossRepoHeader}\n\n` : ""}For each repository group: read bounded diffs and recorded pipelines before judging. Report findings by severity with file:line evidence covering doctrine, correctness, security, tests, and simplicity. State explicitly what you verified and what you could not.\n\n${protocol}`;
+				return `Review this Hive-ranked repository wave for ${repository}:\n\n${list}\n\n${workflow} Report findings by severity with file:line evidence. Copy this block verbatim into every worker prompt:\n${rules}`;
 			case "diff":
-				return `Inspect and summarize the diffs for the following ${batch.length} selected items grouped by repository:\n\n${list}\n\n${crossRepoHeader ? `${crossRepoHeader}\n\n` : ""}For each repository group, call bluefin_review_diff and summarize what changed file by file, with the cross-repo risk each change carries.\n\n${autonomousRule}`;
-			case "docs":
-				return `Update and align documentation for the following ${batch.length} selected items grouped by repository:\n\n${list}\n\n${crossRepoHeader ? `${crossRepoHeader}\n\n` : ""}Enforce the projectbluefin/common agentic documentation system with brutal alignment: ensure AGENTS.md, docs/factory/agentic-model.md, docs/SKILL.md, and docs/skills/*.md are strictly source-backed, concise (<200 lines soft max, <256 char descriptions), zero-filler, with no grandfathering or speculative noise. Run \`bash scripts/check-skill-frontmatter.sh --write\` and ensure \`docs/skills/index.json\` is regenerated cleanly.\n\n${protocol}`;
-			case "approve":
-				return `For the following ${batch.length} selected items grouped by repository:\n\n${list}\n\n${crossRepoHeader ? `${crossRepoHeader}\n\n` : ""}Confirm every required check is green per repository, restate the merge risk and cross-repo dependencies, then approve and squash merge in dependency order. Stop and report if any check is failing or pending.\n\n${protocol}`;
+				return `Inspect this Hive-ranked repository wave for ${repository}:\n\n${list}\n\n${workflow} Use hive_workbench_diff and report the changed files and concrete risks. Copy this block verbatim into every worker prompt:\n${rules}`;
 			case "fix":
-				return `Fix the findings recorded for the following ${batch.length} selected items grouped by repository:\n\n${list}\n\n${crossRepoHeader ? `${crossRepoHeader}\n\n` : ""}For each repository, read them with bluefin_review_trace, address each at its source, run the smallest contract test covering the changed surface, and prepare clean commits.\n\n${protocol}`;
-			case "slay":
-				// Issues have no diff to land. Slaying one means producing the change
-				// it asked for and handing it to a human as a pull request.
-				return batch.every((entry) => entry.type === "issue")
-					? `Close out the following ${batch.length} queued issues by shipping the work, one pull request per issue:\n\n${list}\n\n${crossRepoHeader ? `${crossRepoHeader}\n\n` : ""}For each issue: do not dismiss or conclude no_work_needed if there is an actionable bug, missing test, broken script, or underlying root cause to address. Diagnose the root cause, implement the fix, run the smallest existing test covering the changed surface, and open a pull request that closes it with \`Closes <owner/repo>#<number>\` in the body. Someone else reviews and merges: never merge your own, never approve. Only if an issue has genuinely already been merged by an earlier PR on the default branch: confirm that commit and close the issue directly with \`gh issue close <number> --repo <owner/repo> --reason completed --comment "<evidence of prior merged PR>"\`. Where an issue cannot be finished as asked, open no pull request for it and report an evidenced finding instead, naming what blocked you. ${SLAY_DELIVERY_RULE}\n\n${protocol}`
-					: `Execute the full fix-and-merge landing pass on the following ${batch.length} selected items:\n\n${list}\n\n${crossRepoHeader ? `${crossRepoHeader}\n\n` : ""}For each PR: review the diff, patch defects directly at source, fix failing tests, verify with focused contract tests, re-kick flaky CI checks (\`gh run rerun <run-id> --failed\`), and once checks are green, approve and squash-merge the pull request with \`gh pr review <id> --repo <repo> --approve\` and \`gh pr merge <id> --repo <repo> --squash\` (or \`--auto --squash\` plus \`lgtm\` label if governed by a merge queue ruleset). Do not leave actionable PRs unmerged once green. Once landed or blocked, immediately proceed to the next assignment.\n\n${protocol}`;
-			default:
-				break;
+				return selected.every((item) => item.type === "issue")
+					? `Implement this Hive-ranked repository wave for ${repository}, opening one review-ready pull request per issue:\n\n${list}\n\n${workflow} Diagnose each root cause, implement the smallest complete fix, and run focused verification. Copy this block verbatim into every worker prompt:\n${rules}`
+					: `Fix this Hive-ranked repository wave for ${repository}:\n\n${list}\n\n${workflow} Address findings at source, run focused verification, and push repaired heads for independent review. Copy this block verbatim into every worker prompt:\n${rules}`;
 		}
 	}
+
+	const item = selected[0]!;
 	switch (action.kind) {
 		case "review":
-			return `Review ${cite(action.item)}. Read the bounded diff with bluefin_review_diff and the recorded pipeline with bluefin_review_trace before judging. Report findings by severity with file:line evidence, covering doctrine, correctness, security, tests, and simplicity. State explicitly what you verified and what you could not.${hive}`;
+			return `Review ${cite(item)}. Use hive_workbench_diff and hive_workbench_trace, then report findings by severity with file:line evidence. ${authority} ${finish}`;
 		case "diff":
-			return `Call bluefin_review_diff for pull request ${action.item.id} in ${action.item.repo} and summarise what actually changed, file by file, with the risk each change carries. ${autonomousRule}`;
-		case "docs":
-			return `Update and align documentation for ${cite(action.item)}. Enforce the projectbluefin/common agentic documentation system with brutal alignment: inspect the actual diff and changed surface, update the closest matching docs/skills/*.md file or core contract (AGENTS.md, docs/factory/agentic-model.md, docs/SKILL.md), eliminate any grandfathering/speculative filler, enforce token efficiency (descriptions <= 256 chars, skill documents <= 200 lines soft max), and run \`bash scripts/check-skill-frontmatter.sh --write\` to ensure docs/skills/index.json is synchronized perfectly for token-efficient agent ingestion. ${autonomousRule}`;
-		case "approve":
-			return `For ${cite(action.item)}${stateOf(action.item)}: confirm every required check is green with \`gh pr checks ${action.item.id} --repo ${action.item.repo}\`, restate the merge risk in one line, then approve with \`gh pr review ${action.item.id} --repo ${action.item.repo} --approve\`. Attempt squash merge with \`gh pr merge ${action.item.id} --repo ${action.item.repo} --squash\`; if the repository uses a merge queue or ruleset, enable auto-merge (\`gh pr merge ${action.item.id} --repo ${action.item.repo} --auto --squash\`) and ensure the \`lgtm\` label is present (\`gh pr edit ${action.item.id} --repo ${action.item.repo} --add-label lgtm\`). Stop and report instead of merging if any check is failing or pending. ${snapshotRule} ${evidenceRule} ${noPollRule} ${mutationRule} ${autonomousRule}`;
+			return `Call hive_workbench_diff for ${cite(item)} and summarize the changed files and concrete risks. ${authority} ${finish}`;
 		case "fix":
-			return `Fix the findings recorded for ${cite(action.item)}. Read them with bluefin_review_trace, address each one at its source, run the smallest contract test that covers the changed surface, and prepare one clean commit. Typed GitHub mutations prefer native/gh/API tools. When repairing defects such as invalid PR titles or labels (e.g. repairing PR title like #440), prefer native gh commands first (\`gh pr edit ${action.item.id} --repo ${action.item.repo} --title "<title>"\` or \`gh pr edit ${action.item.id} --repo ${action.item.repo} --add-label <label>\`). Browser is bounded fallback for UI-only work; equivalent preferred attempts are not repeated indefinitely. Do not suppress a finding you cannot fix — report it.${hive}`;
-		case "slay":
-			// Issues have no diff to land. Slaying one means producing the change it
-			// asked for and handing it to a human as a pull request.
-			return action.item.type === "issue"
-				? `Close out ${cite(action.item)} by implementing and shipping the solution. Do not dismiss or conclude with no_work_needed if there is any actionable bug, test failure, code change, documentation fix, or underlying root cause to address. Inspect the code, diagnose the problem, implement the fix, run the smallest existing test that covers the changed surface, then open a pull request against the default branch whose body contains \`Closes ${action.item.repo}#${action.item.id}\`. Someone else reviews and merges it: never merge your own, never approve it. Only if the issue has already been resolved or closed by an existing merged PR or commit on the default branch: confirm the evidence and close the issue directly with \`gh issue close ${action.item.id} --repo ${action.item.repo} --reason completed --comment "<evidence of live resolution or commit>"\`. Otherwise implement what it asks for and open the PR. ${SLAY_DELIVERY_RULE}${hive}`
-				: `Execute the full fix-and-merge landing pass on ${cite(action.item)}${stateOf(action.item)}: review the diff, patch what is broken, fix and commit any failing tests or defects, ensure contract tests pass, re-kick transient CI failures (\`gh run rerun <run-id> --failed\`), and when checks are already green, approve and land the pull request: approve with \`gh pr review ${action.item.id} --repo ${action.item.repo} --approve\`, squash-merge with \`gh pr merge ${action.item.id} --repo ${action.item.repo} --squash\` (or enable auto-merge \`gh pr merge ${action.item.id} --repo ${action.item.repo} --auto --squash\` if using a merge queue), and apply \`lgtm\` label if required by branch protection/rulesets (\`gh pr edit ${action.item.id} --repo ${action.item.repo} --add-label lgtm\`). ${snapshotRule} ${conflictRule} ${evidenceRule} ${noPollRule} Once merged or if blocked by policy, advance immediately to the next queue assignment.${hive}`;
-		case "snapshot":
-			return `Submit the Argo workflow in deploy/argo-review-fsdk-build.yaml to build and push a container snapshot of the current tree, then report the workflow name and how to watch it.`;
-		default:
-			return undefined;
+			return item.type === "issue"
+				? `Implement ${cite(item)} in an isolated workspace. Diagnose the root cause, make the smallest complete change, run focused verification, and open a review-ready pull request whose body contains \`Closes ${item.repo}#${item.id}\`. ${authority} ${finish}`
+				: `Fix ${cite(item)} in an isolated workspace. Re-read the live diff and failing checks, diagnose each root cause, run focused verification, and push one clean commit for independent review. ${authority} ${finish}`;
 	}
 }
 
@@ -326,51 +232,45 @@ export interface ReviewExtension {
 
 export function createReviewExtension(pi: ReviewExtensionHost, options: ExtensionOptions = {}): ReviewExtension {
 	const env = options.env ?? process.env;
+	const policy = options.policy ?? GENERIC_WORKBENCH_POLICY;
 	const matchKey = options.matchKey;
 	const mode = new ReviewMode({
 		org: options.org ?? env.BLUEFIN_REVIEW_ORG ?? DEFAULT_ORG,
 		fetchImpl: options.fetchImpl,
-		// The mode resolves the hub from this environment too; leaving it to
-		// process.env is how a test reads the developer's own registration.
 		env,
 	});
 
 	let tui: { requestRender(): void } | undefined;
 	const timers: Array<() => void> = [];
 	let dashboardOpen = false;
-	let autoReopenDashboard = false;
-	let autoslayActive = false;
-	let activeDashboardDone: ((action: DashboardAction) => void) | undefined;
+	let activeDashboard: ReviewDashboard | undefined;
 	let activeCtx: CtxLike | undefined;
-	let lastAutoslayKeys = "";
 	let started: Promise<void> = Promise.resolve();
-	let dispatchGeneration = 0;
-	pi.setLabel("Bluefin Review");
+	let activeBatch: PersistedRepositoryBatch | undefined;
+	let batchRequestGeneration = 0;
+	let commentInFlight = false;
+	pi.setLabel("Hive Workbench");
 	pi.registerFlag("pr", { description: "Preselect a pull request or issue number", type: "string" });
 	pi.registerFlag("issues", { description: "Start in issues mode instead of pull requests", type: "boolean", default: false });
 	pi.registerFlag("all", { description: "Show all queue items instead of defaulting to Hive-only", type: "boolean", default: false });
-	pi.registerFlag("splash", { description: "Show 1990s demoscene Razor 1911 ANSI splash screen", type: "boolean", default: true });
 	pi.registerFlag("repo", { description: "Review one repository: owner/repo, or org:name for a whole organization", type: "string" });
-	pi.registerFlag("skip-repo", { description: "Comma-separated repositories to skip (e.g. lab, projectbluefin/lab)", type: "string" });
-	pi.registerFlag("autoslay", { description: "Autoslay queue continuously in Hive priority order on startup", type: "boolean", default: false });
+	pi.registerFlag("skip-repo", { description: "Comma-separated repositories to skip", type: "string" });
 	registerTools(pi as unknown as ToolHost, mode, () => started);
 
 	const repaint = () => tui?.requestRender();
 
 	const syncStatus = (ctx: CtxLike) => {
 		if (!ctx.hasUI) return;
-		if (dashboardOpen) {
-			ctx.ui.setStatus("bluefin_queue", undefined);
-		} else {
-			ctx.ui.setStatus("bluefin_queue", statusSegment(mode, themePainter(ctx.ui.theme), Date.now()));
-		}
+		const painter = workbenchPainter(ctx.ui.theme, () => mode.queueMode);
+		if (dashboardOpen) ctx.ui.setStatus("hive_workbench", undefined);
+		else ctx.ui.setStatus("hive_workbench", statusSegment(mode, painter, Date.now()));
 		const activeItem = mode.selected();
 		if (activeItem) {
 			const kind = activeItem.type === "pr" ? "PR" : "ISSUE";
 			const repo = activeItem.repo.includes("/") ? activeItem.repo.split("/")[1] : activeItem.repo;
-			ctx.ui.setTitle(`bluefin review · ${kind} #${activeItem.id} (${repo}) ${activeItem.title}`);
+			ctx.ui.setTitle(`hive workbench · ${kind} #${activeItem.id} (${repo}) ${activeItem.title}`);
 		} else {
-			ctx.ui.setTitle(`bluefin review · ${mode.queueMode} (${mode.position()})`);
+			ctx.ui.setTitle(`hive workbench · ${mode.queueMode} (${mode.position()})`);
 		}
 		repaint();
 	};
@@ -391,12 +291,167 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		syncStatus(ctx);
 		const result = await mode.refreshQueue();
 		if (result.error && !result.cancelled && result.items.length === 0 && ctx.hasUI) {
-			ctx.ui.notify(`Bluefin queue: ${result.error}`, "error");
+			ctx.ui.notify(`Hive workbench queue: ${result.error}`, "error");
 		}
 		syncStatus(ctx);
+		return result;
 	};
 
 	const persist = () => pi.appendEntry(STATE_ENTRY, mode.toPersisted());
+
+	const syncBatchProgress = (ctx: CtxLike) => {
+		if (!activeBatch) {
+			mode.setBatchProgress(undefined);
+			return;
+		}
+		const wave = activeBatch.waves[Math.min(activeBatch.currentWave, activeBatch.waves.length - 1)];
+		const jobs = ctx.getAsyncJobSnapshot?.();
+		const runningJobs = jobs?.running.filter((job) => job.startTime >= activeBatch!.waveStartedAt).length ?? 0;
+		const failedJobs = jobs?.recent.filter(
+			(job) => job.startTime >= activeBatch!.waveStartedAt && job.status === "failed",
+		).length ?? 0;
+		mode.setBatchProgress({
+			state: activeBatch.state,
+			repository: wave?.repo ?? "complete",
+			wave: Math.min(activeBatch.currentWave + 1, activeBatch.waves.length),
+			waves: activeBatch.waves.length,
+			completedItems: activeBatch.completedItems,
+			totalItems: activeBatch.totalItems,
+			runningJobs,
+			failedJobs,
+		});
+		repaint();
+	};
+
+	const persistBatch = (ctx: CtxLike, batch: PersistedRepositoryBatch) => {
+		activeBatch = batch;
+		pi.appendEntry(BATCH_ENTRY, batch);
+		syncBatchProgress(ctx);
+	};
+
+	const batchBlocker = async (kind: RepositoryBatchKind, items: readonly QueueItem[]): Promise<string | undefined> => {
+		if (kind === "diff") return undefined;
+		const hive = await mode.refreshHive();
+		if (!hive.online) return "Hive is unavailable; browse-only mode disables dispatch";
+		const unranked = items.find((item) => mode.priorityFor(item)?.hiveRank === undefined);
+		if (unranked) return `Hive did not rank ${unranked.repo}#${unranked.id}; browse-only mode disables dispatch`;
+		const claimed = items.find((item) => mode.claimFor(item));
+		if (claimed) return `${claimed.repo}#${claimed.id} is already claimed by ${mode.claimFor(claimed)}`;
+		if (kind !== "fix") return undefined;
+
+		const managedIssues = items.filter((item) => item.type === "issue" && managedPolicyFor(item.repo, policy));
+		if (managedIssues.length > 0) {
+			const result = await fetchIssueAdmission(
+				managedIssues.map((item) => {
+					const [owner, repo] = item.repo.split("/") as [string, string];
+					return { owner, repo, number: item.id };
+				}),
+				{ token: mode.tokenOptions().token ?? resolveToken(env), fetchImpl: options.fetchImpl },
+			);
+			if (result.error) return `Admission check failed: ${result.error}`;
+			for (const admitted of result.issues) {
+				const key = `${admitted.owner}/${admitted.repo}#${admitted.number}`;
+				const admissionPolicy = managedPolicyFor(`${admitted.owner}/${admitted.repo}`, policy);
+				if (!admissionPolicy) return `Cannot dispatch ${key}: no managed-repository policy`;
+				if (admitted.closed) return `Cannot dispatch ${key}: issue is closed`;
+				if (admitted.labelsTruncated) return `Cannot dispatch ${key}: incomplete label evidence`;
+				for (const denied of admissionPolicy.deniedLabels) {
+					if (admitted.labels.includes(denied)) return `Cannot dispatch ${key}: issue has ${denied} label`;
+				}
+				for (const required of admissionPolicy.requiredLabels) {
+					if (!admitted.labels.includes(required)) return `Cannot dispatch ${key}: missing explicit admission label '${required}'`;
+				}
+			}
+		}
+
+		const managedPullRequests = items.filter((item) => item.type === "pr" && managedPolicyFor(item.repo, policy));
+		if (managedPullRequests.length > 0) {
+			const live = await fetchItemsByKey(
+				managedPullRequests.map((item) => `${item.repo}#${item.id}`),
+				"prs",
+				mode.tokenOptions(),
+			);
+			if (live.error) return `Live pull-request check failed: ${live.error}`;
+			for (const item of managedPullRequests) {
+				const current = live.items.find((candidate) => candidate.repo === item.repo && candidate.id === item.id);
+				if (!current) return `Cannot dispatch ${item.repo}#${item.id}: pull request is closed or unreadable`;
+				if (!current.headSha || current.headSha !== item.headSha) return `Cannot dispatch ${item.repo}#${item.id}: pull request head changed`;
+				const denied = managedPolicyFor(item.repo, policy)?.deniedLabels.find((label) => current.labels.includes(label));
+				if (denied) return `Cannot dispatch ${item.repo}#${item.id}: pull request has ${denied} label`;
+			}
+		}
+		return undefined;
+	};
+
+	const dispatchCurrentWave = async (ctx: CtxLike, deliverAs?: "steer" | "followUp", prevalidated = false) => {
+		if (!activeBatch) return;
+		if (mode.paused) {
+			persistBatch(ctx, { ...activeBatch, state: "paused" });
+			return;
+		}
+		const wave = activeBatch.waves[activeBatch.currentWave];
+		if (!wave) {
+			persistBatch(ctx, { ...activeBatch, state: "complete" });
+			ctx.ui.notify("Repository batch complete", "info");
+			return;
+		}
+		if (!prevalidated) {
+			const blocker = await batchBlocker(activeBatch.kind, wave.items);
+			if (blocker) {
+				persistBatch(ctx, { ...activeBatch, state: "blocked", error: blocker });
+				ctx.ui.notify(blocker, "error");
+				return;
+			}
+		}
+		const startedAt = Date.now();
+		persistBatch(ctx, { ...activeBatch, state: "running", waveStartedAt: startedAt, error: undefined });
+		const waveAction = {
+			kind: activeBatch.kind,
+			item: wave.items[0]!,
+			items: wave.items.length > 1 ? [...wave.items] : undefined,
+		} as DashboardAction;
+		const prompt = actionPrompt(waveAction, mode.priorityFor(wave.items[0]!));
+		if (!prompt) {
+			persistBatch(ctx, { ...activeBatch!, state: "blocked", error: "wave action produced no prompt" });
+			return;
+		}
+		ctx.ui.notify(`Dispatching ${wave.repo} wave ${activeBatch.currentWave + 1}/${activeBatch.waves.length}`, "info");
+		pi.sendUserMessage(prompt, deliverAs ? { deliverAs } : undefined);
+	};
+
+	const startRepositoryBatch = async (ctx: CtxLike, kind: RepositoryBatchKind, items: readonly QueueItem[]) => {
+		const generation = ++batchRequestGeneration;
+		if (activeBatch?.state === "running" || activeBatch?.state === "paused") {
+			ctx.ui.notify(`Batch ${activeBatch.id} is already ${activeBatch.state}`, "warning");
+			return;
+		}
+		const blocker = await batchBlocker(kind, items);
+		if (generation !== batchRequestGeneration) return;
+		if (activeBatch?.state === "running" || activeBatch?.state === "paused") return;
+		if (blocker) {
+			ctx.ui.notify(blocker, "error");
+			return;
+		}
+		const waves = mode.repositoryWaves(items);
+		if (waves.length === 0) return;
+		const startedAt = Date.now();
+		const batch: PersistedRepositoryBatch = {
+			version: 1,
+			id: `batch-${startedAt.toString(36)}`,
+			kind,
+			waves,
+			currentWave: 0,
+			completedItems: 0,
+			totalItems: items.length,
+			state: mode.paused ? "paused" : "running",
+			startedAt,
+			waveStartedAt: startedAt,
+		};
+		mode.clearSelected();
+		persist();
+		persistBatch(ctx, batch);
+		await dispatchCurrentWave(ctx, undefined, true);
+	};
 
 	/**
 	 * Point the queue at another repository.
@@ -421,194 +476,154 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		return true;
 	};
 
-	const dispatch = async (
-		ctx: CtxLike,
-		action: DashboardAction,
-		deliveryOptions?: { deliverAs?: "steer" | "followUp" },
-	): Promise<void> => {
-		if (action.kind === "close") {
-			autoReopenDashboard = false;
-			return;
-		}
+	const dispatch = async (ctx: CtxLike, action: DashboardAction): Promise<void> => {
+		if (action.kind === "close") return;
 		if (action.kind === "scope") {
 			await promptForScope(ctx);
 			return;
 		}
 		if (action.kind === "reference") {
-			const items = "items" in action && action.items && action.items.length > 0 ? action.items : [action.item];
-			const text = items.map((it) => `${it.repo}#${it.id} — ${it.title}\n${it.url}\n`).join("\n");
-			ctx.ui.pasteToEditor(text);
+			const items = action.items && action.items.length > 0 ? action.items : [action.item];
+			ctx.ui.pasteToEditor(items.map((item) => `${item.repo}#${item.id} — ${item.title}\n${item.url}\n`).join("\n"));
 			return;
 		}
 
-		// Capture identities before the admission read can yield to UI activity.
-		const capturedItems: QueueItem[] =
-			"items" in action && action.items && action.items.length > 0 ? [...action.items] : [action.item];
+		const capturedItems = action.items && action.items.length > 0 ? [...action.items] : [action.item];
 
-		const isImpl = isImplementationAction(action);
-		const reviewIssues = isImpl
-			? capturedItems.filter((it) => it.type === "issue" && managedPolicyFor(it.repo))
-			: [];
-
-		if (reviewIssues.length > 0) {
-			const generation = ++dispatchGeneration;
-			const targets = reviewIssues.map((it) => {
-				const [owner, repo] = it.repo.split("/") as [string, string];
-				return { owner, repo, number: it.id };
-			});
-
-			const token = mode.tokenOptions().token ?? resolveToken(env);
-			const result = await fetchIssueAdmission(targets, {
-				token,
-				fetchImpl: options.fetchImpl,
-			});
-
-			if (generation !== dispatchGeneration) return;
-
-			if (result.error) {
-				ctx.ui.notify(`Admission check failed: ${result.error}`, "error");
+		if (action.kind === "comment") {
+			if (commentInFlight) {
+				ctx.ui.notify("A comment action is already in progress", "warning");
 				return;
 			}
+			commentInFlight = true;
+			let commentPlan: CommentActionPlan | undefined;
+			try {
+				const body = await ctx.ui.editor("Comment on selected work", "");
+				if (body === undefined || !body.trim()) return;
+				const targets: CommentTargetSnapshot[] = capturedItems.map((item) => ({
+					repo: item.repo,
+					number: item.id,
+					type: item.type === "pr" ? "pull_request" : "issue",
+					headSha: item.headSha,
+				}));
+				commentPlan = createCommentActionPlan(targets, body);
+				pi.appendEntry(COMMENT_ENTRY, { version: 1, state: "previewed", plan: commentPlan } satisfies PersistedCommentResult);
+				if (!(await ctx.ui.confirm("Post comment batch?", renderCommentActionPlan(commentPlan)))) {
+					pi.appendEntry(COMMENT_ENTRY, { version: 1, state: "aborted", plan: commentPlan } satisfies PersistedCommentResult);
+					return;
+				}
 
-			for (const admitted of result.issues) {
-				const key = `${admitted.owner}/${admitted.repo}#${admitted.number}`;
-				// Only managed items were targeted, so a policy always exists; the
-				// guard keeps an unexpected read from slipping an unmanaged item
-				// through the human path.
-				const policy = managedPolicyFor(`${admitted.owner}/${admitted.repo}`);
-				if (!policy) {
-					ctx.ui.notify(`Cannot dispatch ${key}: no managed-repository policy`, "error");
-					return;
-				}
-				if (admitted.closed) {
-					ctx.ui.notify(`Cannot dispatch ${key}: issue is closed`, "error");
-					return;
-				}
-				if (admitted.labelsTruncated) {
-					ctx.ui.notify(`Cannot dispatch ${key}: incomplete label evidence`, "error");
-					return;
-				}
-				for (const denied of policy.deniedLabels) {
-					if (admitted.labels.includes(denied)) {
-						ctx.ui.notify(`Cannot dispatch ${key}: issue has ${denied} label`, "error");
-						return;
+				const queueMode = capturedItems[0]!.type === "pr" ? "prs" : "issues";
+				const live = await fetchItemsByKey(
+					targets.map((target) => `${target.repo}#${target.number}`),
+					queueMode,
+					mode.tokenOptions(),
+				);
+				if (live.error) throw new Error(`live revalidation failed: ${live.error}`);
+				const liveTargets: CommentTargetSnapshot[] = live.items.map((item) => ({
+					repo: item.repo,
+					number: item.id,
+					type: item.type === "pr" ? "pull_request" : "issue",
+					headSha: item.headSha,
+				}));
+				const validation = validateCommentActionPlan(commentPlan, liveTargets);
+				if (!validation.valid) throw new Error(validation.errors.join("; "));
+				pi.appendEntry(COMMENT_ENTRY, { version: 1, state: "confirmed", plan: commentPlan } satisfies PersistedCommentResult);
+
+				const receipts: string[] = [];
+				for (const target of commentPlan.targets) {
+					const invocation = commentInvocation(target, commentPlan.body);
+					const result = await pi.exec(invocation.command, [...invocation.args], { timeout: 30_000 });
+					if (result.code !== 0 || result.killed) {
+						throw new Error(result.stderr.trim() || `gh comment exited ${result.code}`);
 					}
+					receipts.push(result.stdout.trim() || `${target.repo}#${target.number}`);
 				}
-				for (const required of policy.requiredLabels) {
-					if (!admitted.labels.includes(required)) {
-						ctx.ui.notify(`Cannot dispatch ${key}: missing explicit admission label '${required}'`, "error");
-						return;
-					}
-				}
+				pi.appendEntry(COMMENT_ENTRY, { version: 1, state: "complete", plan: commentPlan, receipts } satisfies PersistedCommentResult);
+				ctx.ui.notify(`Posted ${receipts.length} GitHub-confirmed comment${receipts.length === 1 ? "" : "s"}`, "info");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (commentPlan) pi.appendEntry(COMMENT_ENTRY, { version: 1, state: "failed", plan: commentPlan, error: message } satisfies PersistedCommentResult);
+				ctx.ui.notify(`Comment action stopped: ${message}`, "error");
+			} finally {
+				commentInFlight = false;
 			}
+			return;
 		}
 
-		const count = capturedItems.length;
-		const priority = action.kind === "snapshot" ? undefined : mode.priorityFor(action.item);
-		const prompt = actionPrompt(action, priority);
-		if (!prompt) return;
-		const label = count > 1 ? `${action.kind}: ${count} items` : `${action.kind}: ${action.item.repo}#${action.item.id}`;
-		ctx.ui.notify(action.kind === "snapshot" ? "Queuing snapshot build…" : label, "info");
-		activeCtx = ctx;
-		autoReopenDashboard = !autoslayActive;
-		mode.clearSelected();
-		pi.sendUserMessage(prompt, deliveryOptions?.deliverAs ? { deliverAs: deliveryOptions.deliverAs } : undefined);
-	};
-	const openLeaderboard = async (ctx: CtxLike) => {
-		if (!ctx.hasUI) return;
-		try {
-			await ctx.ui.custom<void>(
-				(hostTui, theme, _keybindings, done) => {
-					return new HiveLeaderboardComponent(
-						hostTui as { requestRender(): void },
-						themePainter(theme as UiLike["theme"]),
-						done,
-					);
-				},
-				{ overlay: false },
-			);
-		} catch {
-			// Ignore cancellation
+
+		if (action.kind === "review" || action.kind === "fix" || action.kind === "diff") {
+			activeCtx = ctx;
+			await startRepositoryBatch(ctx, action.kind, capturedItems);
 		}
 	};
-
 	const openDashboard = async (ctx: CtxLike) => {
 		if (!ctx.hasUI || dashboardOpen) return;
 		dashboardOpen = true;
-		mode.refreshState();
+		let reopen = false;
 		try {
 			const action = await ctx.ui.custom<DashboardAction>(
 				(hostTui, theme, _keybindings, done) => {
 					tui = hostTui as { requestRender(): void };
-					activeDashboardDone = done;
-					return new ReviewDashboard(
+					activeDashboard = new ReviewDashboard(
 						tui,
-						themePainter(theme as UiLike["theme"]),
+						workbenchPainter(theme as UiLike["theme"], () => mode.queueMode),
 						mode,
 						done,
 						() => void refreshQueue(ctx),
 						Math.max(14, Math.min(30, (process.stdout.rows ?? 30) - 8)),
 						matchKey,
+						() => {
+							persist();
+							syncStatus(ctx);
+						},
+						(nextAction) => void dispatch(ctx, nextAction),
+						(paused) => {
+							persist();
+							if (!paused && activeBatch?.state === "paused") void dispatchCurrentWave(ctx, "followUp");
+							syncBatchProgress(ctx);
+						},
 					);
+					return activeDashboard;
 				},
 				{ overlay: false },
 			);
-			dashboardOpen = false;
-			if (action.kind === "slay") {
-				autoslayActive = true;
-			}
-			await dispatch(ctx, action);
-			// looking at the queue you just asked for.
 			if (action.kind === "scope") {
-				dashboardOpen = false;
-				await openDashboard(ctx);
-				return;
-			}
-			if (action.kind === "leaderboard") {
-				dashboardOpen = false;
-				await openLeaderboard(ctx);
-				await openDashboard(ctx);
-				return;
+				await dispatch(ctx, action);
+				reopen = true;
 			}
 		} catch {
-			// The overlay was cancelled. Nothing awaits this call, so a rejection
-			// here would surface as an unhandled rejection, not a closed dashboard.
+			// OMP cancellation closes the workbench without changing batch state.
 		} finally {
 			dashboardOpen = false;
-			activeDashboardDone = undefined;
+			activeDashboard = undefined;
 			persist();
 			syncStatus(ctx);
 		}
+		if (reopen) void openDashboard(ctx);
 	};
 
-	/**
-	 * Everything startup does that is not instantaneous.
-	 *
-	 * omp kills an extension handler that has not returned inside its budget, and
-	 * this is two network round trips plus an animated intro. Run inside
-	 * `session_start` it timed out every session: the poll timers below it never
-	 * started, so the queue was fetched once, at most, and never refreshed.
-	 */
 	const startSession = async (ctx: CtxLike, persisted: PersistedSelection | undefined) => {
-		// Started, not awaited: the intro plays over the fetch instead of after it.
-		const splash =
-			pi.getFlag("splash") === false
-				? undefined
-				: ctx.ui.custom<void>(
-						(hostTui, _theme, _keybindings, done) => {
-							return new BluefinAnsiSplash(hostTui as { requestRender(): void }, done);
-						},
-						{ overlay: false },
-					);
-
-		// Ask the hub before the queue: an item that arrives already ranked is
-		// never shown in the wrong order, not even for one frame.
 		const hive = await mode.refreshHive();
 		if (hive.configured && hive.error) {
-			ctx.ui.notify(`${hiveFailureStatus(hive.error)}, ordering locally`, "warning");
+			ctx.ui.notify(`${hiveFailureStatus(hive.error)}; browse-only mode`, "warning");
 		}
 		await refreshQueue(ctx);
 		mode.restore(persisted);
+
+		const recoveredBatch = readPersistedBatch(ctx);
+		if (recoveredBatch) {
+			activeBatch = recoveredBatch.state === "running"
+				? { ...recoveredBatch, state: "blocked", error: "session ended before the repository wave reached a terminal state" }
+				: recoveredBatch;
+			if (recoveredBatch.state === "running") pi.appendEntry(BATCH_ENTRY, activeBatch);
+			if (activeBatch.state === "paused") mode.setPaused(true);
+			syncBatchProgress(ctx);
+		}
+		const recoveredComment = readPersistedComment(ctx);
+		if (recoveredComment?.state === "previewed" || recoveredComment?.state === "confirmed") {
+			ctx.ui.notify("An interrupted comment plan was not replayed; inspect it before retrying", "warning");
+		}
 
 		const preselect = pi.getFlag("pr");
 		if (typeof preselect === "string" && preselect.trim()) {
@@ -618,27 +633,48 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			}
 		}
 		syncStatus(ctx);
-
-		await splash;
-		const flagAutoslay = pi.getFlag("autoslay");
-		if (flagAutoslay === true) {
-			autoslayActive = true;
-			const slayable = mode.slayableItems();
-			const items = (slayable.length > 0 ? slayable.slice(0, 7) : [mode.selected()].filter(Boolean)) as QueueItem[];
-			if (items.length > 0) {
-				lastAutoslayKeys = items.map((it) => `${it.repo}#${it.id}`).sort().join(",");
-				const action: DashboardAction = { kind: "slay", item: items[0]!, items: items.length > 1 ? items : undefined };
-				void dispatch(ctx, action);
-				return;
-			}
-			autoslayActive = false;
-		}
-		// Opened, not awaited: `ctx.ui.custom` resolves when the maintainer closes
-		// the dashboard, and startup is over long before that.
 		void openDashboard(ctx);
 	};
 
+	const advanceRepositoryBatch = async (ctx: CtxLike) => {
+		if (!activeBatch || activeBatch.state !== "running") return;
+		const wave = activeBatch.waves[activeBatch.currentWave];
+		if (!wave) return;
+		const jobs = ctx.getAsyncJobSnapshot?.();
+		const recent = jobs?.recent.filter((job) => job.startTime >= activeBatch!.waveStartedAt) ?? [];
+		const failed = recent.filter((job) => job.status === "failed");
+		if (failed.length > 0 || (ctx.getAsyncJobSnapshot && recent.length === 0)) {
+			const error = failed.length > 0
+				? `${failed.length} workflowz job${failed.length === 1 ? "" : "s"} failed`
+				: "workflowz produced no observable jobs for the repository wave";
+			persistBatch(ctx, { ...activeBatch, state: "blocked", error });
+			ctx.ui.notify(`Repository wave stopped: ${error}`, "error");
+			return;
+		}
+		const refreshed = await refreshQueue(ctx);
+		if (refreshed.error) {
+			persistBatch(ctx, { ...activeBatch, state: "blocked", error: refreshed.error });
+			ctx.ui.notify(`Repository wave stopped: ${refreshed.error}`, "error");
+			return;
+		}
+		const nextWave = activeBatch.currentWave + 1;
+		const completedItems = activeBatch.completedItems + wave.items.length;
+		if (nextWave >= activeBatch.waves.length) {
+			persistBatch(ctx, { ...activeBatch, currentWave: nextWave, completedItems, state: "complete" });
+			ctx.ui.notify("Repository batch complete", "info");
+			return;
+		}
+		persistBatch(ctx, {
+			...activeBatch,
+			currentWave: nextWave,
+			completedItems,
+			state: mode.paused ? "paused" : "running",
+		});
+		if (!mode.paused) await dispatchCurrentWave(ctx, "followUp");
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
+		activeCtx = ctx;
 		mode.setToken(resolveToken(env));
 		// Mode, scope and filter apply immediately; the remembered item can only be
 		// found once the queue has actually been fetched, so restore runs twice.
@@ -681,35 +717,26 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			return;
 		}
 
-		ctx.ui.setTitle("bluefin review");
+		ctx.ui.setTitle("hive workbench");
 		ctx.ui.setWidget(
-			"bluefin-rail",
+			"hive-workbench-rail",
 			(hostTui: unknown, theme: unknown) => {
 				tui = hostTui as { requestRender(): void };
-				return new ReviewRail(tui, themePainter(theme as UiLike["theme"]), mode, RAIL_KEYS, () => dashboardOpen);
+				return new ReviewRail(
+					tui,
+					workbenchPainter(theme as UiLike["theme"], () => mode.queueMode),
+					mode,
+					RAIL_KEYS,
+					() => dashboardOpen,
+				);
 			},
 			{ placement: "belowEditor" },
 		);
 
-		if (typeof ctx.ui.setFooter === "function") {
-			ctx.ui.setFooter((_hostTui: unknown, theme: unknown) => {
-				const painter = themePainter(theme as UiLike["theme"]);
-				return {
-					render(width: number): string[] {
-						return [tmuxReviewStatusBar(mode, painter, width, Date.now())];
-					},
-				};
-			});
-		}
-
-		mode.refreshState();
 		syncStatus(ctx);
 
 		// Before the first await: a startup that fails or drags must still leave a
 		// session that refreshes itself.
-		every(STATE_POLL_MS, () => {
-			if (mode.refreshState()) repaint();
-		});
 		every(QUEUE_POLL_MS, () => {
 			void refreshQueue(ctx);
 		});
@@ -722,7 +749,7 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		// Detached: nothing awaits this, so an escaping rejection would take the
 		// whole session process down with it.
 		started = startSession(ctx, persisted).catch((error: unknown) => {
-			ctx.ui.notify(`Bluefin review startup: ${error instanceof Error ? error.message : String(error)}`, "error");
+			ctx.ui.notify(`Hive workbench startup: ${error instanceof Error ? error.message : String(error)}`, "error");
 		});
 	});
 
@@ -732,66 +759,21 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 
 	// ---- live turn trace -----------------------------------------------------
 
-	pi.on("turn_start", () => {
+	pi.on("turn_start", (_event, eventCtx) => {
 		mode.session.startTurn(Date.now());
+		const ctxToUse = (eventCtx as CtxLike | undefined) ?? activeCtx;
+		if (ctxToUse) syncBatchProgress(ctxToUse);
 		repaint();
 	});
-	pi.on("turn_end", async (_event, eventCtx) => {
+	pi.on("turn_end", (_event, eventCtx) => {
 		mode.session.endTurn(Date.now());
-		repaint();
 		const ctxToUse = (eventCtx as CtxLike | undefined) ?? activeCtx;
-		if (autoslayActive && ctxToUse) {
-			await refreshQueue(ctxToUse);
-			const nextBatch = mode.slayableItems();
-			if (nextBatch.length > 0) {
-				const items = nextBatch.slice(0, 7);
-				const batchKeys = items.map((it) => `${it.repo}#${it.id}`).sort().join(",");
-				if (batchKeys === lastAutoslayKeys) {
-					autoslayActive = false;
-					lastAutoslayKeys = "";
-					if (ctxToUse.hasUI) ctxToUse.ui.notify("Autoslay stopped: items require human review or updated commits", "info");
-					return;
-				}
-				lastAutoslayKeys = batchKeys;
-				const action: DashboardAction = { kind: "slay", item: items[0]!, items: items.length > 1 ? items : undefined };
-				void dispatch(ctxToUse, action, { deliverAs: "followUp" });
-				return;
-			}
-			autoslayActive = false;
-			lastAutoslayKeys = "";
-			if (ctxToUse.hasUI) ctxToUse.ui.notify("Autoslay completed: queue fully drained", "info");
-		}
-		if (autoReopenDashboard && ctxToUse && ctxToUse.hasUI && !dashboardOpen) {
-			autoReopenDashboard = false;
-			await refreshQueue(ctxToUse);
-			if (mode.visibleItems().length > 0) {
-				void openDashboard(ctxToUse);
-			}
-		}
+		if (ctxToUse) syncBatchProgress(ctxToUse);
+		repaint();
 	});
 	pi.on("agent_settled", async (_event, eventCtx) => {
 		const ctxToUse = (eventCtx as CtxLike | undefined) ?? activeCtx;
-		if (autoslayActive && ctxToUse) {
-			await refreshQueue(ctxToUse);
-			const nextBatch = mode.slayableItems();
-			if (nextBatch.length > 0) {
-				const items = nextBatch.slice(0, 7);
-				const batchKeys = items.map((it) => `${it.repo}#${it.id}`).sort().join(",");
-				if (batchKeys === lastAutoslayKeys) {
-					autoslayActive = false;
-					lastAutoslayKeys = "";
-					if (ctxToUse.hasUI) ctxToUse.ui.notify("Autoslay stopped: items require human review or updated commits", "info");
-					return;
-				}
-				lastAutoslayKeys = batchKeys;
-				const action: DashboardAction = { kind: "slay", item: items[0]!, items: items.length > 1 ? items : undefined };
-				void dispatch(ctxToUse, action);
-				return;
-			}
-			autoslayActive = false;
-			lastAutoslayKeys = "";
-			if (ctxToUse.hasUI) ctxToUse.ui.notify("Autoslay completed: queue fully drained", "info");
-		}
+		if (ctxToUse) await advanceRepositoryBatch(ctxToUse);
 	});
 	pi.on("tool_execution_start", (event) => {
 		const { toolCallId, toolName, args } = event as { toolCallId: string; toolName: string; args: unknown };
@@ -803,96 +785,23 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		mode.session.updateTool(toolCallId, partialResult);
 		repaint();
 	});
-	pi.on("tool_execution_end", (event) => {
+	pi.on("tool_execution_end", (event, eventCtx) => {
 		const { toolCallId, result, isError } = event as { toolCallId: string; result: unknown; isError: boolean };
 		mode.session.endTool(toolCallId, result, isError === true, Date.now());
+		const ctxToUse = (eventCtx as CtxLike | undefined) ?? activeCtx;
+		if (ctxToUse) syncBatchProgress(ctxToUse);
 		repaint();
 	});
 
 	// ---- keyboard ------------------------------------------------------------
 
 	pi.registerShortcut("alt+b", {
-		description: "Open the Bluefin review dashboard",
+		description: "Open the Hive workbench",
 		handler: (ctx) => void openDashboard(ctx),
 	});
-	pi.registerShortcut("alt+j", {
-		description: "Select the next queue item",
-		handler: (ctx) => {
-			mode.move(1);
-			syncStatus(ctx);
-		},
-	});
-	pi.registerShortcut("alt+k", {
-		description: "Select the previous queue item",
-		handler: (ctx) => {
-			mode.move(-1);
-			syncStatus(ctx);
-		},
-	});
-	pi.registerShortcut("alt+x", {
-		description: "Toggle selection on current queue item",
-		handler: (ctx) => {
-			const item = mode.selected();
-			if (!item) return;
-			const nowSelected = mode.toggleSelected();
-			if (ctx.hasUI) {
-				const state = nowSelected ? "selected" : "deselected";
-				const count = mode.selectedKeys.size;
-				ctx.ui.notify(`${state} #${item.id} (${count} selected)`, "info");
-			}
-			syncStatus(ctx);
-		},
-	});
-	pi.registerShortcut("alt+i", {
-		description: "Toggle pull requests and issues",
-		handler: (ctx) => {
-			const next = mode.toggleMode();
-			if (ctx.hasUI) ctx.ui.notify(`Bluefin queue: ${next === "prs" ? "pull requests" : "issues"}`, "info");
-			void refreshQueue(ctx);
-			persist();
-		},
-	});
-	pi.registerShortcut("alt+o", {
-		description: "Review another repository (owner/repo)",
-		handler: (ctx) => void promptForScope(ctx),
-	});
 	pi.registerShortcut("alt+u", {
-		description: "Refetch the Bluefin queue",
+		description: "Refetch the Hive workbench queue",
 		handler: (ctx) => void refreshQueue(ctx),
-	});
-	pi.registerShortcut("alt+y", {
-		description: "Cite the selected queue item in the prompt",
-		handler: (ctx) => {
-			const chosen = mode.chosenItems();
-			const items = chosen.length > 0 ? chosen : [mode.selected()].filter(Boolean) as QueueItem[];
-			if (items.length === 0) {
-				if (ctx.hasUI) ctx.ui.notify("No queue item selected", "warning");
-				return;
-			}
-			const text = items.map((item) => `${item.repo}#${item.id} — ${item.title}\n${item.url}\n`).join("\n");
-			ctx.ui.pasteToEditor(text);
-		},
-	});
-	pi.registerShortcut("alt+s", {
-		description: "Autoslay queue in Hive priority order (continuous serial loop)",
-		handler: (ctx) => {
-			// Autoslay runs directly in strict Hive priority order across the queue,
-			// cycling continuously through assignments without requiring manual intervention.
-			autoslayActive = true;
-			const slayable = mode.slayableItems();
-			const items = (slayable.length > 0 ? slayable.slice(0, 7) : [mode.selected()].filter(Boolean)) as QueueItem[];
-			if (items.length === 0) {
-				autoslayActive = false;
-				if (ctx.hasUI) ctx.ui.notify("No queue items available to slay", "warning");
-				return;
-			}
-			const action: DashboardAction = { kind: "slay", item: items[0]!, items: items.length > 1 ? items : undefined };
-			if (dashboardOpen && activeDashboardDone) {
-				activeDashboardDone(action);
-			} else {
-				void dispatch(ctx, action);
-			}
-		},
 	});
 
 	return { whenStarted: () => started };

@@ -35,8 +35,6 @@ spec:
           image: ghcr.io/projectbluefin/contribute:stable
           imagePullPolicy: Always
           env:
-            - name: AGENT_BACKEND
-              value: omp
             - name: GH_TOKEN
               valueFrom:
                 secretKeyRef:

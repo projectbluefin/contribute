@@ -26,9 +26,21 @@ const ROLE_TO_THEME: Record<PaintRole, string> = {
 	toolTitle: "toolOutput",
 };
 
-export function themePainter(theme: ThemeLike): Painter {
+const ISSUE_ROLE_TO_THEME: Record<PaintRole, string> = {
+	...ROLE_TO_THEME,
+	accent: "warning",
+	warning: "accent",
+	border: "warning",
+	toolTitle: "warning",
+};
+
+
+export function workbenchPainter(theme: ThemeLike, mode: () => "prs" | "issues"): Painter {
 	return {
-		fg: (role, text) => theme.fg(ROLE_TO_THEME[role], text),
+		fg: (role, text) => {
+			const roles = mode() === "issues" ? ISSUE_ROLE_TO_THEME : ROLE_TO_THEME;
+			return theme.fg(roles[role], text);
+		},
 		bold: (text) => theme.bold(text),
 		inverse: (text) => theme.inverse(text),
 	};

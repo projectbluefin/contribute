@@ -10,15 +10,19 @@
 #   --repo owner/repo
 #   --issues / issues
 #   --all / all
-#   --autoslay / autoslay / slay
 #   and any mixed combination.
 #
 # Populates PARSED_REVIEW_ARGS array with the resulting arguments.
 set -euo pipefail
 
 parse_review_args() {
-  local -a in_args=("$@")
+  local -a in_args
   local -a out_args=()
+  if [[ $# -eq 1 && "$1" == *" "* ]]; then
+    read -r -a in_args <<<"$1"
+  else
+    in_args=("$@")
+  fi
   local i=0
   local len=${#in_args[@]}
 
@@ -86,14 +90,6 @@ parse_review_args() {
       ;;
     all)
       out_args+=(--all)
-      i=$((i + 1))
-      ;;
-    --autoslay)
-      out_args+=(--autoslay)
-      i=$((i + 1))
-      ;;
-    autoslay | slay)
-      out_args+=(--autoslay)
       i=$((i + 1))
       ;;
     --skip-repo | --profile | --extension | --model | --effort)

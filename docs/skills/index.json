@@ -1,11 +1,11 @@
 {
-  "generated_at": "2026-09-13",
+  "generated_at": "2026-09-14",
   "schema_version": "1.0",
   "skills": [
     {
       "id": "cluster-workers",
       "name": "cluster-workers",
-      "one_line_purpose": "Scale out review contributor workers across Kubernetes clusters.",
+      "one_line_purpose": "Scale OMP contributor workers across Kubernetes clusters.",
       "entry_point": "docs/skills/cluster-workers.md",
       "category": "ci-ops",
       "status": "active",
@@ -15,9 +15,9 @@
         "scale",
         "workers"
       ],
-      "description": "Manages cluster contributor workers in bluefin-system and secret synchronization. Use when scaling workers or operating review-contributor on Kubernetes.",
-      "version": "1.1",
-      "last_updated": "2026-09-07",
+      "description": "Manages OMP contributor workers in bluefin-system and secret synchronization.",
+      "version": "2.0",
+      "last_updated": "2026-09-14",
       "doc_type": "procedure"
     },
     {
@@ -59,26 +59,6 @@
       "doc_type": "policy"
     },
     {
-      "id": "final-review",
-      "name": "final-review",
-      "one_line_purpose": "Run bounded fresh-context review and fix rounds after a batch lands.",
-      "entry_point": "docs/skills/final-review.md",
-      "category": "ci-ops",
-      "status": "active",
-      "tags": [
-        "review",
-        "batch",
-        "rounds",
-        "models",
-        "breaker",
-        "cleanup"
-      ],
-      "description": "Defines the dashboard's final review-and-fix phase: one session policy, batch classification, fresh-context rounds with explicit models, a five-round breaker, and the cleanup gate.",
-      "version": "1.0",
-      "last_updated": "2026-09-05",
-      "doc_type": "policy"
-    },
-    {
       "id": "hive-runtime",
       "name": "hive-runtime",
       "one_line_purpose": "Operate inside Hive's tmux, token, and cooldown constraints.",
@@ -94,8 +74,8 @@
         "workspace"
       ],
       "description": "Explains Hive's tmux session, workspace directory, prompt and output contract, contributor credentials, token lifetime, cooldown, and exclusive task selection. Use when operating or debugging a session.",
-      "version": "2.3",
-      "last_updated": "2026-08-25",
+      "version": "3.0",
+      "last_updated": "2026-09-14",
       "doc_type": "reference"
     },
     {
@@ -118,28 +98,9 @@
       "doc_type": "runbook"
     },
     {
-      "id": "image-audit",
-      "name": "image-audit",
-      "one_line_purpose": "Audit FSDK base and review container image attestations and SBOM.",
-      "entry_point": "docs/skills/image-audit.md",
-      "category": "ci-ops",
-      "status": "active",
-      "tags": [
-        "audit",
-        "sbom",
-        "slsa",
-        "attestation",
-        "ghcr"
-      ],
-      "description": "Audits base and derived OCI image composition, SPDX SBOM manifests, SLSA provenance attestations, and multi-arch publishing. Use when running tests/image-audit.sh or debugging publish workflows.",
-      "version": "1.0",
-      "last_updated": "2026-09-06",
-      "doc_type": "procedure"
-    },
-    {
       "id": "image-build",
       "name": "image-build",
-      "one_line_purpose": "Derive and pin the review contributor image safely.",
+      "one_line_purpose": "Build and pin the OMP review and contributor images.",
       "entry_point": "docs/skills/image-build.md",
       "category": "ci-ops",
       "status": "active",
@@ -148,50 +109,12 @@
         "image",
         "digest",
         "pinning",
-        "build",
-        "audit"
+        "omp",
+        "hive"
       ],
-      "description": "Use when maintaining the pinned FSDK-derived contributor image, audit, OMP assets, Hive runtime, or publishing path.",
-      "version": "2.25",
-      "last_updated": "2026-09-11",
-      "doc_type": "procedure"
-    },
-    {
-      "id": "lab-broker",
-      "name": "lab-broker",
-      "one_line_purpose": "Lend host Kubernetes cluster access to the review dashboard safely.",
-      "entry_point": "docs/skills/lab-broker.md",
-      "category": "ci-ops",
-      "status": "active",
-      "tags": [
-        "kubernetes",
-        "broker",
-        "lab",
-        "gvisor",
-        "socket"
-      ],
-      "description": "Controls the host-side lab broker, private Unix domain socket handoff, and gVisor host-uds safety for review-queue sessions. Use when debugging lab workflows or broker socket connectivity.",
-      "version": "1.0",
-      "last_updated": "2026-09-06",
-      "doc_type": "procedure"
-    },
-    {
-      "id": "landing-batches",
-      "name": "landing-batches",
-      "one_line_purpose": "Manage multi-PR landing batches and automated fix-and-land agents.",
-      "entry_point": "docs/skills/landing-batches.md",
-      "category": "ci-ops",
-      "status": "active",
-      "tags": [
-        "batches",
-        "landing",
-        "tui",
-        "agent",
-        "automerge"
-      ],
-      "description": "Manages batch landings, multi-repo lane partitioning, fix-and-land agents, and landing status persistence. Use when modifying batch execution or landing.py.",
-      "version": "1.3",
-      "last_updated": "2026-09-13",
+      "description": "Use when maintaining the distroless OMP review appliance or the OMP Hive contributor image.",
+      "version": "3.0",
+      "last_updated": "2026-09-14",
       "doc_type": "procedure"
     },
     {
@@ -205,12 +128,13 @@
         "just",
         "launcher",
         "podman",
-        "container",
-        "kubernetes"
+        "kubernetes",
+        "omp",
+        "hive"
       ],
-      "description": "Maintains the review launcher recipes and their credential boundaries. Use when editing justfile.",
-      "version": "3.10",
-      "last_updated": "2026-09-13",
+      "description": "Maintains the OMP appliance and Hive contributor launcher recipes without crossing their credential or authority boundaries.",
+      "version": "5.0",
+      "last_updated": "2026-09-14",
       "doc_type": "runbook"
     },
     {
@@ -254,7 +178,7 @@
     {
       "id": "review-checks",
       "name": "review-checks",
-      "one_line_purpose": "Maintain the five review check specifications and consolidated review scope.",
+      "one_line_purpose": "Maintain the OMP workbench review agents and policy seam.",
       "entry_point": "docs/skills/review-checks.md",
       "category": "ci-ops",
       "status": "active",
@@ -262,17 +186,18 @@
         "checks",
         "review",
         "subagents",
-        "doctrine"
+        "doctrine",
+        "omp"
       ],
-      "description": "Maintains the five image-owned review check definitions (bluefin-doctrine, security, correctness, test-coverage, simplicity) and review scope. Use when changing review checks or review doctrine.",
-      "version": "1.1",
-      "last_updated": "2026-09-09",
+      "description": "Maintains the review agents shipped by the OMP workbench. Use when changing review doctrine, specialist responsibilities, or orchestration prompts.",
+      "version": "2.0",
+      "last_updated": "2026-09-14",
       "doc_type": "reference"
     },
     {
       "id": "review-dashboard",
       "name": "review-dashboard",
-      "one_line_purpose": "Maintain the Oh My Pi review extension and the retained Textual compatibility dashboard.",
+      "one_line_purpose": "Maintain the single-screen OMP review workbench.",
       "entry_point": "docs/skills/review-dashboard.md",
       "category": "ci-ops",
       "status": "active",
@@ -281,71 +206,32 @@
         "extension",
         "dashboard",
         "review",
-        "textual",
-        "maintainer"
+        "maintainer",
+        "workflowz"
       ],
-      "description": "Maintains the primary Oh My Pi review extension in image/extension/bluefin-review/ and the retained Textual compatibility dashboard in image/tui/bluefin_review_tui.py. Use when editing review UI or action seams.",
-      "version": "3.1",
-      "last_updated": "2026-09-09",
+      "description": "Maintains the OMP review workbench in image/extension/bluefin-review/. Use when editing review UI, queue projection, workflowz dispatch, or action seams.",
+      "version": "4.0",
+      "last_updated": "2026-09-14",
       "doc_type": "runbook"
-    },
-    {
-      "id": "review-exec-broker",
-      "name": "review-exec-broker",
-      "one_line_purpose": "Offload selected batch reviews through a session-scoped host broker.",
-      "entry_point": "docs/skills/review-exec-broker.md",
-      "category": "ci-ops",
-      "status": "active",
-      "tags": [
-        "review",
-        "broker",
-        "kubernetes",
-        "socket",
-        "batch"
-      ],
-      "description": "Maintains the optional review-exec UDS broker, typed review Jobs, session cleanup, and local fallback.",
-      "version": "1.0",
-      "last_updated": "2026-09-06",
-      "doc_type": "procedure"
     },
     {
       "id": "review-monitoring",
       "name": "review-monitoring",
-      "one_line_purpose": "Monitor running review containers, landing batch execution, and container health.",
+      "one_line_purpose": "Monitor OMP workbenches and Hive contributor workers.",
       "entry_point": "docs/skills/review-monitoring.md",
       "category": "ci-ops",
       "status": "active",
       "tags": [
         "monitoring",
         "review",
-        "landings",
-        "queue",
-        "kubernetes",
-        "countme"
+        "omp",
+        "hive",
+        "container"
       ],
-      "description": "Use when observing, diagnosing, or monitoring running review-queue or review-container instances, landing batches, or agent process health.",
-      "version": "1.5",
-      "last_updated": "2026-09-08",
+      "description": "Use when observing or diagnosing a running OMP review appliance or Hive contributor worker.",
+      "version": "2.0",
+      "last_updated": "2026-09-14",
       "doc_type": "procedure"
-    },
-    {
-      "id": "review-scheduler",
-      "name": "review-scheduler",
-      "one_line_purpose": "Admit review work process-wide, batch transport, and never batch judgement.",
-      "entry_point": "docs/skills/review-scheduler.md",
-      "category": "ci-ops",
-      "status": "active",
-      "tags": [
-        "scheduler",
-        "capacity",
-        "throughput",
-        "rate-limit",
-        "worktree"
-      ],
-      "description": "Owns process-wide review admission, capacity measurement, subprocess deadlines, dependency circuit breakers, and repository transport reuse. Use when changing review_engine.py, capacity.py, or anything that dispatches reviews.",
-      "version": "1.0",
-      "last_updated": "2026-09-07",
-      "doc_type": "runbook"
     },
     {
       "id": "skill-improvement",

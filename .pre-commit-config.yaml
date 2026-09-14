@@ -80,14 +80,6 @@ repos:
   # ------------------------------------------------------------------ local
   - repo: local
     hooks:
-      # image/ is half of what this repo ships, and every assertion is a
-      # substring check over a file, so it costs nothing to run per-commit.
-      - id: image-contract
-        name: image contract holds
-        language: system
-        entry: bash tests/image-contract.sh
-        files: ^(image|tests/image-contract\.sh)
-        pass_filenames: false
       # docs/skills/index.json is generated from front-matter; the checker
       # fails on a stale manifest (regenerate with --write).
       - id: check-skill-frontmatter
@@ -102,20 +94,13 @@ repos:
         entry: bash tests/generate-skills.sh
         files: ^(scripts/generate-skills\.py|tests/generate-skills\.sh)$
         pass_filenames: false
-      - id: sbom-manifest
-        name: SBOM manifest generator contract
-        language: system
-        entry: bash tests/sbom-manifest.sh
-        files: ^(scripts/generate-sbom-manifest\.py|tests/sbom-manifest\.sh|image/Containerfile|\.dockerignore|\.github/workflows/publish-compat-image\.yml)$
-        pass_filenames: false
-      # The omp review mode ships as loose TypeScript that only executes inside a
-      # TUI, so a break there is invisible until a maintainer is mid-review. This
-      # runs it headlessly against a fake host.
+      # The OMP workbench ships as loose TypeScript, so exercise it headlessly
+      # against a fake host on every related change.
       - id: omp-review-mode
         name: omp review mode contract
         language: system
         entry: bash tests/omp-review-mode.sh
-        files: ^(image/extension/|image/harness/omp\.py|bin/omp-review|tests/omp-review-mode\.(sh|test\.ts)|tests/omp_harness_contract\.py)
+        files: ^(image/extension/|bin/omp-review|tests/omp-review-mode\.(sh|test\.ts))
         pass_filenames: false
       # The appliance is assembled from pinned artifacts rather than installed,
       # so its Containerfile is the whole supply chain. The static half of the

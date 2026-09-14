@@ -1,9 +1,9 @@
 {
-	"name": "bluefin-review",
+	"name": "hive-workbench",
 	"version": "1.0.0",
 	"private": true,
 	"type": "module",
-	"description": "Project Bluefin review mode for Oh My Pi: live Dagger-style pipeline dashboard over the PR/issue queue.",
+	"description": "OMP-native workbench for Hive-ranked issue and pull-request batches.",
 	"omp": {
 		"extensions": ["./index.ts"]
 	}

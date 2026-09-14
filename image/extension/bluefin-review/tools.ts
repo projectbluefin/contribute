@@ -6,9 +6,7 @@
  */
 
 import { diffToText, fetchDiff } from "./github.ts";
-import { fetchHiveMe, hiveFailureStatus } from "./hive.ts";
-import { fetchHiveLeaderboard, getTierInfo } from "./leaderboard.ts";
-import { queueKey } from "./state.ts";
+import { hiveFailureStatus } from "./hive.ts";
 import { traceToText } from "./trace.ts";
 
 interface ToolContent {
@@ -63,16 +61,13 @@ function resolveRepo(mode: ReviewMode, params: Record<string, unknown>): string 
 function orderLine(mode: ReviewMode): string {
 	const hive = mode.hive;
 	if (!hive.configured) {
-		return "order: local — no hive hub configured; queue classified from live GitHub evidence";
+		return "order: unranked — no hive hub configured; GitHub evidence is browse-only";
 	}
 	if (!hive.online) {
-		return `order: local — ${hiveFailureStatus(hive.error)}, configured but unreachable`;
+		return `order: unavailable — ${hiveFailureStatus(hive.error)}; GitHub evidence is browse-only`;
 	}
 	const actionable = hive.actionableItems === undefined ? "" : `, ${hive.actionableItems} actionable overall`;
 	const coverage = mode.hiveCoverage();
-	if (mode.orderSource() !== "hive") {
-		return `order: local — hive is online at ${hive.hub} but has queued nothing in this scope${actionable}`;
-	}
 	const shortfall =
 		coverage.present < coverage.total
 			? ` ${coverage.total - coverage.present} of Hive's ${coverage.total} queued items could not be resolved on GitHub and are missing from this queue.`
@@ -89,10 +84,10 @@ export function registerTools(pi: ToolHost, mode: ReviewMode, whenReady: () => P
 	const z = pi.zod;
 
 	pi.registerTool({
-		name: "bluefin_review_status",
-		label: "Review Status",
+		name: "hive_workbench_status",
+		label: "Workbench Status",
 		description:
-			"Current Bluefin review queue: mode, counts, the selected item, and the durable pipeline trace recorded for it (run state, review events, landing events, receipt findings).",
+			"Current Hive workbench queue, selection, source authority, and available execution evidence.",
 		parameters: z.object({}),
 		async execute() {
 			await whenReady();
@@ -118,7 +113,7 @@ export function registerTools(pi: ToolHost, mode: ReviewMode, whenReady: () => P
 					priority ? `priority: ${priority.category} (${priority.reason}, ${priority.source})` : "priority: unranked",
 					item.url,
 					"",
-					traceToText(mode.pipelineSpans(now), now),
+					traceToText(mode.session.roots(), now),
 				);
 			} else {
 				lines.push("", "no item selected");
@@ -147,17 +142,16 @@ export function registerTools(pi: ToolHost, mode: ReviewMode, whenReady: () => P
 					queue_error: mode.queueError ?? null,
 					ci: tally,
 					selected: item ?? null,
-					state_root: mode.stateRoot,
 				},
 			};
 		},
 	});
 
 	pi.registerTool({
-		name: "bluefin_review_queue",
-		label: "Review Queue",
+		name: "hive_workbench_queue",
+		label: "Workbench Queue",
 		description:
-			"List the live Project Bluefin queue of open pull requests or issues, optionally filtered by a substring across title, repository, author, label, and number.",
+			"List the live workbench queue of open pull requests or issues, optionally filtered by title, repository, author, label, or number.",
 		parameters: z.object({
 			filter: z.string().describe("substring matched against title, repo, author, labels, number").optional(),
 			limit: z.number().describe("maximum rows to return (default 30)").optional(),
@@ -208,7 +202,7 @@ export function registerTools(pi: ToolHost, mode: ReviewMode, whenReady: () => P
 	});
 
 	pi.registerTool({
-		name: "bluefin_review_diff",
+		name: "hive_workbench_diff",
 		label: "Review Diff",
 		description:
 			"Fetch the bounded diff for a pull request from the GitHub API: every changed file with add/delete counts, and patch text for the first files up to a character budget.",
@@ -249,50 +243,26 @@ export function registerTools(pi: ToolHost, mode: ReviewMode, whenReady: () => P
 	});
 
 	pi.registerTool({
-		name: "bluefin_review_trace",
+		name: "hive_workbench_trace",
 		label: "Review Trace",
-		description:
-			"Render the recorded pipeline trace for one pull request from the appliance's durable state: run state machine, review batch events, landing lifecycle, and receipt findings.",
-		parameters: z.object({
-			pull_request: z.number().describe("Pull request number"),
-			repo: z.string().describe("owner/repo; defaults to the selected item's repository").optional(),
-		}),
-		async execute(_id, params) {
-			const pullRequest = typeof params.pull_request === "number" ? params.pull_request : Number.NaN;
-			if (!Number.isInteger(pullRequest) || pullRequest < 1) {
-				return { content: text("pull_request must be a positive integer"), isError: true };
-			}
-			const repo = resolveRepo(mode, params);
-			if (!repo) {
-				return { content: text("no repository: pass repo as owner/name, or select a queue item first"), isError: true };
-			}
-
-			mode.refreshState();
+		description: "Render the current OMP session and workflowz execution trace.",
+		parameters: z.object({}),
+		async execute() {
 			const now = Date.now();
-			const key = queueKey(repo, pullRequest);
-			const item = mode.items.find((entry) => entry.repo === repo && entry.id === pullRequest);
-			const spans = mode.tracePipeline(key, item?.title ?? "", now);
-			const receipt = mode.snapshot.receipts.get(key);
-
+			const spans = mode.session.roots();
 			return {
 				content: text(traceToText(spans, now)),
-				details: {
-					repo,
-					pull_request: pullRequest,
-					state_root: mode.stateRoot,
-					receipt: receipt ?? null,
-					has_state: spans.some((span) => (span.children?.length ?? 0) > 0),
-				},
+				details: { has_state: spans.length > 0 },
 			};
 		},
 	});
 	pi.registerTool({
-		name: "bluefin_hive_lookup",
+		name: "hive_workbench_lookup",
 		label: "Hive Lookup",
 		description:
-			"Programmatically query the authenticated Project Bluefin Hive hub: live status, connected contributors, current contributor/task state, queue items, or the curated Markdown knowledge base.",
+			"Query the authenticated Hive hub for live status, contributor state, ordered work, triage, or curated knowledge.",
 		parameters: z.object({
-			target: z.string().describe("Target query: 'status' (default), 'knowledge' (curated patterns & test gaps), 'me' (contributor identity and task), 'queue' (ordered tasks), 'triage' (stages), or 'leaderboard' (top 25 contributors & task counts)").optional(),
+			target: z.string().describe("Target query: 'status' (default), 'knowledge', 'me', 'queue', or 'triage'").optional(),
 		}),
 		async execute(_id, params) {
 			await whenReady();
@@ -321,7 +291,7 @@ export function registerTools(pi: ToolHost, mode: ReviewMode, whenReady: () => P
 			}
 
 			if (target === "me") {
-				const me = await fetchHiveMe({ env: process.env });
+				const me = await mode.getHiveMe();
 				if (!me) {
 					return {
 						content: text(`Hive /api/v1/me unavailable from ${hive.hub}`),
@@ -348,23 +318,6 @@ export function registerTools(pi: ToolHost, mode: ReviewMode, whenReady: () => P
 				return {
 					content: text(lines.length > 0 ? lines.join("\n") : "No triage groups recorded"),
 					details: { target: "triage", groups: hive.triage },
-				};
-			}
-			if (target === "leaderboard") {
-				const roster = await fetchHiveLeaderboard({ env: process.env });
-				if (roster.length === 0) {
-					return {
-						content: text("Hive leaderboard is currently empty or unavailable"),
-						details: { target: "leaderboard", count: 0, items: [] },
-					};
-				}
-				const lines = roster.slice(0, 25).map((c, idx) => {
-					const tier = getTierInfo(c.totalTasksCompleted);
-					return `${idx + 1}. @${c.username} [${c.trustTier}] — ${c.totalTasksCompleted} tasks (${c.totalTasksCompletedWithPr} with PR) | ${tier.description}`;
-				});
-				return {
-					content: text(lines.join("\n")),
-					details: { target: "leaderboard", count: roster.length, items: roster.slice(0, 25) },
 				};
 			}
 			// Default: status overview

@@ -12,92 +12,68 @@
  */
 
 import { GLYPH, SPINNER_TICK_MS, type Painter, formatDuration, statusIcon, statusRole } from "./glyphs.ts";
-import type { QueueItem } from "./github.ts";
+import type { QueueItem, QueueMode } from "./github.ts";
 import { type KeyMatcher, canonicalKey, rawKeyMatcher } from "./keys.ts";
 import { type ReviewMode, ciGlyph } from "./mode.ts";
-import { type RailKey, keymapBar, orderSourceLabel, priorityChip, tmuxReviewStatusBar } from "./rail.ts";
+import { type RailKey, keymapBar, orderSourceLabel, priorityChip, workbenchProgressBar } from "./rail.ts";
 import { type RenderedRow, type Span, defaultExpanded, findSpan, hasChildren, renderSpanTree, visibleSpanIds } from "./trace.ts";
 import { fitToWidth, truncateToWidth, visibleWidth } from "./width.ts";
-import { BLUEFIN_RAPTOR_BANNER, renderRaptorGlyph } from "./mascot.ts";
 export type DashboardAction =
 	| { kind: "close" }
 	| { kind: "review"; item: QueueItem; items?: QueueItem[] }
 	| { kind: "diff"; item: QueueItem; items?: QueueItem[] }
-	| { kind: "docs"; item: QueueItem; items?: QueueItem[] }
-	| { kind: "approve"; item: QueueItem; items?: QueueItem[] }
+	| { kind: "comment"; item: QueueItem; items?: QueueItem[] }
 	| { kind: "fix"; item: QueueItem; items?: QueueItem[] }
-	| { kind: "slay"; item: QueueItem; items?: QueueItem[] }
 	| { kind: "reference"; item: QueueItem; items?: QueueItem[] }
 	| { kind: "scope" }
-	| { kind: "snapshot" }
-	| { kind: "leaderboard" };
 
 export const DASHBOARD_KEYS: readonly RailKey[] = [
-	{ chord: "s", label: "autoslay" },
-	{ chord: "r/enter", label: "review" },
-	{ chord: "a", label: "approve" },
+	{ chord: "b", label: "batch" },
+	{ chord: "c", label: "comment" },
+	{ chord: "f", label: "fix" },
 	{ chord: "space", label: "select" },
+	{ chord: "alt+b", label: "repo group" },
 	{ chord: "A", label: "all" },
 	{ chord: "x", label: "clear" },
 	{ chord: "j/k", label: "move" },
-	{ chord: "tab", label: "pane" },
+	{ chord: "tab", label: "prs/issues" },
+	{ chord: "t", label: "trace" },
+	{ chord: "p", label: "pause" },
 	{ chord: "h/l", label: "fold" },
-	{ chord: "i", label: "prs/issues" },
 	{ chord: "H", label: "hive" },
 	{ chord: "L", label: "stage" },
 	{ chord: "d", label: "diff" },
-	{ chord: "D", label: "docs" },
-	{ chord: "f", label: "fix" },
-	{ chord: "y", label: "cite" },
-	{ chord: "*", label: "leaders" },
+	{ chord: "enter", label: "cite" },
 	{ chord: "o", label: "repo" },
 	{ chord: "/", label: "filter" },
 	{ chord: "q", label: "close" },
 ];
 
 const HELP: readonly string[] = [
-	"Bluefin review dashboard",
+	"HIVE WORKBENCH",
 	"",
 	"  space            toggle selection on the highlighted item",
-	"  x                clear all selections",
-	"  A                select every row the filters left on screen (max 25)",
-	"  tab              switch between queue and trace",
+	"  alt+b            select or clear the current repository group",
+	"  x / A            clear selections / select the filtered slice",
+	"  tab              toggle pull requests and issues",
+	"  t                switch between queue and trace panes",
+	"  p                pause or resume future repository waves",
 	"  h / l, ← / →     collapse or expand a trace span",
 	"  g / G            jump to first or last row",
-	"  i                toggle pull requests and issues",
-	"  H                toggle hive-only filter (default: on)",
-	"  L                step through Hive's triage stages, then back to all",
-	"  o                review another repository (owner/repo)",
-	"  u                refetch the queue now",
-	"  /                search/filter by title, repo, author, label, number",
-	"                   (in search: type to live-filter, tab/space to select, A to select all)",
-	"  enter / r        review selected pull request (autoslay mode on batch selection)",
-	"  d                inspect its bounded diff",
-	"  D                update documentation enforcing agentic docs system",
-	"  a                verify checks, approve, squash merge",
-	"  f                fix the findings reported for it",
-	"  s                slay: on a pull request review, patch, verify, land;",
-	"                   on an issue implement it and open a pull request",
-	"  y                cite the selection in the prompt",
-	"  b                build a container snapshot",
-	"  *                hive weekly leaderboard (top 25 contributors)",
+	"  H / L            toggle Hive-only / step Hive stages",
+	"  o / r            change repository / refetch",
+	"  /                filter by title, repo, author, label, or number",
+	"  b                review selected item(s) as repository waves",
+	"  c                comment on selected item(s)",
+	"  f                fix selected item(s) in isolated workspaces",
+	"  d                inspect bounded diff evidence",
+	"  enter            cite the selection in the prompt",
 	"  ?                close this help",
-	"  q, esc           close the dashboard",
+	"  q, esc           close the workbench",
 	"",
-	"Mouse / Click parity:",
-	"  Click any queue row to select it; click the checkbox to toggle it.",
-	"  Click panes to focus; click trace spans to collapse/expand.",
-	"  Scroll with the mouse wheel to navigate queue or trace.",
-	"  Click any visible keymap action to trigger it.",
-	"",
-	"Trace spans come from the appliance's own durable state under",
-	"bluefin-review/: run-state, review batches, landings, receipts.",
-	"Live turn spans come from this session's tool executions.",
-	"",
-	"Order comes from Hive when a hub is configured — its queue, its",
-	"positions, never recomputed here. Without a hub the queue is",
-	"categorized locally: ready, findings, blocked, waiting, deps,",
-	"draft, stale. The header always names which one ran.",
+	"The trace projects OMP turn and tool execution.",
+	"Hive supplies priority and claims. GitHub supplies read-only evidence when",
+	"the connected Hive does not yet expose the unified work capability.",
 ];
 
 interface TuiLike {
@@ -114,11 +90,7 @@ export interface MouseEvent {
 	wheel?: -1 | 1;
 }
 
-/**
- * Parses terminal mouse reporting sequences into structured MouseEvent objects.
- * Supports SGR 1006 (\x1b[<b;x;y[Mm]), X10/X11 (\x1b[MCbCxCy), URXVT (\x1b[b;x;yM),
- * and direct programmatic/pilot strings (click:col,row, wheel:up/down, or JSON).
- */
+/** Parse terminal SGR, X10/X11, and URXVT mouse reporting sequences. */
 export function parseMouseEvent(data: string): MouseEvent | undefined {
 	// SGR format: \x1b[<button;x;y[Mm]
 	const sgrMatch = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
@@ -161,47 +133,6 @@ export function parseMouseEvent(data: string): MouseEvent | undefined {
 		return { button, col: Math.max(0, col), row: Math.max(0, row), release: false };
 	}
 
-	// Direct text commands: "click(x, y)", "click:x,y", "mouse:click:x,y"
-	const directClick = /^(?:mouse:)?click(?:\((\d+),\s*(\d+)\)|:(\d+)[,:](\d+))$/.exec(data);
-	if (directClick) {
-		const col = Number.parseInt(directClick[1] ?? directClick[3]!, 10);
-		const row = Number.parseInt(directClick[2] ?? directClick[4]!, 10);
-		return { button: 0, col: Math.max(0, col), row: Math.max(0, row), release: false };
-	}
-
-	// Wheel text commands: "wheel:up", "wheel:down", etc.
-	const directWheel = /^(?:mouse:)?wheel:(up|down)(?::(\d+)[,:](\d+))?$/.exec(data);
-	if (directWheel) {
-		const dir = directWheel[1] === "up" ? -1 : 1;
-		const col = directWheel[2] ? Number.parseInt(directWheel[2], 10) : 0;
-		const row = directWheel[3] ? Number.parseInt(directWheel[3], 10) : 0;
-		return { button: dir === -1 ? 64 : 65, col: Math.max(0, col), row: Math.max(0, row), release: false, wheel: dir };
-	}
-
-	// JSON-formatted mouse events
-	if (data.startsWith("{") && data.endsWith("}")) {
-		try {
-			const obj = JSON.parse(data) as Record<string, unknown>;
-			if (obj.type === "click" || obj.event === "click") {
-				return {
-					button: typeof obj.button === "number" ? obj.button : 0,
-					col: Math.max(0, typeof obj.col === "number" ? obj.col : (typeof obj.x === "number" ? obj.x : 0)),
-					row: Math.max(0, typeof obj.row === "number" ? obj.row : (typeof obj.y === "number" ? obj.y : 0)),
-					release: obj.release === true,
-				};
-			}
-			if (obj.type === "wheel" || obj.event === "wheel") {
-				const dir = typeof obj.direction === "number" ? (obj.direction < 0 ? -1 : 1) : -1;
-				return {
-					button: dir === -1 ? 64 : 65,
-					col: Math.max(0, typeof obj.col === "number" ? obj.col : (typeof obj.x === "number" ? obj.x : 0)),
-					row: Math.max(0, typeof obj.row === "number" ? obj.row : (typeof obj.y === "number" ? obj.y : 0)),
-					release: false,
-					wheel: dir,
-				};
-			}
-		} catch {}
-	}
 
 	return undefined;
 }
@@ -234,6 +165,9 @@ export class ReviewDashboard {
 	private readonly onRefresh: () => void;
 	private readonly rows: number;
 	private readonly matchKey: KeyMatcher;
+	private readonly onModeChange?: (mode: QueueMode) => void;
+	private readonly onAction?: (action: DashboardAction) => void;
+	private readonly onPauseChange?: (paused: boolean) => void;
 
 	constructor(
 		tui: TuiLike,
@@ -243,6 +177,9 @@ export class ReviewDashboard {
 		onRefresh: () => void,
 		rows = 22,
 		matchKey: KeyMatcher = rawKeyMatcher,
+		onModeChange?: (mode: QueueMode) => void,
+		onAction?: (action: DashboardAction) => void,
+		onPauseChange?: (paused: boolean) => void,
 	) {
 		this.tui = tui;
 		this.painter = painter;
@@ -251,11 +188,13 @@ export class ReviewDashboard {
 		this.onRefresh = onRefresh;
 		this.rows = rows;
 		this.matchKey = matchKey;
+		this.onModeChange = onModeChange;
+		this.onAction = onAction;
+		this.onPauseChange = onPauseChange;
 		this.enableMouse();
 		const handle = setInterval(() => {
 			try {
 				this.frame += 1;
-				this.mode.refreshState();
 				this.tui.requestRender();
 			} catch {
 				// Never let a repaint tick escape: an uncaught throw here ends the session.
@@ -295,8 +234,8 @@ export class ReviewDashboard {
 
 	// ---- trace helpers -------------------------------------------------------
 
-	private traceRoots(now: number): Span[] {
-		return [...this.mode.pipelineSpans(now), ...this.mode.session.roots()];
+	private traceRoots(_now: number): Span[] {
+		return this.mode.session.roots();
 	}
 
 	private traceIds(now: number): string[] {
@@ -433,7 +372,8 @@ export class ReviewDashboard {
 			return;
 		}
 		if (col >= 18 && col <= 36) {
-			this.mode.toggleMode();
+			const nextMode = this.mode.toggleMode();
+			this.onModeChange?.(nextMode);
 			this.onRefresh();
 			this.tui.requestRender();
 			return;
@@ -610,17 +550,20 @@ export class ReviewDashboard {
 
 	private triggerChordAction(chord: string, col: number, startCol: number, chordWidth: number): void {
 		switch (chord) {
-			case "s":
-				this.executeKey("s");
+			case "b":
+				this.executeKey("b");
 				break;
-			case "r/enter":
-				this.executeKey("r");
+			case "c":
+				this.executeKey("c");
 				break;
-			case "a":
-				this.executeKey("a");
+			case "f":
+				this.executeKey("f");
 				break;
 			case "space":
 				this.executeKey("space");
+				break;
+			case "alt+b":
+				this.executeKey("alt+b");
 				break;
 			case "A":
 				this.executeKey("A");
@@ -638,15 +581,18 @@ export class ReviewDashboard {
 			case "tab":
 				this.executeKey("tab");
 				break;
+			case "t":
+				this.executeKey("t");
+				break;
+			case "p":
+				this.executeKey("p");
+				break;
 			case "h/l":
 				if (col < startCol + Math.floor(chordWidth / 2)) {
 					this.executeKey("h");
 				} else {
 					this.executeKey("l");
 				}
-				break;
-			case "i":
-				this.executeKey("i");
 				break;
 			case "H":
 				this.executeKey("H");
@@ -657,17 +603,8 @@ export class ReviewDashboard {
 			case "d":
 				this.executeKey("d");
 				break;
-			case "D":
-				this.executeKey("D");
-				break;
-			case "f":
-				this.executeKey("f");
-				break;
-			case "y":
-				this.executeKey("y");
-				break;
-			case "*":
-				this.executeKey("*");
+			case "enter":
+				this.executeKey("enter");
 				break;
 			case "o":
 				this.executeKey("o");
@@ -696,7 +633,8 @@ export class ReviewDashboard {
 			}
 			return;
 		}
-		this.mode.toggleMode();
+		const nextMode = this.mode.toggleMode();
+		this.onModeChange?.(nextMode);
 		this.onRefresh();
 		this.tui.requestRender();
 	}
@@ -711,8 +649,26 @@ export class ReviewDashboard {
 				this.showHelp = this.showHelp === false;
 				this.tui.requestRender();
 				return;
-			case "tab":
+			case "tab": {
+				const nextMode = this.mode.toggleMode();
+				this.onModeChange?.(nextMode);
+				this.onRefresh();
+				this.tui.requestRender();
+				return;
+			}
+			case "t":
 				this.pane = this.pane === "queue" ? "trace" : "queue";
+				this.tui.requestRender();
+				return;
+			case "p": {
+				const paused = this.mode.togglePaused();
+				this.onPauseChange?.(paused);
+				this.tui.requestRender();
+				return;
+			}
+			case "alt+b":
+			case "\u001bb":
+				this.mode.selectCurrentRepository();
 				this.tui.requestRender();
 				return;
 			case "/":
@@ -758,11 +714,6 @@ export class ReviewDashboard {
 				else this.pane = "trace";
 				this.tui.requestRender();
 				return;
-			case "i":
-				this.mode.toggleMode();
-				this.onRefresh();
-				this.tui.requestRender();
-				return;
 			case "H":
 				this.mode.toggleHiveOnly();
 				this.tui.requestRender();
@@ -771,17 +722,11 @@ export class ReviewDashboard {
 				this.mode.cycleHiveLevel();
 				this.tui.requestRender();
 				return;
-			case "u":
+			case "r":
 				this.onRefresh();
 				return;
 			case "o":
 				this.done({ kind: "scope" });
-				return;
-			case "b":
-				this.done({ kind: "snapshot" });
-				return;
-			case "*":
-				this.done({ kind: "leaderboard" });
 				return;
 			default:
 				break;
@@ -793,40 +738,32 @@ export class ReviewDashboard {
 		const items = chosenItems.length > 0 ? chosenItems : undefined;
 		const item = items ? items[0]! : activeItem;
 		switch (key) {
-			case "r":
-			case "return":
-			case "enter":
-				// With multiple items selected, batch review natively operates in autoslay mode
-				if (items && items.length > 1) {
-					this.done({ kind: "slay", item, items });
-				} else {
-					this.done({ kind: "review", item, items });
-				}
+			case "b":
+				this.emitAction({ kind: "review", item, items });
 				return;
-			case "d":
-				this.done({ kind: "diff", item, items });
-				return;
-			case "D":
-				this.done({ kind: "docs", item, items });
-				return;
-			case "a":
-				this.done({ kind: "approve", item, items });
+			case "c":
+				this.emitAction({ kind: "comment", item, items });
 				return;
 			case "f":
-				this.done({ kind: "fix", item, items });
+				this.emitAction({ kind: "fix", item, items });
 				return;
-			case "s": {
-				const slayable = this.mode.slayableItems();
-				const batch = chosenItems.length > 0 ? chosenItems : (slayable.length > 0 ? slayable.slice(0, 7) : undefined);
-				const targetItem = batch && batch.length > 0 ? batch[0]! : activeItem;
-				this.done({ kind: "slay", item: targetItem, items: batch && batch.length > 1 ? batch : undefined });
+			case "d":
+				this.emitAction({ kind: "diff", item, items });
 				return;
-			}
-			case "y":
-				this.done({ kind: "reference", item, items });
+			case "return":
+			case "enter":
+				this.emitAction({ kind: "reference", item, items });
 				return;
 			default:
 				break;
+		}
+	}
+
+	private emitAction(action: DashboardAction): void {
+		if (this.onAction) {
+			this.onAction(action);
+		} else {
+			this.done(action);
 		}
 	}
 
@@ -907,7 +844,7 @@ export class ReviewDashboard {
 	private headerRow(width: number, now: number): string {
 		const tally = this.mode.ciTally();
 		const parts = [
-			this.painter.bold(this.painter.fg("accent", `${GLYPH.hex} bluefin review`)),
+			this.painter.bold(this.painter.fg("accent", `${GLYPH.hex} HIVE WORKBENCH`)),
 			this.painter.fg("dim", GLYPH.logDashed.trim()),
 			this.painter.bold(this.painter.fg("text", this.mode.queueMode === "prs" ? "PULL REQUESTS" : "ISSUES")),
 			this.painter.fg("text", this.mode.position()),
@@ -947,7 +884,7 @@ export class ReviewDashboard {
 			if (this.mode.loading) {
 				emptyMsg = `  ${this.painter.fg("warning", statusIcon("running", this.frame))} loading queue…`;
 			} else if (this.mode.hiveOnly && this.mode.hive.online && this.mode.items.length > 0) {
-				emptyMsg = `  no Hive-ranked ${this.mode.queueMode} (${this.mode.items.length} unranked open — press H to show all, i for ${this.mode.queueMode === "prs" ? "issues" : "prs"})`;
+				emptyMsg = `  no Hive-ranked ${this.mode.queueMode} (${this.mode.items.length} unranked open — press H to show all, Tab for ${this.mode.queueMode === "prs" ? "issues" : "prs"})`;
 			} else {
 				emptyMsg = "  nothing open";
 			}
@@ -1064,7 +1001,7 @@ export class ReviewDashboard {
 		if (item.type === "issue" && item.closedByPrs && item.closedByPrs.length > 0) {
 			rows.push(
 				truncateToWidth(
-					`  ${this.painter.fg("accent", "merged PR:")} ${this.painter.fg("warning", item.closedByPrs.join(", "))} ${this.painter.fg("dim", "(slay to verify and close)")}`,
+					`  ${this.painter.fg("accent", "merged PR:")} ${this.painter.fg("warning", item.closedByPrs.join(", "))} ${this.painter.fg("dim", "(review before closing)")}`,
 					width,
 				),
 			);
@@ -1084,7 +1021,7 @@ export class ReviewDashboard {
 		const roots = this.traceRoots(now);
 		if (roots.length === 0) {
 			this.traceRowSpans.push(undefined);
-			return [...hive, this.painter.fg("dim", `  ${statusIcon("pending")} no pipeline state recorded yet`)];
+			return [...hive, this.painter.fg("dim", `  ${statusIcon("pending")} no OMP activity yet`)];
 		}
 		const ids = this.traceIds(now);
 		this.traceCursor = Math.min(this.traceCursor, Math.max(0, ids.length - 1));
@@ -1134,9 +1071,7 @@ export class ReviewDashboard {
 		const lines: string[] = [this.headerRow(width, now), this.painter.fg("border", "─".repeat(width))];
 
 		if (this.showHelp) {
-			for (const bannerLine of BLUEFIN_RAPTOR_BANNER) {
-				lines.push(truncateToWidth(this.painter.fg("accent", bannerLine), width));
-			}
+			lines.push(this.painter.bold(this.painter.fg("accent", "HIVE WORKBENCH")));
 			lines.push("");
 			for (const line of HELP) lines.push(truncateToWidth(this.painter.fg(line.startsWith("  ") ? "dim" : "text", line), width));
 			lines.push(keymapBar(this.painter, [{ chord: "?", label: "back" }], width));
@@ -1179,7 +1114,7 @@ export class ReviewDashboard {
 			lines.push(truncateToWidth(this.painter.fg("dim", `filter: ${this.mode.filter}  (/ to search · esc/clear to reset)`), width));
 		}
 		lines.push(keymapBar(this.painter, DASHBOARD_KEYS, width));
-		lines.push(tmuxReviewStatusBar(this.mode, this.painter, width, now));
+		lines.push(workbenchProgressBar(this.mode, this.painter, width));
 		return lines;
 	}
 

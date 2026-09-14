@@ -1,7 +1,7 @@
 ---
 name: hive-runtime
-version: "2.3"
-last_updated: 2026-08-25
+version: "3.0"
+last_updated: 2026-09-14
 id: hive-runtime
 one_line_purpose: Operate inside Hive's tmux, token, and cooldown constraints.
 entry_point: docs/skills/hive-runtime.md
@@ -18,8 +18,8 @@ metadata:
 
 # Hive Runtime
 
-> The published image contains the pinned Hive contributor runtime. These
-> procedures describe its handoff from the review launcher.
+> The contributor image contains the pinned Hive relay and OMP. These
+> procedures describe its handoff from the launcher.
 
 ## When to Use
 
@@ -39,27 +39,17 @@ credential handling ([`launcher.md`](launcher.md)).
 |---|---|
 | "A local shim will unblock this now." | It outlives the gap it was written for and shadows the real tool once upstream lands the fix. Report it and wait. |
 | "Upstream is slow; we can patch our copy." | A patched copy of a pinned upstream file silently diverges at the next bump, and nothing fails to say so. |
-| "The pin is close enough to upstream." | The image consumes three pinned Hive runtime files; verify their compatibility together and do not add a downstream protocol implementation. |
+| "The pin is close enough to upstream." | The image consumes Hive's pinned runtime files as one set; verify their compatibility together and do not add a downstream protocol implementation. |
 
 ## Core Process
 
 1. Let Hive own the WebSocket protocol, assignment selection, `contributor`
    tmux session, prompt injection, and result capture. Context7 reaches the
-   agent via the hub, which queries it server-side
-   (`src/pkg/knowledge/context7.go`) and delivers assigned-task context through
-   its knowledge export. Note that `review-container` is Codex-only.
-   review starts the runtime and does not reproduce Hive's jobs. Authenticated
-   reads use `Authorization: Bearer ${GH_TOKEN}` over HTTPS to `/api/v1/status`,
-   `/api/v1/me`, `/api/v1/contributors`, `/api/v1/knowledge`, `/api/contribute/queue`,
-   and `/api/contribute/triage`. It projects `hub`, `actionable_items`, and
-   `active_contributors` from status, plus `github_username`, `active`, and
-   `current_task.repo`/`number`/`title` from me; absent fields render as
-   `unknown`, active me records render as `working` or `idle`, inactive
-   records as `disconnected`, failed reads as `unavailable`; a failed refresh
-   after a successful read keeps the last assignment as `LAST KNOWN` with a
-   stale age. Hub-wide actionable and contributor counts are labeled
-   separately from the worker's own state, and the Hive-owned tmux session
-   remains authoritative.
+   agent through Hive's server-side knowledge export. Both `contribute` and
+   `review-container` launch the same OMP-only runtime; the launcher does not
+   choose a model or implement Hive's jobs. The maintainer workbench may read
+   Hive's HTTP projections for ordering and status, but those reads never grant
+   assignment authority.
 2. Attach only to inspect or deliberately steer a live session:
 
    ```bash
@@ -101,7 +91,7 @@ credential handling ([`launcher.md`](launcher.md)).
    informational. The relay reports its runtime posture during authentication,
    and Hive stores and surfaces it without routing or gating assignments on it.
    Do not add downstream capability-based task selection.
-8. Expect interactive delivery from `just contribute` and `just review-container`. The pinned runtime reads `CONTRIBUTOR_MODE`, which selects between `interactive` (the default: a live tmux pane the relay types the prompt into) and `headless` (no tmux session at all — the relay drives a one-shot CLI per task and writes lifecycle state to `HIVE_HEADLESS_STATUS_FILE`). The isolated OMP contributor is interactive-only; its Kubernetes manifest retains tmux probes but must not select a headless OMP path until upstream proves one-shot semantics. Do not set headless expecting the same attachable session.
+8. Expect interactive delivery from `just contribute` and `just review-container`. The pinned runtime reads `CONTRIBUTOR_MODE`, which selects between `interactive` (the default: a live tmux pane the relay types the prompt into) and `headless` (no tmux session at all — the relay drives a one-shot CLI per task and writes lifecycle state to `HIVE_HEADLESS_STATUS_FILE`). This OMP contributor is interactive-only; its Kubernetes manifest retains tmux probes and must not select headless mode until upstream proves equivalent one-shot semantics.
 
 ### Hive runtime contract
 
