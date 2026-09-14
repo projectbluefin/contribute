@@ -90,6 +90,7 @@ export function queueAge(fetchedAt: number, now: number): string | undefined {
 /** Colour per category: what the eye should land on first is loudest. */
 const CATEGORY_ROLE: Record<PriorityCategory, PaintRole> = {
 	hive: "accent",
+	personal_request: "accent",
 	"ready-for-human-merge": "success",
 	review: "warning",
 	"resolve-conflicts": "error",
@@ -101,6 +102,7 @@ const CATEGORY_ROLE: Record<PriorityCategory, PaintRole> = {
 /** Short forms, because a queue row is not a place for a sentence. */
 const CATEGORY_LABEL: Record<PriorityCategory, string> = {
 	hive: "hive",
+	personal_request: "direct-req",
 	"ready-for-human-merge": "merge",
 	review: "review",
 	"resolve-conflicts": "conflict",

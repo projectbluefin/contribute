@@ -77,6 +77,7 @@ export class ReviewMode {
 	fetchedAt = 0;
 	loading = false;
 	selectedKeys = new Set<string>();
+	currentUserLogin?: string;
 
 	snapshot: StateSnapshot;
 	hive: HiveSnapshot = EMPTY_HIVE;
@@ -170,6 +171,7 @@ export class ReviewMode {
 			hive: this.hive,
 			hasFindings: (key) => hasRecordedFindings(this.snapshot, key),
 			now,
+			currentUserLogin: this.currentUserLogin,
 		});
 	}
 

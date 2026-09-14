@@ -21,13 +21,13 @@ import type { HiveSnapshot } from "./hive.ts";
 
 export type PriorityCategory =
 	| "hive"
+	| "personal_request"
 	| "ready-for-human-merge"
 	| "review"
 	| "resolve-conflicts"
 	| "fix-ci"
 	| "investigate"
 	| "triage";
-
 export interface Priority {
 	category: PriorityCategory;
 	source: "hive" | "local";
@@ -44,8 +44,8 @@ export interface PrioritizeContext {
 	/** True when durable review state recorded findings for this key. */
 	hasFindings: (key: string) => boolean;
 	now: number;
+	currentUserLogin?: string;
 }
-
 export interface PrioritizedQueue {
 	items: QueueItem[];
 	priorities: ReadonlyMap<string, Priority>;
@@ -62,12 +62,13 @@ export interface PrioritizedQueue {
  */
 const MAINTAINER_ORDER: Record<PriorityCategory, number> = {
 	hive: 0,
-	"ready-for-human-merge": 1,
-	review: 2,
-	"resolve-conflicts": 3,
-	"fix-ci": 4,
-	investigate: 5,
-	triage: 6,
+	personal_request: 1,
+	"ready-for-human-merge": 2,
+	review: 3,
+	"resolve-conflicts": 4,
+	"fix-ci": 5,
+	investigate: 6,
+	triage: 7,
 };
 
 const STALE_AFTER_MS = 21 * 24 * 60 * 60 * 1000;
@@ -103,6 +104,9 @@ export function isDependencyBump(item: QueueItem): boolean {
  */
 export function categorize(item: QueueItem, context: PrioritizeContext): { category: PriorityCategory; reason: string } {
 	if (item.type === "issue") return { category: "triage", reason: "issue awaiting triage" };
+	if (context.currentUserLogin && item.requestedReviewers && item.requestedReviewers.includes(context.currentUserLogin)) {
+		return { category: "personal_request", reason: "review requested from you" };
+	}
 	if (item.draft) return { category: "investigate", reason: "draft, waiting on its author" };
 	if (context.hasFindings(itemKey(item))) return { category: "review", reason: "recorded review findings" };
 	if (item.ciStatus === "failure") return { category: "fix-ci", reason: "checks failing" };
@@ -224,6 +228,7 @@ export function prioritize(items: readonly QueueItem[], context: PrioritizeConte
 export function categoryTally(priorities: ReadonlyMap<string, Priority>): Record<PriorityCategory, number> {
 	const tally: Record<PriorityCategory, number> = {
 		hive: 0,
+		personal_request: 0,
 		"ready-for-human-merge": 0,
 		review: 0,
 		"resolve-conflicts": 0,
