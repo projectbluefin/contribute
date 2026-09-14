@@ -1,22 +1,16 @@
-# Project settings for projectbluefin/review.
+# Project settings for projectbluefin/review development.
 #
-# Subagent work in this repository runs on Gemini 3.8 Flash, the same model the
-# review appliance and the Textual dashboard already default to
-# (image/harness/omp.py, justfile's gemini_model). Research, review and triage
-# fan out across many agents; running them on the model this project is actually
-# tuned and budgeted for is what keeps a wide fan-out affordable and its output
-# consistent with what the appliance produces.
+# The interactive model remains the user's choice through /model. Repository
+# subagents are pinned so reviews and CI-oriented fan-out use one affordable,
+# reproducible model family; this file is not copied into either runtime image.
 #
 # Deliberately absent: modelRoles.default. The model *you* drive is yours to
-# pick with /model; this file only decides what the agents you spawn run on.
+# choose; these settings apply only to agents spawned while working in this repo.
 task:
   agentModelOverrides:
-    # Read-only research and mechanical collection.
     scout: github-copilot/gemini-3.8-flash
     sonic: github-copilot/gemini-3.8-flash
     task: github-copilot/gemini-3.8-flash
-    # Judgement work gets the same model at a higher effort rather than a
-    # different model: one lineage, one set of habits, one failure mode.
     reviewer: github-copilot/gemini-3.8-flash:high
     security-reviewer: github-copilot/gemini-3.8-flash:high
     bluefin-doctrine: github-copilot/gemini-3.8-flash:high
@@ -27,9 +21,6 @@ task:
     bluefin-simplicity: github-copilot/gemini-3.8-flash:high
     bluefin-reviewer: github-copilot/gemini-3.8-flash:high
     bluefin-queue-triage: github-copilot/gemini-3.8-flash:high
-# Role aliases the shipped review agents and any local agent may reference.
-# Concrete selectors live here so an agent definition can name a role without
-# hardcoding a provider.
 modelRoles:
   review: github-copilot/gemini-3.8-flash:high
   fast: github-copilot/gemini-3.8-flash

@@ -28,7 +28,8 @@ if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" && -z "${COPILOT_GITHUB_TOKEN
   if command -v python3 &>/dev/null; then
     RESOLVED_OMP_TOKEN="$(python3 -c '
 import sqlite3, os, json
-db_path = os.path.expanduser("~/.omp/agent/agent.db")
+state_dir = os.environ.get("BLUEFIN_OMP_STATE") or os.path.expanduser("~/.omp")
+db_path = os.path.join(state_dir, "agent/agent.db")
 if os.path.exists(db_path):
     try:
         conn = sqlite3.connect(db_path)
@@ -58,10 +59,10 @@ if [[ -z "${COPILOT_GITHUB_TOKEN:-}" && -n "${GH_TOKEN:-}" ]]; then
   export COPILOT_GITHUB_TOKEN="$GH_TOKEN"
 fi
 # 3. Ensure all spawned subagents, subprocesses, and tool bridges inherit credentials
-export GH_TOKEN="${GH_TOKEN:-}"
-export GITHUB_TOKEN="${GITHUB_TOKEN:-}"
-export COPILOT_GITHUB_TOKEN="${COPILOT_GITHUB_TOKEN:-}"
-export GITHUB_COPILOT_TOKEN="${GITHUB_COPILOT_TOKEN:-}"
+export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+export GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+export COPILOT_GITHUB_TOKEN="${COPILOT_GITHUB_TOKEN:-${GH_TOKEN:-}}"
+export GITHUB_COPILOT_TOKEN="${GITHUB_COPILOT_TOKEN:-${COPILOT_GITHUB_TOKEN:-}}"
 export CONTEXT7_API_KEY="${CONTEXT7_API_KEY:-}"
 # Pin Copilot client identity to developer CLI so Gemini/Kimi models are permitted by GitHub Copilot
 export COPILOT_INTEGRATION_ID="${COPILOT_INTEGRATION_ID:-copilot-developer-cli}"

@@ -148,9 +148,6 @@ export function parseScope(input: string, defaultOrg: string): QueueScope | unde
 	return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(trimmed) ? { kind: "repo", value: trimmed } : undefined;
 }
 
-export function describeScope(scope: QueueScope): string {
-	return scope.kind === "org" ? scope.value : scope.value;
-}
 
 export function searchExpression(mode: QueueMode, scope: QueueScope): string {
 	const kind = mode === "prs" ? "is:pr" : "is:issue";
@@ -250,14 +247,14 @@ function toReviewState(value?: string | null): ReviewState {
 }
 
 function toQueueItem(node: SearchNode, mode: QueueMode): QueueItem | undefined {
-	if (typeof node.number !== "number") return undefined;
+	if (typeof node.number !== "number" || !node.repository?.nameWithOwner) return undefined;
 	const updated = node.updatedAt ? Date.parse(node.updatedAt) : Number.NaN;
 	return {
 		id: node.number,
 		type: mode === "prs" ? "pr" : "issue",
-		repo: node.repository?.nameWithOwner ?? DEFAULT_ORG,
+		repo: node.repository.nameWithOwner,
 		title: node.title ?? "(untitled)",
-		author: node.author?.login ?? "ghost",
+		author: node.author?.login ?? "unknown",
 		url: node.url ?? "",
 		updatedAt: Number.isNaN(updated) ? 0 : updated,
 		draft: node.isDraft === true,
@@ -704,6 +701,50 @@ export async function fetchDiff(repo: string, pullRequest: number, options: Diff
 		return result;
 	}
 }
+export interface CollaboratorPermissionResult {
+	permission?: string;
+	isCollaborator: boolean;
+	error?: string;
+}
+
+/**
+ * Query authenticated user repository permission from GitHub REST API:
+ * GET /repos/{owner}/{repo}/collaborators/{username}/permission
+ *
+ * Returns the authoritative GitHub permission (e.g. "admin", "write", "read", "none").
+ */
+export async function fetchCollaboratorPermission(
+	repo: string,
+	username: string,
+	options: FetchOptions = {},
+): Promise<CollaboratorPermissionResult> {
+	const { token, signal } = options;
+	const doFetch = options.fetchImpl ?? fetch;
+	try {
+		const response = await doFetch(
+			`https://api.github.com/repos/${repo}/collaborators/${username}/permission`,
+			{ headers: headers(token), signal, redirect: "error" },
+		);
+		if (!response.ok) {
+			if (response.status === 404) {
+				return { permission: "none", isCollaborator: false };
+			}
+			return { isCollaborator: false, error: `GitHub REST ${response.status} ${response.statusText}` };
+		}
+		const data = (await response.json()) as { permission?: string; role_name?: string };
+		const perm = data.permission ?? data.role_name ?? "none";
+		return {
+			permission: perm,
+			isCollaborator: perm === "admin" || perm === "write" || perm === "maintain",
+		};
+	} catch (error) {
+		return {
+			isCollaborator: false,
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
 
 /** Render a diff result as the compact text an agent should read. */
 export function diffToText(diff: DiffResult): string {

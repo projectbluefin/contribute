@@ -14,7 +14,7 @@ Closes #
 - [ ] PR title follows Conventional Commits (`fix:`, `feat:`, `docs:`, `ci:`, `refactor:`, etc.)
 - [ ] `bash scripts/check-skill-frontmatter.sh` passes
 - [ ] `bash tests/generate-skills.sh` passes
-- [ ] `bash tests/image-contract.sh` passes
+- [ ] `bash tests/appliance-contract.sh` and `bash tests/contribute-contract.sh` pass
 - [ ] `bash tests/just-onboarding.sh` passes
 - [ ] `git diff --check` is clean
 - [ ] `just --list` parses
