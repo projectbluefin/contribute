@@ -810,6 +810,10 @@ export class ReviewDashboard {
 				this.done({ kind: "docs", item, items });
 				return;
 			case "a":
+				if (this.mode.isBlueberry) {
+					this.tui.requestRender();
+					return;
+				}
 				this.done({ kind: "approve", item, items });
 				return;
 			case "f":

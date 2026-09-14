@@ -21,6 +21,7 @@ import { type ToolHost, registerTools } from "./tools.ts";
 import { BluefinAnsiSplash } from "./splash.ts";
 import { HiveLeaderboardComponent } from "./leaderboard.ts";
 import { hiveFailureStatus } from "./hive.ts";
+import { BLUEBERRY_WELCOME_MESSAGE, assertBlueberryActionAllowed, checkBlueberryPermission } from "./blueberry.ts";
 export {
 	type MutationKind,
 	type MutationCapability,
@@ -191,7 +192,11 @@ export function isImplementationAction(action: DashboardAction): boolean {
  * the review contributes to what the project decided matters, and an agent that
  * is not told the link cannot honor it.
  */
-export function actionPrompt(action: DashboardAction, priority?: Priority): string | undefined {
+export function actionPrompt(
+	action: DashboardAction,
+	priority?: Priority,
+	options?: { isBlueberry?: boolean; model?: string },
+): string | undefined {
 	const autonomousRule = "This is an automated review and landing tool: execute all actions end-to-end autonomously in a continuous loop. Never ask the user for confirmation, permission, or interactive prompts to proceed. Once a batch or queue item is complete, immediately request the next assignment from the queue or advance to the next item so the loop runs continuously without stopping.";
 	const mutationRule = "Typed GitHub mutations prefer native/gh/API tools. Browser is bounded fallback for UI-only work; equivalent preferred attempts are not repeated indefinitely. Preserved human confirmation and merge authority: stop and report instead of merging if any check is failing or pending.";
 	// A turn spent asleep is a turn billed for nothing: the queue re-dispatches on
@@ -291,6 +296,9 @@ export function actionPrompt(action: DashboardAction, priority?: Priority): stri
 	}
 	switch (action.kind) {
 		case "review":
+			if (options?.isBlueberry) {
+				return `Review ${cite(action.item)} in Blueberry advisory mode. Read the bounded diff with bluefin_review_diff and the recorded pipeline with bluefin_review_trace before judging. As a non-maintainer Blueberry contributor, donate your review to the project as an advisory submission. Format your review with \`[Blueberry Advisory Review | Model: ${options.model ?? "default"}]\` and submit it as a GitHub pull request comment or advisory review (\`gh pr review ${action.item.id} --repo ${action.item.repo} --comment -b "..."\`). Never approve, merge, or apply landing labels.${hive}`;
+			}
 			return `Review ${cite(action.item)}. Read the bounded diff with bluefin_review_diff and the recorded pipeline with bluefin_review_trace before judging. Report findings by severity with file:line evidence, covering doctrine, correctness, security, tests, and simplicity. State explicitly what you verified and what you could not.${hive}`;
 		case "diff":
 			return `Call bluefin_review_diff for pull request ${action.item.id} in ${action.item.repo} and summarise what actually changed, file by file, with the risk each change carries. ${autonomousRule}`;
@@ -446,6 +454,14 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			"items" in action && action.items && action.items.length > 0 ? [...action.items] : [action.item];
 
 		const isImpl = isImplementationAction(action);
+		if (mode.isBlueberry) {
+			const guard = assertBlueberryActionAllowed(action.kind, true);
+			if (!guard.allowed) {
+				ctx.ui.notify(guard.reason ?? "Action restricted in Blueberry Mode", "warning");
+				return;
+			}
+		}
+
 		const reviewIssues = isImpl
 			? capturedItems.filter((it) => it.type === "issue" && managedPolicyFor(it.repo))
 			: [];
@@ -505,8 +521,7 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 
 		const count = capturedItems.length;
 		const priority = action.kind === "snapshot" ? undefined : mode.priorityFor(action.item);
-		const prompt = actionPrompt(action, priority);
-		if (!prompt) return;
+		const prompt = actionPrompt(action, priority, { isBlueberry: mode.isBlueberry });
 		const label = count > 1 ? `${action.kind}: ${count} items` : `${action.kind}: ${action.item.repo}#${action.item.id}`;
 		ctx.ui.notify(action.kind === "snapshot" ? "Queuing snapshot build…" : label, "info");
 		activeCtx = ctx;

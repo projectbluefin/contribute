@@ -38,7 +38,10 @@ export function tmuxReviewStatusBar(mode: ReviewMode, painter: Painter, width: n
 
 	const blueBg = "\x1b[48;2;30;41;59m"; // #1e293b
 	const bluefinBadge = "\x1b[48;2;29;78;216m\x1b[38;2;255;255;255m\x1b[1m 🦖 BLUEFIN \x1b[0m";
-	const reviewBadge = "\x1b[48;2;37;99;235m\x1b[38;2;255;255;255m review \x1b[0m";
+	const reviewLabel = mode.isBlueberry ? "Blueberry" : "review";
+	const reviewBadge = mode.isBlueberry
+		? "\x1b[48;2;99;102;241m\x1b[38;2;255;255;255m\x1b[1m Blueberry \x1b[0m"
+		: "\x1b[48;2;37;99;235m\x1b[38;2;255;255;255m review \x1b[0m";
 	const hiveBadge = `\x1b[48;2;30;64;175m\x1b[38;2;191;219;254m 🐝 ${hiveMode} \x1b[0m`;
 
 	const item = mode.selected();

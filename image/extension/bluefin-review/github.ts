@@ -704,6 +704,50 @@ export async function fetchDiff(repo: string, pullRequest: number, options: Diff
 		return result;
 	}
 }
+export interface CollaboratorPermissionResult {
+	permission?: string;
+	isCollaborator: boolean;
+	error?: string;
+}
+
+/**
+ * Query authenticated user repository permission from GitHub REST API:
+ * GET /repos/{owner}/{repo}/collaborators/{username}/permission
+ *
+ * Returns the authoritative GitHub permission (e.g. "admin", "write", "read", "none").
+ */
+export async function fetchCollaboratorPermission(
+	repo: string,
+	username: string,
+	options: FetchOptions = {},
+): Promise<CollaboratorPermissionResult> {
+	const { token, signal } = options;
+	const doFetch = options.fetchImpl ?? fetch;
+	try {
+		const response = await doFetch(
+			`https://api.github.com/repos/${repo}/collaborators/${username}/permission`,
+			{ headers: headers(token), signal, redirect: "error" },
+		);
+		if (!response.ok) {
+			if (response.status === 404) {
+				return { permission: "none", isCollaborator: false };
+			}
+			return { isCollaborator: false, error: `GitHub REST ${response.status} ${response.statusText}` };
+		}
+		const data = (await response.json()) as { permission?: string; role_name?: string };
+		const perm = data.permission ?? data.role_name ?? "none";
+		return {
+			permission: perm,
+			isCollaborator: perm === "admin" || perm === "write" || perm === "maintain",
+		};
+	} catch (error) {
+		return {
+			isCollaborator: false,
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
 
 /** Render a diff result as the compact text an agent should read. */
 export function diffToText(diff: DiffResult): string {

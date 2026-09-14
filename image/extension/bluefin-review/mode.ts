@@ -77,6 +77,7 @@ export class ReviewMode {
 	fetchedAt = 0;
 	loading = false;
 	selectedKeys = new Set<string>();
+	isBlueberry = false;
 
 	snapshot: StateSnapshot;
 	hive: HiveSnapshot = EMPTY_HIVE;
@@ -295,6 +296,10 @@ export class ReviewMode {
 		this.selectedKeys.clear();
 		return this.queueMode;
 	}
+	setBlueberry(isBlueberry: boolean): void {
+		this.isBlueberry = isBlueberry;
+	}
+
 
 	toggleSelected(key?: string): boolean {
 		const targetKey = key ?? this.selectedKey();
