@@ -152,6 +152,7 @@ cat >"$scratch/home/.config/hive/contributor.env" <<'EOF'
 HIVE_HUB=https://hive.example.test
 EOF
 mock_podman_log="$scratch/podman.log"
+mock_attestation_log="$scratch/attestation.log"
 kvm="$scratch/kvm"
 touch "$kvm"
 chmod 0666 "$kvm"
@@ -167,7 +168,13 @@ printf '%s\n' "\$*" >>"$mock_podman_log"
 case "\${1:-} \${2:-}" in
   "pull "*) [[ "\${FAKE_PULL_FAIL:-0}" != 1 ]]; exit ;;
   "image exists") [[ "\${FAKE_IMAGE_MISSING:-0}" != 1 ]]; exit ;;
-  "image inspect") printf '26.08.07|0123456789abcdef|sha256:deadbeef\n'; exit 0 ;;
+  "image inspect")
+    if [[ "\$*" == *'{{.Digest}}'* ]]; then
+      printf 'sha256:deadbeef\n'
+    else
+      printf '26.08.07|0123456789abcdef|sha256:deadbeef\n'
+    fi
+    exit 0 ;;
 esac
 exit 0
 EOF
@@ -212,11 +219,16 @@ export REVIEW_TEST_FUSE_DEVICE=/dev/null
 chmod +x "$scratch/bin/apptainer"
 chmod +x "$scratch/bin/krun"
 
-cat >"$scratch/bin/gh" <<'EOF'
+cat >"$scratch/bin/gh" <<EOF
 #!/usr/bin/env bash
-if [[ "$*" == "auth token"* ]]; then
+if [[ "\$*" == "auth token"* ]]; then
   echo "mock-token"
   exit 0
+fi
+if [[ "\${1:-} \${2:-}" == "attestation verify" ]]; then
+  printf '%s\n' "\$*" >>"$mock_attestation_log"
+  [[ "\${FAKE_ATTESTATION_FAIL:-0}" != 1 ]]
+  exit
 fi
 exit 1
 EOF
@@ -310,6 +322,44 @@ assert_bluefin_review "projectbluefin/review#463" "--repo projectbluefin/review 
 assert_bluefin_review "--issues projectbluefin/review" "--issues --repo projectbluefin/review"
 assert_bluefin_review "projectbluefin/review#463 --issues" "--repo projectbluefin/review --pr 463 --issues"
 assert_bluefin_review "projectbluefin/review autoslay" "--repo projectbluefin/review --autoslay --advisor"
+
+# --- 2b. Provenance verification gates the published image -------------------
+
+: >"$mock_attestation_log"
+"${repo_root}/bin/bluefin" review projectbluefin/review >/dev/null 2>&1 || fail "bin/bluefin review failed with attestation passing"
+grep -qFx 'attestation verify oci://ghcr.io/projectbluefin/review:stable@sha256:deadbeef --repo projectbluefin/review' "$mock_attestation_log" ||
+  fail "review launcher did not verify the pulled image digest attestation"
+
+: >"$mock_podman_log"
+if FAKE_ATTESTATION_FAIL=1 "${repo_root}/bin/bluefin" review projectbluefin/review >/dev/null 2>&1; then
+  fail "bin/bluefin review ran despite attestation verification failure"
+fi
+if grep -q '^run ' "$mock_podman_log"; then
+  fail "container launched despite attestation verification failure"
+fi
+
+: >"$mock_attestation_log"
+"${repo_root}/bin/bluefin" contribute >/dev/null 2>&1 || fail "bin/bluefin contribute failed with attestation passing"
+grep -qFx 'attestation verify oci://ghcr.io/projectbluefin/contribute:stable@sha256:deadbeef --repo projectbluefin/review' "$mock_attestation_log" ||
+  fail "contribute launcher did not verify the pulled image digest attestation"
+
+: >"$mock_attestation_log"
+REVIEW_TEST_KVM_DEVICE="$scratch/missing-kvm" "${repo_root}/bin/bluefin" review projectbluefin/review >/dev/null 2>&1 ||
+  fail "apptainer fallback review failed with attestation passing"
+grep -qFx 'attestation verify oci://ghcr.io/projectbluefin/review:stable --repo projectbluefin/review' "$mock_attestation_log" ||
+  fail "apptainer fallback did not verify the registry ref before pulling"
+
+: >"$mock_apptainer_log"
+if FAKE_ATTESTATION_FAIL=1 REVIEW_TEST_KVM_DEVICE="$scratch/missing-kvm" "${repo_root}/bin/bluefin" review projectbluefin/review >/dev/null 2>&1; then
+  fail "apptainer fallback ran despite attestation verification failure"
+fi
+[[ ! -s "$mock_apptainer_log" ]] || fail "apptainer launched despite attestation verification failure"
+
+: >"$mock_attestation_log"
+BLUEFIN_REVIEW_IMAGE="localhost/review:dev" "${repo_root}/bin/bluefin" review projectbluefin/review >/dev/null 2>&1 ||
+  fail "localhost override image launch failed"
+[[ ! -s "$mock_attestation_log" ]] || fail "localhost override image was sent to attestation verification"
+
 
 # --- 3. Hermetic test of bin/omp-review (Source launcher) ----------------------
 
