@@ -44,7 +44,10 @@ repos:
         # SC1090: the entrypoint sources a path resolved at runtime.
         # SC2034: the onboarding harness captures launcher output into vars
         # that are asserted on conditionally.
-        args: [--exclude=SC1090, --exclude=SC2034]
+        # -x follows the `# shellcheck source=` directives the launcher and its
+        # tests already carry; without it every one of them is an SC1091 error
+        # and the sourced file is never checked at all.
+        args: [-x, --exclude=SC1090, --exclude=SC2034]
 
   - repo: https://github.com/scop/pre-commit-shfmt
     rev: v3.13.1-1 # shfmt v3.13.1

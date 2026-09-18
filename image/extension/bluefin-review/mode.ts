@@ -436,11 +436,17 @@ export class ReviewMode {
 	 * Items available for slay execution: chosen items first, then visible items,
 	 * falling back to unranked items in local priority order when the Hive-only
 	 * filter leaves zero items.
+	 *
+	 * `exclude` drops already-attempted work at every tier before the limit is
+	 * applied, which is what lets an unattended run take a genuinely new batch
+	 * each pass instead of re-selecting the same head of the queue forever.
 	 */
-	slayableItems(limit = BATCH_LIMIT): QueueItem[] {
-		const chosen = this.chosenItems();
+	slayableItems(limit = BATCH_LIMIT, exclude?: ReadonlySet<string>): QueueItem[] {
+		const keep = (items: QueueItem[]): QueueItem[] =>
+			exclude === undefined ? items : items.filter((item) => !exclude.has(itemKey(item)));
+		const chosen = keep(this.chosenItems());
 		if (chosen.length > 0) return chosen.slice(0, limit);
-		const visible = this.visibleItems();
+		const visible = keep(this.visibleItems());
 		if (visible.length > 0) return visible.slice(0, limit);
 		let base = this.ranked.items.length === this.items.length ? this.ranked.items : this.items;
 		if (this.skipRepos.size > 0) {
@@ -450,7 +456,7 @@ export class ReviewMode {
 				return !this.skipRepos.has(repoLower) && !this.skipRepos.has(shortName);
 			});
 		}
-		return base.slice(0, limit);
+		return keep(base).slice(0, limit);
 	}
 
 

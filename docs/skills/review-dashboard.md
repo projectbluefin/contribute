@@ -73,7 +73,7 @@ palette and warm issue palette.
 | `s` | Slay selected PRs, or implement selected issues through submitted PRs |
 | `Alt-S` | Repair returned PRs first, then implement the visible issue backlog |
 | `f` | Fix selected items in isolated workspaces |
-| `d` | Inspect bounded diff evidence |
+| `d` | Inspect bounded evidence (PR diff, issue discussion) |
 | `p` | Pause or resume later wave admission |
 | `r` | Refetch GitHub and Hive projections |
 | `o` | Change repository or organization scope |

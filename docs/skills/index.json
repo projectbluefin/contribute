@@ -120,7 +120,7 @@
     {
       "id": "launcher",
       "name": "launcher",
-      "one_line_purpose": "Change review just recipes without breaking the launch contract.",
+      "one_line_purpose": "Change the Bluefin application launcher without breaking its runtime contracts.",
       "entry_point": "docs/skills/launcher.md",
       "category": "ci-ops",
       "status": "active",

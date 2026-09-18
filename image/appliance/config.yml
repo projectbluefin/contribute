@@ -1,8 +1,21 @@
-# Invocation overlay owned by the immutable appliance. User and project
-# settings still apply, except that a packaged binary never advertises an
-# in-place update that cannot survive appliance replacement.
+# Invocation overlay owned by the immutable appliance, loaded through
+# PI_CONFIG_FILES so every omp invocation in the image resolves it. User and
+# project settings still apply, except that a packaged binary never advertises
+# an in-place update that cannot survive appliance replacement.
 startup:
   checkUpdate: false
+  # Each review target gets its own state volume, so a first launch against a
+  # new repository starts with an empty OMP home and the onboarding wizard
+  # takes the terminal instead of the queue. The appliance resolves its
+  # credentials from the launcher's environment, so there is nothing here for
+  # an operator to answer.
+  setupWizard: false
+
+# The appliance runs in a Bluefin terminal, which ships a Nerd Font. Left at
+# the `unicode` default OMP draws the fallback glyph set and then asks the
+# operator to "use nerdfont" on every launch, which is neither actionable
+# inside a distroless image nor true of the terminal it is running in.
+symbolPreset: nerd
 
 modelRoles:
   advisor: "@default"

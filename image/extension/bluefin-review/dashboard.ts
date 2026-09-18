@@ -77,7 +77,7 @@ const HELP: readonly string[] = [
 	"  alt+s            repair returned PRs, then implement issue waves",
 	"  c                comment on selected item(s)",
 	"  f                fix selected item(s) in isolated workspaces",
-	"  d                inspect bounded diff evidence",
+	"  d                inspect evidence (PR diff, issue discussion)",
 	"  enter            cite the selection in the prompt",
 	"  ?                close this help",
 	"  q, esc           close the workbench",

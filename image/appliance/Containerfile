@@ -158,6 +158,7 @@ ENV HOME=/home/bluefin \
     SHELL=/usr/bin/bash \
     TERM=xterm-256color \
     COLORTERM=truecolor \
+    PI_CONFIG_FILES=/usr/share/bluefin/review/appliance-config.yml \
     BLUEFIN_REVIEW_ORG=projectbluefin \
     BLUEFIN_REVIEW_APPLIANCE=1
 

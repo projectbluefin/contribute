@@ -20,6 +20,28 @@ Review gates required +2 reviews to merge, so a maintainer running both can neve
 
 What we have now:
 
+## Product boundary
+
+Review is a GitHub-first core. On any GitHub repository the operator can access,
+pull requests and issues are first-class objects, and the workbench offers only
+the actions its backend can run: PR review, diff, fix, and slay; issue
+inspection, implementation, and fix. Review owns the generic core — PRs, issues,
+queues, search, reading, inspection, review, repair, implementation, and landing
+— subject to GitHub access, operator permissions, execution requirements, and
+safety checks.
+
+When Hive is missing or unreachable, queue order falls back to GitHub, and
+review, fix, and slay remain available without Hive; the workbench is not
+browse-only. OMP owns sessions, agents, execution, and traces. [Bluefin](https://projectbluefin.io)
+adds its doctrine, specialized reviewers, labels, conventions, and repository
+admission rules. [Hive](https://hive.projectbluefin.io) adds ordering, claims,
+stages, curated knowledge, and contributor coordination through its MCP server.
+Neither integration is required for the core GitHub workflows: GitHub defines
+what work exists, Review defines what can be done with it, Hive may prioritize
+and coordinate it, and Bluefin may specialize its policy. The boundary and its
+follow-up work — including a GitHub-only mode that selects Hive or the plain
+GitHub toolchain — are tracked in [#591](https://github.com/projectbluefin/review/issues/591).
+
 ## Installation
 
 Install `bluefin-contributor-tools` in one command from the [Universal Blue experimental tap](https://github.com/ublue-os/homebrew-experimental-tap), which automatically trusts the formula:
@@ -33,7 +55,7 @@ This installs the `bluefin` CLI with both `review` and `contribute` subcommands 
 
 Maintainers:
 ```bash
-# Review pull requests and inspect CI failures
+# Implement issues or review and land pull requests
 bluefin review
 ```
 
@@ -47,8 +69,9 @@ You need **Linux and GitHub CLI (`gh`)**. For hardware isolation, install
 rootless Podman with the `krun` runtime and grant read/write access to
 `/dev/kvm`. Otherwise the launcher reports the unavailable KVM prerequisite and
 uses Apptainer, which the Linux Homebrew formula installs as a dependency.
-From a checkout, `just review-appliance` opens the same image;
-`just review-doctor` reports which runtime will be used without starting it.
+Run `bluefin doctor` to check the machine without starting an agent. From a
+checkout, the compatible `just review-appliance` and `just review-doctor`
+developer recipes invoke the same runtime contracts.
 
 ### 1. Get the launcher and sign in to GitHub
 
@@ -60,15 +83,18 @@ gh auth login --web --hostname github.com --scopes repo,read:org,workflow
 
 ### 2. Open the OMP workbench
 
-`review-queue` is a convenience name for the same distroless OMP appliance as
-`review-appliance`; there is no alternate maintainer UI:
+`bluefin review` opens the distroless OMP maintainer appliance; there is no
+alternate maintainer UI:
 
 ```bash
-just review-queue                 # the whole organization queue
-just review-queue owner/repo      # review one repository
-just review-queue --pr 1284       # preselect one pull request
-just review-queue --issues        # start on issues
+bluefin review                    # the whole organization queue
+bluefin review owner/repo         # review one repository
+bluefin review owner/repo 1284    # preselect one pull request
+bluefin review --issues           # start on issues
 ```
+
+Checkout users may use the compatible `just review-queue` and
+`just review-appliance` developer recipes. `review-queue` delegates to `review-appliance`.
 
 `ghcr.io/projectbluefin/review` carries the OMP review extension, `omp`, `gh`,
 `git`, Python, and the review validators `actionlint`, `shellcheck`, `yq`, `jq`,
@@ -124,7 +150,7 @@ slash commands.
 | `alt+s` | Repair returned PRs first, then implement the visible issue backlog in bounded waves |
 | `alt+b` | Select / clear the focused repository group |
 | `f` | Fix selected items in isolated workspaces |
-| `d` | Inspect bounded diff evidence |
+| `d` | Inspect bounded evidence (PR diff, issue discussion) |
 | `p` | Pause / resume starting later repository waves |
 | `r` | Refetch GitHub and Hive projections |
 | `o` | Change repository or organization scope |
@@ -153,8 +179,8 @@ The mode also ships the `bluefin-doctrine` and `bluefin-ci-triage` task agents.
 ### 3. Start with one repository, or browse the organization
 
 The commands above open the whole Project Bluefin queue. To narrow it, append
-a repository—for example, `just review-queue projectbluefin/review`.
-`review-queue` delegates to `review-appliance`, so both commands use
+a repository—for example, `bluefin review projectbluefin/review`. The developer
+recipe `just review-queue projectbluefin/review` uses
 `ghcr.io/projectbluefin/review:stable`, the same OMP configuration, and the same
 single-screen workbench.
 
@@ -175,39 +201,42 @@ selected model without pinning a provider.
 The [workbench guide](docs/skills/review-dashboard.md) documents the
 authority model.
 
-
 ## Run a worker
 
 Hive assigns contributor work; the OMP workbench is the maintainer surface.
 Both contributor convenience commands launch the same OMP worker:
 
 ```bash
-just contribute
-just review-container
+bluefin contribute
+bluefin contribute projectbluefin/server
 ```
+
+From a checkout, `just contribute` and `just review-container` are compatible
+developer recipes for the same Hive-authorized OMP worker.
 
 Choose provider, model, and effort inside OMP. The launcher does not interpret
 profiles or export `AGENT_MODEL` / `AGENT_REASONING_EFFORT`.
 
 Each contributor invocation prefers a foreground libkrun microVM and falls back
-gracefully to an isolated foreground Apptainer container:
-
-```bash
-bluefin contribute
-bluefin contribute projectbluefin/server
-```
-
-An optional `org/repo` argument names the isolated instance and selects
+gracefully to an isolated foreground Apptainer container. An optional `org/repo`
+argument names the isolated instance and selects
 `~/.config/hive/contributor.<org-repo>.env`; Hive still chooses and assigns the
 actual work. Different instance names use different persistent OMP volumes and
 unique container names. Set `BLUEFIN_INSTANCE` to split concurrent runs for the
 same target.
 
+`bluefin setup [instance]` performs the attended Hive registration that writes
+those files. The registration decides which hive the worker joins, so a bare
+`bluefin contribute` does the work of whatever `~/.config/hive/contributor.env`
+names — pass an instance, or repoint that file, to switch projects. Each launch
+prints the hub it is joining before the container starts.
+
 Keep the launching terminal open. **Ctrl-C stops only that invocation.**
 Detached contributor containers are unsupported (`REVIEW_DETACH=1` is rejected).
 
-Kubernetes users can scale workers with `just contribute cluster [N]` and
-stop them with `just review-stop cluster`. Start with the
+Kubernetes users can scale workers with `bluefin cluster scale [N]` and stop
+them with `bluefin cluster stop`. The compatible developer recipes are
+`just contribute cluster [N]` and `just review-stop cluster`. Start with the
 [cluster guide](docs/skills/cluster-workers.md); a cluster is not required for
 the OMP workbench, and opening the workbench never starts a worker.
 
@@ -228,25 +257,11 @@ unreproduced reports. Planned documentation assistance is tracked in
 [#134](https://github.com/projectbluefin/review/issues/134); the feedback loop
 is tracked in [#135](https://github.com/projectbluefin/review/issues/135).
 
-### Product boundary
-
-Review is a GitHub-first core with optional Bluefin and Hive integrations.
-[#591](https://github.com/projectbluefin/review/issues/591) decided it works for
-any GitHub repository, with Bluefin and Hive as optional additions. Review owns
-the generic core — PRs, issues, queues, search, reading, inspection, review,
-repair, implementation, and landing — and is first-class in any repository.
-OMP owns sessions, agents, execution, and traces. Bluefin adds its doctrine,
-specialized reviewers, labels, conventions, and admission rules; Hive adds
-ordering, claims, stages, and contributor context through its MCP server. The
-core requires neither: GitHub access, operator permissions, execution
-requirements, and safety checks still apply. GitHub defines what work exists;
-Review defines what can be done with it; Hive prioritizes and coordinates it;
-Bluefin specializes its policy.
 
 <details>
 <summary>Image provenance</summary>
 
-The contributor image layers the pinned Hive runtime at `feaac6859a46d22c143420102cc3ab4e8687cd65`; it contains no maintainer UI. `ghcr.io/projectbluefin/contribute` is the separate distroless Hive + OMP worker, and `ghcr.io/projectbluefin/review` is the maintainer-facing OMP appliance.
+The contributor image layers the pinned Hive runtime at `67530919a135cbc466d1e0961770028842c80876`; it contains no maintainer UI. `ghcr.io/projectbluefin/contribute` is the separate distroless Hive + OMP worker, and `ghcr.io/projectbluefin/review` is the maintainer-facing OMP appliance.
 See [image architecture and validation](docs/image-and-development.md).
 
 </details>

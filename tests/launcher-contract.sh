@@ -159,7 +159,7 @@ cat >"$scratch/bin/podman" <<EOF
 #!/usr/bin/env bash
 [[ "\${1:-}" == info ]] && exit 0
 if [[ "\${1:-} \${2:-} \${3:-}" == "system connection list" ]]; then
-  [[ "\${FAKE_REMOTE_DEFAULT:-}" != 1 ]] || printf 'remote\tssh://engine.example.test/run/podman.sock\ttrue\n'
+  [[ "\${FAKE_REMOTE_DEFAULT:-}" != 1 ]] || printf 'remote\tssh://engine.example.test/run/podman.sock\tidentity\ttrue\n'
   exit 0
 fi
 printf '%s\n' "\$*" >>"$mock_podman_log"
@@ -551,6 +551,37 @@ contribute_instance_home="$(find "$scratch/home/.local/state/bluefin/instances" 
 [[ -f "$contribute_instance_home/.config/contribute/config.env" ]] || fail "nested contribute configuration was not migrated"
 [[ ! -e "$contribute_instance_home/bluefin-contribute.sif" ]] || fail "legacy contribute SIF was copied into instance home"
 [[ -d "$legacy_contribute_dir" ]] || fail "legacy contribute state directory was broadly deleted"
+# A contributor does the work of whichever hive its registration names, and that
+# choice used to be invisible: a default registration written by another
+# project's contribute-setup routed every bare launch to that project's queue.
+printf 'HIVE_REGISTRATION_TOKEN=two\nHIVE_HUB=wss://other.example.test/contribute\n' >"$HOME/.config/hive/contributor.owner-repo2.env"
+chmod 0600 "$HOME/.config/hive/contributor.owner-repo2.env"
+: >"$mock_podman_log"
+hive_notice="$("${repo_root}/bin/bluefin" contribute owner/repo2 2>&1 >/dev/null)" || fail "contributor launch failed"
+[[ "$hive_notice" == *"hive: wss://other.example.test/contribute (contributor.owner-repo2.env)"* ]] ||
+  fail "contributor launch did not name the hive it joins: ${hive_notice}"
+
+printf 'HIVE_REGISTRATION_TOKEN=two\n' >"$HOME/.config/hive/contributor.owner-repo2.env"
+chmod 0600 "$HOME/.config/hive/contributor.owner-repo2.env"
+: >"$mock_podman_log"
+set +e
+hubless_output="$("${repo_root}/bin/bluefin" contribute owner/repo2 2>&1)"
+hubless_status=$?
+set -e
+[[ "$hubless_status" -ne 0 ]] || fail "contributor launched from a registration with no HIVE_HUB"
+[[ "$hubless_output" == *"has no usable HIVE_HUB"* ]] || fail "hub-less registration error is unexplained"
+! grep -q '^run ' "$mock_podman_log" || fail "hub-less registration still started a container"
+printf 'HIVE_REGISTRATION_TOKEN=two\nHIVE_HUB=https://hive.example.test\n' >"$HOME/.config/hive/contributor.owner-repo2.env"
+chmod 0600 "$HOME/.config/hive/contributor.owner-repo2.env"
+
+set +e
+setup_output="$(REVIEW_NON_INTERACTIVE=true "${repo_root}/bin/bluefin" setup owner/repo 2>&1)"
+setup_status=$?
+set -e
+[[ "$setup_status" -ne 0 ]] || fail "non-interactive setup unexpectedly replaced a registration"
+[[ "$setup_output" == *"non-interactive mode cannot answer"* ]] || fail "setup did not explain its attended registration requirement"
+grep -qF 'HIVE_REGISTRATION_TOKEN=one' "$HOME/.config/hive/contributor.owner-repo.env" || fail "failed setup did not restore the prior registration"
+[[ ! -e "$HOME/.config/hive/contributor.owner-repo.env.bak" ]] || fail "failed setup left a registration backup behind"
 
 mv "$scratch/bin/krun" "$scratch/krun"
 : >"$mock_apptainer_log"

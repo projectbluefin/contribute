@@ -1,7 +1,7 @@
 # Bluefin Contribute: an isolated interactive Hive + OMP worker.
 ARG FSDK_BASE_IMAGE=ghcr.io/projectbluefin/base:26.08@sha256:f4c4557fa9841639dfc0274d2ff014ac86e183a150a46d6e356b7731d57cc932
 ARG FSDK_BUILDER_IMAGE=ghcr.io/projectbluefin/lab-runner:26.08@sha256:5217c4e4ed0d89a801e1e64d45c1191a8525ccae8aed6e234cd44382e9b3a143
-ARG HIVE_COMMIT=feaac6859a46d22c143420102cc3ab4e8687cd65
+ARG HIVE_COMMIT=67530919a135cbc466d1e0961770028842c80876
 # renovate: datasource=github-releases depName=can1357/oh-my-pi
 ARG OMP_VERSION=18.2.1
 ARG OMP_X86_64_SHA256=9c76485c4e65875678b88c7926c7e6891d488796676f359de9c4df584c886fc9
@@ -71,6 +71,16 @@ ARG FSDK_BASE_IMAGE HIVE_COMMIT OMP_VERSION NODE_VERSION GH_VERSION TMUX_VERSION
 COPY --from=build /out /
 COPY --chmod=0755 image/contribute/entrypoint.sh /usr/local/bin/contribute-entrypoint
 COPY image/tmux.conf /etc/tmux.conf
+# Hive owns the `omp` command line inside its tmux session, so the image's own
+# OMP settings ride PI_CONFIG_FILES, the documented wrapper seam: it loads as a
+# CLI overlay, above user and project settings, without touching Hive's argv.
+COPY image/contribute/config.yml /usr/share/bluefin/contribute/omp-config.yml
+# LANG is load-bearing for the attended terminal, not cosmetic. Without a
+# UTF-8 locale glibc resolves to C, and tmux then treats its attach client as
+# non-UTF-8: box drawing degrades to DEC ACS escapes and every other non-ASCII
+# cell — arrows, bullets, the status-line emoji, OMP's own glyphs — is written
+# to the terminal as `_`. The base ships C.utf8 and en_US.utf8; C.UTF-8 keeps
+# byte-ordered collation and language-neutral formatting for the agent.
 ENV HOME=/home/bluefin \
     XDG_CONFIG_HOME=/home/bluefin/.config \
     XDG_STATE_HOME=/home/bluefin/.local/state \
@@ -78,6 +88,8 @@ ENV HOME=/home/bluefin \
     PATH=/usr/bin:/bin \
     SHELL=/usr/bin/bash \
     TERM=xterm-256color \
+    LANG=C.UTF-8 \
+    PI_CONFIG_FILES=/usr/share/bluefin/contribute/omp-config.yml \
     AGENT_BACKEND=omp
 LABEL org.opencontainers.image.title="Bluefin Contribute" \
       org.opencontainers.image.description="Distroless OMP contributor runtime for Hive-assigned work." \

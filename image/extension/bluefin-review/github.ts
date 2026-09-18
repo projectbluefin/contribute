@@ -90,6 +90,7 @@ const PR_ITEM_FIELDS = `
 		nodes { path }
 	}
 	autoMergeRequest { enabledAt }
+	isInMergeQueue
 	commits(last: 1) {
 		nodes {
 			commit {
@@ -223,6 +224,7 @@ interface SearchNode {
 	closed?: boolean;
 	changedFiles?: number;
 	autoMergeRequest?: { enabledAt?: string } | null;
+	isInMergeQueue?: boolean | null;
 	author?: { login?: string } | null;
 	repository?: { nameWithOwner?: string } | null;
 	labels?: { nodes?: Array<{ name?: string }> } | null;
@@ -319,7 +321,7 @@ function toQueueItem(node: SearchNode, mode: QueueMode): QueueItem | undefined {
 		deletions: node.deletions,
 		changedFiles: node.changedFiles,
 		headSha: node.headRefOid,
-		autoMergeEnabled: Boolean(node.autoMergeRequest?.enabledAt),
+		autoMergeEnabled: Boolean(node.autoMergeRequest?.enabledAt || node.isInMergeQueue),
 		workflowFiles:
 			mode === "prs"
 				? (node.files?.nodes ?? []).map((file) => file.path ?? "").filter((path) => path.startsWith(".github/workflows/"))

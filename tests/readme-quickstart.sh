@@ -34,6 +34,10 @@ require_before() {
 require_heading
 require_before '^## +(Start here|Quick start)([[:space:]]|$)' '^## +What this is for([[:space:]]|$)'
 
+for command in review contribute doctor setup "cluster scale"; do
+  require_text "bluefin $command"
+done
+
 for command in contribute review-doctor review-queue review-appliance review-container review-stop; do
   require_text "just $command"
 done

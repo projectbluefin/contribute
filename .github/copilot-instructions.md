@@ -28,15 +28,16 @@ relay's `ws` dependency; this is not a Node application.
 | --- | --- | --- |
 | Contribute one local Hive worker | `bluefin contribute [instance]` or `just contribute [instance]` | Foreground OMP worker; prefers a libkrun microVM and falls back to Apptainer. Hive selects and assigns tasks. |
 | Scale cluster contributors | `just contribute cluster [N]` | OMP workers independent from the maintainer workbench. |
-| Review PRs or implement issues | `bluefin review [org/repo]` or `just review-queue [flags...]` | Foreground OMP workbench; prefers a libkrun microVM and falls back to Apptainer. |
+| Review PRs or implement issues | `bluefin review [org/repo]` or `just review-queue [flags...]` | Foreground OMP workbench; prefers a libkrun microVM and falls back to Apptainer. Issue mode implements selected issues into pull requests, while PR mode reviews, repairs, and lands selected pull requests. |
 | Develop the review extension directly | `bin/omp-review [number\|issues]` | Host OMP process; development-only, not an appliance boundary. |
 | Build the review image | `just review-appliance-build [tag]` | Produces the OCI image used by both runtimes. |
 | Stop cluster workers | `just review-stop cluster` | Explicit cluster lifecycle command. |
 | Diagnose launch readiness | `just review-doctor` | Read-only preflight; starts no agent. |
 
 Never make task selection, assignment, completion, or priority decisions for
-Hive. The maintainer owns review, approval, queueing, and merge decisions; a
-confirmed slay delegates only their bounded execution to the coordinator.
+Hive. The maintainer owns review, approval, queueing, and merge decisions; an
+explicit Slay action delegates its bounded implementation, review, repair,
+and landing lifecycle to the workbench coordinator.
 
 The review mode consumes Hive rather than competing with it. Pull requests
 authored by the authenticated user with requested changes form a local,

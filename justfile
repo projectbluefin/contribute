@@ -57,7 +57,7 @@ hive_repo_url := "https://github.com/hivecommons/hive"
 # kubestellar/hive#6670 (fix: scope OMP's login/onboarding checks to the
 # pane's last 3 lines instead of a 15-line tail a tip or a finished turn's
 # own prose could still land in).
-hive_commit := "feaac6859a46d22c143420102cc3ab4e8687cd65"
+hive_commit := "67530919a135cbc466d1e0961770028842c80876"
 contribute_image := env("CONTRIBUTE_IMAGE", "ghcr.io/projectbluefin/contribute:stable")
 
 # Shared bash, 'eval''d at the top of every recipe script that needs it:
