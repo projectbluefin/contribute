@@ -28,15 +28,16 @@ relay's `ws` dependency; this is not a Node application.
 | --- | --- | --- |
 | Contribute one local Hive worker | `bluefin contribute [instance]` or `just contribute [instance]` | Foreground OMP worker; prefers a libkrun microVM and falls back to Apptainer. Hive selects and assigns tasks. |
 | Scale cluster contributors | `just contribute cluster [N]` | OMP workers independent from the maintainer workbench. |
-| Review PRs or implement issues | `bluefin review [org/repo]` or `just review-queue [flags...]` | Foreground OMP workbench; prefers a libkrun microVM and falls back to Apptainer. |
+| Review PRs or implement issues | `bluefin review [org/repo]` or `just review-queue [flags...]` | Foreground OMP workbench; prefers a libkrun microVM and falls back to Apptainer. Issue mode implements selected issues into pull requests, while PR mode reviews, repairs, and lands selected pull requests. |
 | Develop the review extension directly | `bin/omp-review [number\|issues]` | Host OMP process; development-only, not an appliance boundary. |
 | Build the review image | `just review-appliance-build [tag]` | Produces the OCI image used by both runtimes. |
 | Stop cluster workers | `just review-stop cluster` | Explicit cluster lifecycle command. |
 | Diagnose launch readiness | `just review-doctor` | Read-only preflight; starts no agent. |
 
 Never make task selection, assignment, completion, or priority decisions for
-Hive. The maintainer owns review, approval, queueing, and merge decisions; a
-confirmed slay delegates only their bounded execution to the coordinator.
+Hive. The maintainer owns review, approval, queueing, and merge decisions; an
+explicit Slay action delegates its bounded implementation, review, repair,
+and landing lifecycle to the workbench coordinator.
 
 The review mode consumes Hive rather than competing with it. Pull requests
 authored by the authenticated user with requested changes form a local,
@@ -56,6 +57,18 @@ companion agents omit model and effort fields and inherit OMP's resolved choice.
 For repository development, `.omp/config.yml` pins subagent models and effort
 and defines model-role mappings. It leaves the interactive model to the user
 and is not copied into either runtime image.
+
+## Follow upstream releases and derived checksums
+
+The daily Renovate workflow tracks stable upstream releases (OMP, GitHub CLI,
+Node.js, and tmux) along with PyPI dependencies in `requirements-ci.lock`.
+Allowlisted tasks (`scripts/update-omp-pins.mjs`, `scripts/update-gh-pins.mjs`,
+`scripts/update-node-pins.mjs`, `scripts/update-tmux-pins.mjs`, and
+`scripts/update-requirements-ci-hashes.mjs`) synchronize version pins and verified
+per-architecture digests across Containerfiles and lockfile hashes.
+After checks and OMP-specific automerge, the `main` push triggers both image
+publish workflows. Never update only one image or a version without its release
+asset digests.
 
 ## Inspect live state; preserve active work
 

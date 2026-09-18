@@ -17,10 +17,11 @@ import { GLYPH, PLAIN_PAINTER, formatDuration, statusIcon } from "../image/exten
 import { workbenchPainter } from "../image/extension/bluefin-review/paint.ts";
 import { renderSpanTree, traceToText, visibleSpanIds } from "../image/extension/bluefin-review/trace.ts";
 import { truncateToWidth, visibleWidth } from "../image/extension/bluefin-review/width.ts";
-import { fetchDiff, fetchItemsByKey, fetchQueue, parseScope, searchExpression } from "../image/extension/bluefin-review/github.ts";
+import { fetchDiff, exactHeadVerified, fetchItemsByKey, fetchQueue, parseScope, searchExpression, toCiStatus } from "../image/extension/bluefin-review/github.ts";
 import { EMPTY_HIVE, buildRankMap, fetchHive, hiveFailureStatus, resolveHub } from "../image/extension/bluefin-review/hive.ts";
 import { categorize, prioritize } from "../image/extension/bluefin-review/priority.ts";
 import { BATCH_LIMIT, ReviewMode, ciGlyph } from "../image/extension/bluefin-review/mode.ts";
+import { HOLD_LABELS, isLandingReady, landingReason, landingState } from "../image/extension/bluefin-review/landing.ts";
 import { RAW_KEYS, canonicalKey, rawKeyMatcher } from "../image/extension/bluefin-review/keys.ts";
 import { ReviewDashboard, parseMouseEvent } from "../image/extension/bluefin-review/dashboard.ts";
 import { STALE_AFTER_MS, priorityChip, queueAge, renderRail, statusSegment } from "../image/extension/bluefin-review/rail.ts";
@@ -558,7 +559,84 @@ test("check suites surface failures and pending runs without rollup contexts", a
 	assert.deepEqual(result.items.map((item) => item.ciStatus), ["failure", "pending", "success"]);
 });
 
-test("pull request queue omits workflow changes before reviewer selection", async () => {
+test("successful statusCheckRollup takes precedence over unrelated queued check suites (#592)", async () => {
+	const fetchImpl = async (_url, init) => {
+		const node = (number, statusCheckRollup, checkSuites) => ({
+			number,
+			title: `suite ${number}`,
+			url: `https://github.com/projectbluefin/review/pull/${number}`,
+			updatedAt: new Date(NOW).toISOString(),
+			repository: { nameWithOwner: "projectbluefin/review" },
+			commits: { nodes: [{ commit: { statusCheckRollup, checkSuites } }] },
+		});
+		return {
+			ok: true,
+			status: 200,
+			statusText: "OK",
+			json: async () => ({
+				data: {
+					search: {
+						pageInfo: { hasNextPage: false, endCursor: null },
+						nodes: [
+							node(
+								1,
+								{ state: "SUCCESS" },
+								{
+									pageInfo: { hasNextPage: false },
+									nodes: [
+										{ app: { name: "Azure Boards" }, status: "QUEUED", conclusion: null },
+										{ app: { name: "Veracode Workflow App" }, status: "QUEUED", conclusion: null },
+									],
+								},
+							),
+						],
+					},
+				},
+			}),
+		};
+	};
+	const result = await fetchQueue("prs", { token: "t", fetchImpl });
+	assert.equal(result.items[0].ciStatus, "success");
+});
+
+test("toCiStatus prioritizes decisive rollup and falls back to check suites (#592)", () => {
+	// Rollup precedence over check suites
+	const queuedSuites = {
+		pageInfo: { hasNextPage: false },
+		nodes: [
+			{ status: "QUEUED", conclusion: null },
+			{ status: "QUEUED", conclusion: null },
+		],
+	};
+	assert.equal(toCiStatus("SUCCESS", queuedSuites), "success");
+	assert.equal(toCiStatus("FAILURE", queuedSuites), "failure");
+	assert.equal(toCiStatus("ERROR", queuedSuites), "failure");
+	assert.equal(toCiStatus("PENDING", queuedSuites), "pending");
+
+	// Fallback when rollup is absent or indeterminate
+	assert.equal(toCiStatus(undefined, queuedSuites), "pending");
+	assert.equal(toCiStatus(undefined, { pageInfo: { hasNextPage: true }, nodes: [] }), "pending");
+	assert.equal(toCiStatus(undefined, {
+		pageInfo: { hasNextPage: false },
+		nodes: [{ status: "COMPLETED", conclusion: "FAILURE" }],
+	}), "failure");
+	assert.equal(toCiStatus(undefined, {
+		pageInfo: { hasNextPage: false },
+		nodes: [{ status: "COMPLETED", conclusion: "SUCCESS" }],
+	}), "success");
+	assert.equal(toCiStatus(undefined, {
+		pageInfo: { hasNextPage: false },
+		nodes: [
+			{ status: "COMPLETED", conclusion: "SUCCESS" },
+			{ status: "COMPLETED", conclusion: "NEUTRAL" },
+			{ status: "COMPLETED", conclusion: "SKIPPED" },
+		],
+	}), "success");
+	assert.equal(toCiStatus(undefined, null), undefined);
+	assert.equal(toCiStatus(undefined, { pageInfo: { hasNextPage: false }, nodes: [] }), undefined);
+});
+
+test("pull request queue keeps workflow changes and incomplete file lists visible but blocked", async () => {
 	const fetchImpl = async (_url, init) => {
 		const body = JSON.parse(String(init?.body ?? "{}"));
 		assert.match(body.query, /files\(first: 100\)/);
@@ -589,6 +667,15 @@ test("pull request queue omits workflow changes before reviewer selection", asyn
 								changedFiles: 1,
 								files: { pageInfo: { hasNextPage: false }, nodes: [{ path: "README.md" }] },
 							},
+							{
+								number: 3,
+								title: "truncated file list",
+								url: "https://github.com/projectbluefin/review/pull/3",
+								updatedAt: new Date(NOW).toISOString(),
+								repository: { nameWithOwner: "projectbluefin/review" },
+								changedFiles: 150,
+								files: { pageInfo: { hasNextPage: true }, nodes: [{ path: "README.md" }] },
+							},
 						],
 					},
 				},
@@ -599,8 +686,68 @@ test("pull request queue omits workflow changes before reviewer selection", asyn
 	mode.setToken("t");
 	await mode.refreshQueue();
 
-	assert.deepEqual(mode.items.map((item) => `${item.repo}#${item.id}`), ["projectbluefin/review#2"]);
-	assert.equal(mode.selectById("projectbluefin/review", 1), false);
+	assert.deepEqual(
+		mode.items.map((item) => `${item.repo}#${item.id}`),
+		["projectbluefin/review#1", "projectbluefin/review#2", "projectbluefin/review#3"],
+	);
+	assert.equal(mode.position(), "1/3");
+
+	assert.equal(mode.selectById("projectbluefin/review", 1), true);
+	const pr1 = mode.selected()!;
+	const priority1 = mode.priorityFor(pr1);
+	assert.equal(priority1?.category, "blocked");
+	assert.equal(priority1?.reason, "workflow change");
+	assert.match(priorityChip(PLAIN_PAINTER, priority1), /blocked · workflow change/);
+
+	assert.equal(mode.selectById("projectbluefin/review", 2), true);
+	const pr2 = mode.selected()!;
+	assert.notEqual(mode.priorityFor(pr2)?.category, "blocked");
+
+	assert.equal(mode.selectById("projectbluefin/review", 3), true);
+	const pr3 = mode.selected()!;
+	const priority3 = mode.priorityFor(pr3);
+	assert.equal(priority3?.category, "blocked");
+	assert.equal(priority3?.reason, "incomplete changed-file list");
+	assert.match(priorityChip(PLAIN_PAINTER, priority3), /blocked · incomplete changed-file list/);
+
+	// A queue containing only unsupported PRs does not say 0/0 or "nothing open"
+	const unsupportedOnlyFetch = async () => ({
+		ok: true,
+		status: 200,
+		statusText: "OK",
+		json: async () => ({
+			data: {
+				search: {
+					pageInfo: { hasNextPage: false, endCursor: null },
+					nodes: [
+						{
+							number: 956,
+							title: "build and deploy workflows",
+							url: "https://github.com/projectbluefin/review/pull/956",
+							updatedAt: new Date(NOW).toISOString(),
+							repository: { nameWithOwner: "projectbluefin/review" },
+							changedFiles: 3,
+							files: { pageInfo: { hasNextPage: false }, nodes: [{ path: ".github/workflows/deploy.yml" }] },
+						},
+					],
+				},
+			},
+		}),
+	});
+	const unsupportedMode = new ReviewMode({ org: "projectbluefin", fetchImpl: unsupportedOnlyFetch, env: ISOLATED_ENV });
+	unsupportedMode.setToken("t");
+	await unsupportedMode.refreshQueue();
+
+	assert.equal(unsupportedMode.items.length, 1);
+	assert.equal(unsupportedMode.position(), "1/1");
+	const dashboard = new ReviewDashboard({ requestRender() {} }, PLAIN_PAINTER, unsupportedMode, () => {}, () => {}, 24);
+	const rendered = dashboard.render(80).join("\n");
+	assert.doesNotMatch(rendered, /nothing open/);
+	assert.doesNotMatch(rendered, /0\/0/);
+	assert.match(rendered, /#956/);
+	assert.match(rendered, /blocked · workflow change/);
+	assert.match(rendered, /BLOCKED · workflow change/);
+	assert.match(rendered, /changes \.github\/workflows\/deploy\.yml/);
 });
 test("queue cancellation is classified separately from failures", async () => {
 	const controller = new AbortController();
@@ -856,6 +1003,67 @@ test("diff fetch is bounded but honest about it", async () => {
 	assert.equal(diff.truncated, true);
 });
 
+test("exactHeadVerified refuses unless the workspace is the exact expected head", () => {
+	const sha = "a".repeat(40);
+	assert.equal(exactHeadVerified(sha, sha), true, "an exact head match proceeds");
+	assert.equal(exactHeadVerified(sha, "b".repeat(40)), false, "a different head is refused");
+	assert.equal(exactHeadVerified(sha, undefined), false, "an unreadable workspace is refused");
+	assert.equal(exactHeadVerified(undefined, sha), false, "a diff alone does not prove the head");
+	assert.equal(exactHeadVerified(undefined, undefined), false, "nothing verifies without an expected head");
+});
+
+test("fetchDiff carries the PR head SHA so verification can materialize it exactly", async () => {
+	const head = "c".repeat(40);
+	const headFetch = (url: string | URL, init?: RequestInit) => {
+		const target = String(url);
+		if (target.includes("/pulls/42/files")) return fakeFetch([])(url, init);
+		if (target.includes("/pulls/42")) {
+			return { ok: true, status: 200, statusText: "OK", json: async () => ({ head: { sha: head } }) };
+		}
+		return fakeFetch([])(url, init);
+	};
+	const diff = await fetchDiff("projectbluefin/review", 42, { token: "t", fetchImpl: headFetch });
+	assert.equal(diff.headSha, head, "the diff reports the exact PR head");
+	assert.equal(diff.totalFiles, 2);
+	assert.ok(exactHeadVerified(diff.headSha, head), "the reported head verifies against itself");
+});
+
+test("#440 a stale or unknown workspace head is refused before executable verification", async () => {
+	// A diff proves only what GitHub reports. If the materialized workspace is not
+	// the diff's exact head, verification must refuse rather than run against drift.
+	const diff = await fetchDiff("projectbluefin/review", 42, { token: "t", fetchImpl: fakeFetch([]) });
+	assert.equal(diff.headSha, null, "no PR payload means an unknown head");
+	assert.equal(exactHeadVerified(diff.headSha, "a".repeat(40)), false, "an unknown expected head refuses");
+
+	const head = "d".repeat(40);
+	assert.equal(exactHeadVerified(head, head), true, "a matching workspace proceeds");
+	assert.equal(exactHeadVerified(head, "e".repeat(40)), false, "a stale workspace head is refused");
+});
+
+test("the diff tool surfaces the exact head and status shows expected vs workspace SHA", async () => {
+	const head = "4".repeat(40);
+	const headFetch = (url: string | URL, init?: RequestInit) => {
+		const target = String(url);
+		if (target.includes("/pulls/42/files")) return fakeFetch([])(url, init);
+		if (target.includes("/pulls/42")) {
+			return { ok: true, status: 200, statusText: "OK", json: async () => ({ head: { sha: head } }) };
+		}
+		return fakeFetch([])(url, init);
+	};
+	const pi = fakeHost();
+	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl: headFetch, env: ISOLATED_ENV });
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+
+	const diff = await pi.tools.get("hive_workbench_diff").execute("id", { pull_request: 42 });
+	assert.equal(diff.details.head_sha, head, "the diff tool surfaces the exact PR head");
+
+	const status = await pi.tools.get("hive_workbench_status").execute("id", {});
+	assert.match(status.content[0].text, /head: 4/, "status shows the expected head SHA");
+});
+
 // ---------------------------------------------------------------- mode + ui
 
 test("a queue cut off by the fetch ceiling says so", async () => {
@@ -903,7 +1111,7 @@ test("without Hive the queue stays in GitHub evidence order and remains descript
 	await mode.refreshQueue();
 	assert.equal(mode.visibleItems().length, 2);
 
-	assert.equal(mode.selected().id, 42, "browse-only mode preserves the fetched GitHub order");
+	assert.equal(mode.selected().id, 42, "unreachable-Hive mode preserves the fetched GitHub order");
 	assert.equal(mode.priorityFor(mode.selected()).category, "fix-ci", "categories remain descriptive");
 	assert.equal(mode.orderSource(), "local");
 
@@ -1043,7 +1251,7 @@ test("dashboard navigates, folds, filters, and returns actions", (t) => {
 	assert.ok(frame()[0].includes("HIVE WORKBENCH"));
 	for (const row of frame()) assert.ok(visibleWidth(row) <= 120, row);
 
-	assert.equal(mode.selected().id, 42, "browse-only mode preserves fetched order");
+	assert.equal(mode.selected().id, 42, "unreachable-Hive mode preserves fetched order");
 	dashboard.handleInput("j");
 	assert.equal(mode.selected().id, 7);
 	dashboard.handleInput("k");
@@ -1332,7 +1540,7 @@ test("without a hub the queue remains unranked in fetched order", () => {
 	assert.equal(ranked.priorities.get("projectbluefin/review#1").demotion, 1, "descriptive metadata may still mark a dependency bump");
 	assert.equal(categorize(queueItem({ type: "issue" }), { hive: EMPTY_HIVE, now }).category, "triage");
 });
-test("browse-only issue queues preserve fetched order and delineate repository transitions", () => {
+test("unreachable-Hive issue queues preserve fetched order and delineate repository transitions", () => {
 	const now = NOW;
 	const items = [
 		queueItem({ id: 201, type: "issue", repo: "projectbluefin/server", title: "server issue", updatedAt: now - 100 }),
@@ -1689,10 +1897,10 @@ test("the extension registers keyboard-only surfaces and real tools", async () =
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(pi.messages.length, 1, "slay dispatches without requiring Hive ranking");
 	assert.match(pi.messages[0], /bluefin-reviewer/);
-	assert.ok(!ctx.notifications.some((notification) => /browse-only mode disables dispatch/.test(notification.message)));
+	assert.match(status.content[0].text, /review, fix, and slay remain available/, "a missing Hive must not read as browse-only: authorized actions remain available");
 });
 
-test("--autoslay repairs returned pull requests before implementing issue waves", async () => {
+test("--autoslay works the pull-request queue, repairs first, and never switches to issues", async () => {
 	let repairHead = "a".repeat(40);
 	let issueHasPullRequest = false;
 	const repairNode = () => ({
@@ -1754,26 +1962,28 @@ test("--autoslay repairs returned pull requests before implementing issue waves"
 	await pi.events.get("session_start")({}, ctx);
 	await review.whenStarted();
 	await new Promise((resolve) => setImmediate(resolve));
+	// A pull request returned to its author is the blocked work, so it leads.
 	assert.equal(pi.messages.length, 1);
 	assert.match(pi.messages[0], /Repair .*projectbluefin\/review#41/);
 	assert.doesNotMatch(pi.messages[0], /projectbluefin\/review#77/);
+	const prQueue = await pi.tools.get("hive_workbench_queue").execute("id", {});
+	assert.match(prQueue.content[0].text, /projectbluefin\/review#41/, "the queue stays on pull requests");
+	assert.doesNotMatch(prQueue.content[0].text, /projectbluefin\/review#77/, "autoslay must not move the operator onto the issue backlog");
 
 	repairHead = "b".repeat(40);
 	ctx.asyncJobs.recent = [{ id: "repair", status: "completed", startTime: Date.now() + 1 }];
 	await pi.events.get("agent_end")({}, ctx);
-	assert.equal(pi.messages.length, 2);
-	assert.match(pi.messages[1], /Implement projectbluefin\/review#77/);
-	assert.match(pi.messages[1], /hive_workbench_lookup.*queue.*knowledge/);
-	assert.match(pi.messages[1], /workflowz/);
-	assert.match(pi.messages[1], /Closes <owner\/repo>#<number>/);
-
-
-	issueHasPullRequest = true;
-	ctx.asyncJobs.recent = [{ id: "issue", status: "completed", startTime: Date.now() + 1 }];
-	await pi.events.get("agent_end")({}, ctx);
-	const batch = pi.entries.filter((entry) => entry.customType === BATCH_ENTRY).at(-1).data;
-	assert.equal(batch.state, "complete");
-	assert.equal(batch.completedItems, 2);
+	for (let turn = 0; turn < 8; turn += 1) {
+		const { promise, resolve } = Promise.withResolvers();
+		setImmediate(resolve);
+		await promise;
+	}
+	// The issue backlog is never implemented from a pull-request autoslay run.
+	for (const message of pi.messages) {
+		assert.doesNotMatch(message, /Implement projectbluefin\/review#77/);
+	}
+	const afterQueue = await pi.tools.get("hive_workbench_queue").execute("id", {});
+	assert.doesNotMatch(afterQueue.content[0].text, /projectbluefin\/review#77/);
 });
 test("host Alt-S uses issue autoslay and blocks without a submitted pull request", async () => {
 	const node = {
@@ -1834,6 +2044,119 @@ test("ordinary PR slay blocks failed CI before reviewer dispatch", async () => {
 	assert.ok(ctx.notifications.some((notification) => /CI is failure/.test(notification.message)));
 });
 
+test("slay and fix fail closed on unsupported pull requests and keep them visible", async () => {
+	const workflowPr = {
+		number: 10,
+		title: "update deploy pipeline",
+		url: "https://github.com/projectbluefin/review/pull/10",
+		updatedAt: new Date(NOW).toISOString(),
+		isDraft: false,
+		mergeable: "MERGEABLE",
+		reviewDecision: "REVIEW_REQUIRED",
+		headRefOid: "1".repeat(40),
+		changedFiles: 1,
+		files: { pageInfo: { hasNextPage: false }, nodes: [{ path: ".github/workflows/deploy.yml" }] },
+		author: { login: "contributor" },
+		repository: { nameWithOwner: "projectbluefin/review" },
+		labels: { nodes: [] },
+		commits: { nodes: [{ commit: { statusCheckRollup: { state: "SUCCESS" } } }] },
+	};
+	const truncatedPr = {
+		number: 20,
+		title: "massive refactor",
+		url: "https://github.com/projectbluefin/review/pull/20",
+		updatedAt: new Date(NOW - 1000).toISOString(),
+		isDraft: false,
+		mergeable: "MERGEABLE",
+		reviewDecision: "REVIEW_REQUIRED",
+		headRefOid: "2".repeat(40),
+		changedFiles: 200,
+		files: { pageInfo: { hasNextPage: true }, nodes: [{ path: "src/index.ts" }] },
+		author: { login: "contributor" },
+		repository: { nameWithOwner: "projectbluefin/review" },
+		labels: { nodes: [] },
+		commits: { nodes: [{ commit: { statusCheckRollup: { state: "SUCCESS" } } }] },
+	};
+	const eligiblePr = {
+		number: 30,
+		title: "fix typo",
+		url: "https://github.com/projectbluefin/review/pull/30",
+		updatedAt: new Date(NOW - 2000).toISOString(),
+		isDraft: false,
+		mergeable: "MERGEABLE",
+		reviewDecision: "APPROVED",
+		headRefOid: "3".repeat(40),
+		changedFiles: 1,
+		files: { pageInfo: { hasNextPage: false }, nodes: [{ path: "README.md" }] },
+		author: { login: "contributor" },
+		repository: { nameWithOwner: "projectbluefin/review" },
+		labels: { nodes: [] },
+		commits: { nodes: [{ commit: { statusCheckRollup: { state: "SUCCESS" } } }] },
+	};
+	const fetchImpl = async (_url, init) => {
+		const body = JSON.parse(String(init?.body ?? "{}"));
+		if (body.variables?.search !== undefined) {
+			return {
+				ok: true,
+				status: 200,
+				statusText: "OK",
+				json: async () => ({
+					data: {
+						viewer: { login: "maintainer" },
+						search: {
+							pageInfo: { hasNextPage: false, endCursor: null },
+							nodes: [workflowPr, truncatedPr, eligiblePr],
+						},
+					},
+				}),
+			};
+		}
+		const data = {};
+		const aliases = /(\w+): repository\(owner: [^,]+, name: [^)]+\)\s*\{\s*issueOrPullRequest\(number: (\d+)\)/g;
+		for (const [, alias, number] of body.query.matchAll(aliases)) {
+			const found = [workflowPr, truncatedPr, eligiblePr].find((n) => n.number === Number(number));
+			data[alias] = { issueOrPullRequest: found ? { ...found, closed: false } : null };
+		}
+		return { ok: true, status: 200, statusText: "OK", json: async () => ({ data }) };
+	};
+
+	const pi = fakeHost();
+	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl, env: ISOLATED_ENV });
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+
+	// Verify both unsupported PRs are visible in the queue tool with blocked status
+	const queue = await pi.tools.get("hive_workbench_queue").execute("id", {});
+	assert.match(queue.content[0].text, /\[blocked\] projectbluefin\/review#10/);
+	assert.match(queue.content[0].text, /\[blocked\] projectbluefin\/review#20/);
+	assert.match(queue.content[0].text, /projectbluefin\/review#30/);
+
+	// Try fix on workflow PR -> skipped with notification, no message
+	const dashboard = ctx.overlays[0];
+	dashboard.handleInput("f");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(pi.messages.length, 0);
+	assert.ok(ctx.notifications.some((n) => /Skipping projectbluefin\/review#10: changes \.github\/workflows\/deploy\.yml/.test(n.message)));
+
+	// Select truncated PR and try slay -> skipped with notification, no message
+	dashboard.handleInput("j");
+	dashboard.handleInput("s");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(pi.messages.length, 0);
+	assert.ok(ctx.notifications.some((n) => /Skipping projectbluefin\/review#20: complete changed-file list unavailable/.test(n.message)));
+
+	// Select all items ("A") and slay -> unsupported PRs skipped, only eligible PR dispatched
+	dashboard.handleInput("A");
+	dashboard.handleInput("s");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(pi.messages.length, 1);
+	assert.match(pi.messages[0], /projectbluefin\/review#30/);
+	assert.doesNotMatch(pi.messages[0], /projectbluefin\/review#10/);
+	assert.doesNotMatch(pi.messages[0], /projectbluefin\/review#20/);
+});
 
 test("active slay blocks privileged and credential-bearing bash mutations", async () => {
 	const pi = fakeHost();
@@ -1865,6 +2188,96 @@ test("active slay blocks privileged and credential-bearing bash mutations", asyn
 	assert.equal(await call("gh pr merge 7 --repo projectbluefin/other --auto --squash"), undefined);
 });
 
+
+test("slay gate refuses a blocked landing state and allows only complete readiness (review#461)", async () => {
+	const pi = fakeHost();
+	pi.flagValues.set("pr", "7");
+	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl: fakeFetch([]), env: ISOLATED_ENV });
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+	await new Promise((resolve) => setImmediate(resolve));
+	ctx.overlays[0].handleInput("s");
+	await new Promise((resolve) => setImmediate(resolve));
+	const guard = pi.events.get("tool_call");
+	const call = (command) => guard({ toolName: "bash", input: { command } }, ctx);
+
+	const batch = pi.entries.filter((entry) => entry.customType === BATCH_ENTRY).at(-1).data;
+	const target = batch.waves[0].items[0];
+
+	// Green CI but a requested-changes review blocks approval and merge.
+	target.reviewState = "changes_requested";
+	assert.match((await call("gh pr merge 7 --repo projectbluefin/other --auto --squash")).reason, /changes_requested/);
+	assert.match((await call("gh pr review 7 --repo projectbluefin/other --approve")).reason, /changes_requested/);
+
+	// Green CI and approved but a hold label blocks.
+	target.reviewState = "approved";
+	target.labels = ["hold"];
+	assert.match((await call("gh pr merge 7 --repo projectbluefin/other --auto --squash")).reason, /hold label/);
+
+	// Green, approved, unheld but a dirty merge blocks.
+	target.labels = [];
+	target.mergeState = "dirty";
+	assert.match((await call("gh pr merge 7 --repo projectbluefin/other --auto --squash")).reason, /conflicts/);
+
+	// Green, approved, clean but pending CI blocks.
+	target.mergeState = "clean";
+	target.ciStatus = "pending";
+	assert.match((await call("gh pr merge 7 --repo projectbluefin/other --auto --squash")).reason, /CI is pending/);
+
+	// A green, approved, clean, unheld pull request is the only ready-to-land state.
+	target.ciStatus = "success";
+	assert.equal(await call("gh pr merge 7 --repo projectbluefin/other --auto --squash"), undefined);
+});
+
+test("landing state evaluates CI, reviews, holds, and mergeability together", () => {
+	const ready = {
+		id: 1, repo: "projectbluefin/review", ciStatus: "success", mergeState: "clean",
+		reviewState: "approved", labels: [], type: "pr",
+	};
+	// Green, approved, clean, unheld is the only ready-to-land state.
+	assert.equal(landingState(ready), "ready-to-land");
+	// A requested-changes review blocks even with green CI and a clean merge.
+	assert.equal(landingState({ ...ready, reviewState: "changes_requested" }), "review-blocked");
+	// A hold label blocks even with green CI and an approval.
+	assert.equal(landingState({ ...ready, labels: ["hold"] }), "held");
+	assert.equal(landingState({ ...ready, labels: ["blocked"] }), "held");
+	// A hold denied by a managed policy counts, not just the standard set.
+	const policy = {
+		managedRepositories: [{ repository: "projectbluefin/review", requiredLabels: [], deniedLabels: ["release-hold"] }],
+	};
+	assert.equal(landingState({ ...ready, labels: ["release-hold"] }, policy), "held");
+	// Failing or pending CI blocks.
+	assert.equal(landingState({ ...ready, ciStatus: "failure" }), "ci-failing");
+	assert.equal(landingState({ ...ready, ciStatus: "pending" }), "ci-pending");
+	// A dirty merge blocks.
+	assert.equal(landingState({ ...ready, mergeState: "dirty" }), "conflicts");
+	// Awaiting approval is not ready.
+	assert.equal(landingState({ ...ready, reviewState: "review_required" }), "unreviewed");
+	// An issue is not a landing target.
+	assert.equal(landingState({ ...ready, type: "issue" }), "incomplete");
+	// A hold is checked before CI, so a hold never reads as merely pending CI.
+	assert.equal(landingState({ ...ready, ciStatus: "failure", labels: ["hold"] }), "held");
+	// isLandingReady is true only for the complete state.
+	assert.equal(isLandingReady(ready), true);
+	assert.equal(isLandingReady({ ...ready, reviewState: "changes_requested" }), false);
+	assert.equal(isLandingReady({ ...ready, labels: ["hold"] }), false);
+	// The standard hold set is exported for callers that need it.
+	assert.deepEqual([...HOLD_LABELS].sort(), ["blocked", "hold"]);
+});
+
+test("landing reason names the blocker for gates and the UI", () => {
+	assert.equal(landingReason("ci-failing"), "CI is failure");
+	assert.equal(landingReason("ci-pending"), "CI is pending");
+	assert.equal(landingReason("review-blocked"), "has a changes_requested review");
+	assert.equal(landingReason("held"), "has a hold label");
+	assert.equal(landingReason("conflicts"), "has conflicts with the base");
+	assert.equal(landingReason("unreviewed"), "is awaiting approval");
+	assert.equal(landingReason("incomplete"), "is not a pull request");
+	assert.equal(landingReason("ready-to-land"), "");
+});
 
 
 test("RAW_KEYS normalizes Alt-S and Alt-B chords", () => {
@@ -2309,7 +2722,7 @@ test("the status tool names the authority that ordered the queue", async () => {
 		return { ok: false, status: 502, statusText: "Bad Gateway", json: async () => ({}) };
 	}, hubEnv);
 	// The header/status line is a concise fallback status, not the raw error.
-	assert.match(unreachable.content[0].text, /order: unavailable — hive unavailable; GitHub evidence is browse-only/);
+	assert.match(unreachable.content[0].text, /order: unavailable — hive unavailable; queue order falls back to GitHub, and review, fix, and slay remain available/);
 	// The raw diagnostic is kept behind the status, in the structured details.
 	assert.match(unreachable.details.hive.error ?? "", /502/, "the raw error stays in the status details, not the header");
 });
@@ -2399,7 +2812,7 @@ test("the status tool names all three optional-Hive states distinctly", async ()
 		},
 		hubEnv,
 	);
-	assert.match(broken.content[0].text, /order: unavailable — hive unavailable; GitHub evidence is browse-only/);
+	assert.match(broken.content[0].text, /order: unavailable — hive unavailable; queue order falls back to GitHub, and review, fix, and slay remain available/);
 	assert.match(broken.details.hive.error ?? "", /502/, "the raw error is the diagnostic, kept in the status details");
 	assert.equal(broken.details.hive.online, false);
 });
@@ -2419,10 +2832,10 @@ test("a hive-only session with a broken hub still fails visibly and concisely", 
 	await review.whenStarted();
 
 	assert.ok(
-		ctx.notifications.some((notification) => /hive unavailable; browse-only mode/.test(notification.message)),
+		ctx.notifications.some((notification) => /hive unavailable; queue order falls back to GitHub/.test(notification.message)),
 		`a broken hive must fail visibly at startup, got ${JSON.stringify(ctx.notifications)}`,
 	);
-	const startupHive = ctx.notifications.find((notification) => /browse-only mode/.test(notification.message));
+	const startupHive = ctx.notifications.find((notification) => /queue order falls back to GitHub/.test(notification.message));
 	assert.doesNotMatch(startupHive.message, /502/);
 });
 
@@ -2442,6 +2855,28 @@ test("action prompts reserve landing authority for slay", () => {
 	const issue = queueItem({ id: 8, type: "issue", reviewState: "unknown" });
 	assert.equal(actionPrompt({ kind: "slay", item, items: [item, issue] }), undefined);
 	assert.equal(actionPrompt({ kind: "close" }), undefined);
+});
+
+test("diff prompts match the object: issues inspect discussion, pull requests diff", () => {
+	// Issue #591: `d` on an issue must not send the agent to the PR-only
+	// diff tool. Issue inspection reads the body, discussion, and linked PRs.
+	const pr = queueItem();
+	const issue = queueItem({ id: 8, type: "issue", reviewState: "unknown" });
+
+	const prPrompt = actionPrompt({ kind: "diff", item: pr });
+	assert.match(prPrompt, /hive_workbench_diff/);
+
+	const issuePrompt = actionPrompt({ kind: "diff", item: issue });
+	assert.match(issuePrompt, /gh issue view 8 --repo projectbluefin\/review --comments/);
+	assert.match(issuePrompt, /linked/);
+	assert.doesNotMatch(issuePrompt, /Call hive_workbench_diff/);
+
+	const issueWave = actionPrompt({ kind: "diff", item: issue, items: [issue, queueItem({ id: 9, type: "issue", reviewState: "unknown" })] });
+	assert.match(issueWave, /Inspect this issue wave/);
+	assert.match(issueWave, /body, discussion, and linked pull requests/);
+	assert.doesNotMatch(issueWave, /Use hive_workbench_diff/);
+	const prWave = actionPrompt({ kind: "diff", item: pr, items: [pr, queueItem({ id: 7, repo: pr.repo })] });
+	assert.match(prWave, /hive_workbench_diff/);
 });
 
 
@@ -2990,11 +3425,11 @@ test("issue admission gate handles positive admission, negative cases, and invar
 	{
 		const { pi, dashboard, turn } = await setup({ number: 485, labels: [] });
 		pi.messages.length = 0;
-		// 'd' for diff
+		// 'd' for diff — on an issue it inspects the discussion, not the PR-only diff tool
 		dashboard.handleInput("d");
 		await turn();
 		assert.equal(pi.messages.length, 1, "diff is read-only and dispatches without admission gate");
-		assert.match(pi.messages[0], /Call hive_workbench_diff/);
+		assert.match(pi.messages[0], /gh issue view 485 --repo projectbluefin\/review --comments/);
 	}
 	{
 		const { dashboard, ctx, turn } = await setup({ number: 485, labels: [] });
@@ -3720,4 +4155,242 @@ test("fix button dispatches workflowz wave for selected issues without requiring
 		false,
 		"must not block with 'Hive is unavailable'",
 	);
+});
+
+test("a slay wave recognizes pull requests queued in GitHub mergeQueue as terminal", async () => {
+	const item = { id: 138, repo: "cncf/endusers", title: "in merge queue", headSha: "b".repeat(40), isInMergeQueue: true };
+	const pi = fakeHost();
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+	const fetchImpl = async (url, init) => {
+		const target = String(url);
+		if (target.endsWith("/graphql")) {
+			const body = JSON.parse(String(init?.body ?? "{}"));
+			const query = body.query ?? "";
+			if (query.includes("search(query:")) {
+				return {
+					ok: true,
+					status: 200,
+					statusText: "OK",
+					json: async () => ({
+						data: {
+							search: {
+								issueCount: 1,
+								pageInfo: { hasNextPage: false },
+								nodes: [{
+									number: 138,
+									title: "in merge queue",
+									url: "https://github.com/cncf/endusers/pull/138",
+									updatedAt: new Date(NOW).toISOString(),
+									isDraft: false,
+									mergeable: "MERGEABLE",
+									reviewDecision: "APPROVED",
+									headRefOid: "b".repeat(40),
+									author: { login: "reviewer" },
+									repository: { nameWithOwner: "cncf/endusers" },
+									labels: { nodes: [] },
+									autoMergeRequest: null,
+									isInMergeQueue: true,
+									commits: { nodes: [{ commit: { statusCheckRollup: { state: "SUCCESS" } } }] },
+								}],
+							},
+						},
+					}),
+				};
+			}
+			return {
+				ok: true,
+				status: 200,
+				statusText: "OK",
+				json: async () => ({
+					data: {
+						w0: {
+							issueOrPullRequest: {
+								closed: false,
+								number: 138,
+								title: "in merge queue",
+								url: "https://github.com/cncf/endusers/pull/138",
+								updatedAt: new Date(NOW).toISOString(),
+								isDraft: false,
+								mergeable: "MERGEABLE",
+								reviewDecision: "APPROVED",
+								headRefOid: "b".repeat(40),
+								author: { login: "reviewer" },
+								repository: { nameWithOwner: "cncf/endusers" },
+								labels: { nodes: [] },
+								autoMergeRequest: null,
+								isInMergeQueue: true,
+								commits: { nodes: [{ commit: { statusCheckRollup: { state: "SUCCESS" } } }] },
+							},
+						},
+					},
+				}),
+			};
+		}
+		return { ok: true, status: 200, statusText: "OK", json: async () => ({}) };
+	};
+	const review = createReviewExtension(pi, {
+		org: "cncf",
+		fetchImpl,
+		env: { ...ISOLATED_ENV, HIVE_HUB: "wss://hive.example/contribute" },
+	});
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+	ctx.overlays[0].handleInput("s");
+	await new Promise((resolve) => setImmediate(resolve));
+
+	ctx.asyncJobs.recent = [{ id: "slay-mq", status: "completed", startTime: Date.now() + 1 }];
+	await pi.events.get("agent_end")({}, ctx);
+
+	const batches = pi.entries.filter((entry) => entry.customType === BATCH_ENTRY).map((entry) => entry.data);
+	assert.equal(batches.at(-1).error, undefined);
+	assert.equal(batches.at(-1).state, "complete");
+	assert.equal(batches.at(-1).completedItems, 1);
+});
+
+test("--autoslay continues past a wave blocked before dispatch", async () => {
+	// The first repository's issue fails the live pre-dispatch check, so its
+	// wave never reaches an agent. Unattended, that must cost one issue, not
+	// the run: the second repository still has to be dispatched.
+	const issue = (repo, number) => ({
+		number,
+		title: `work ${number}`,
+		url: `https://github.com/${repo}/issues/${number}`,
+		updatedAt: new Date(NOW - number * 1000).toISOString(),
+		author: { login: "maintainer" },
+		repository: { nameWithOwner: repo },
+		labels: { nodes: [] },
+		closedByPullRequestsReferences: { nodes: [] },
+	});
+	const stuck = issue("projectbluefin/stuck", 1);
+	const next = issue("projectbluefin/next", 2);
+	const fetchImpl = async (url, init) => {
+		if (!String(url).includes("/graphql")) {
+			return { ok: true, status: 200, statusText: "OK", json: async () => [] };
+		}
+		const body = JSON.parse(String(init?.body ?? "{}"));
+		if (body.variables?.search !== undefined) {
+			const nodes = body.variables.search.includes("is:pr") ? [] : [stuck, next];
+			return {
+				ok: true,
+				status: 200,
+				statusText: "OK",
+				json: async () => ({ data: { viewer: { login: "jorge" }, search: { pageInfo: { hasNextPage: false }, nodes } } }),
+			};
+		}
+		// Live re-read: the stuck issue reads back closed, which is what the
+		// pre-dispatch check rejects.
+		const data = {};
+		const aliases = /(\w+): repository\(owner: "([^"]+)", name: "([^"]+)"\)\s*\{\s*issueOrPullRequest\(number: (\d+)\)/g;
+		for (const [, alias, owner, repo, number] of body.query.matchAll(aliases)) {
+			const source = Number(number) === 1 ? stuck : next;
+			data[alias] = { issueOrPullRequest: { ...source, closed: Number(number) === 1 } };
+		}
+		return { ok: true, status: 200, statusText: "OK", json: async () => ({ data }) };
+	};
+	const pi = fakeHost();
+	pi.flagValues.set("autoslay", true);
+	// This fixture is an issue backlog, so the run is started on it explicitly:
+	// autoslay works the queue it was given and no longer switches modes.
+	pi.flagValues.set("issues", true);
+	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl, env: ISOLATED_ENV });
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+	for (let turn = 0; turn < 8; turn += 1) {
+		const { promise, resolve } = Promise.withResolvers();
+		setImmediate(resolve);
+		await promise;
+	}
+
+	const blocked = pi.entries
+		.filter((entry) => entry.customType === BATCH_ENTRY)
+		.map((entry) => entry.data)
+		.find((batch) => batch.state === "blocked");
+	assert.ok(blocked, "the rejected wave is still recorded as blocked");
+	assert.match(blocked.error, /projectbluefin\/stuck#1/);
+	assert.equal(pi.messages.length, 1, "the run moves on instead of stopping at the blocked wave");
+	assert.match(pi.messages[0], /projectbluefin\/next#2/);
+	assert.doesNotMatch(pi.messages[0], /projectbluefin\/stuck#1/);
+});
+
+test("--autoslay stops when the queue is drained", async () => {
+	// Nothing is slayable, so the run must arm, find no work, report that it
+	// finished, and dispatch nothing at all.
+	const fetchImpl = async (url, init) => {
+		if (!String(url).includes("/graphql")) {
+			return { ok: true, status: 200, statusText: "OK", json: async () => [] };
+		}
+		const body = JSON.parse(String(init?.body ?? "{}"));
+		const data = body.variables?.search !== undefined
+			? { viewer: { login: "jorge" }, search: { pageInfo: { hasNextPage: false }, nodes: [] } }
+			: {};
+		return { ok: true, status: 200, statusText: "OK", json: async () => ({ data }) };
+	};
+	const pi = fakeHost();
+	pi.flagValues.set("autoslay", true);
+	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl, env: ISOLATED_ENV });
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+	for (let turn = 0; turn < 8; turn += 1) {
+		const { promise, resolve } = Promise.withResolvers();
+		setImmediate(resolve);
+		await promise;
+	}
+
+	assert.equal(pi.messages.length, 0, "an empty queue dispatches no agent work");
+	assert.ok(
+		ctx.notifications.some((notification) => /Autoslay finished: \d+ queue item\(s\) attempted/.test(notification.message)),
+		"the run reports why it stopped",
+	);
+});
+
+test("--autoslay drops CI-red pull requests before they cost a dispatch pass", async () => {
+	// The pre-dispatch check rejects a whole batch on its first bad item and
+	// re-reads every candidate live, so carrying a known-red pull request into
+	// the batch spends an entire pass to learn what the queue already knew.
+	const items = [
+		{ id: 10, repo: "projectbluefin/bluefin", title: "green and ready", headSha: "1".repeat(40), ciStatus: "success", changedFiles: 1, autoMergeEnabled: true },
+		{ id: 11, repo: "projectbluefin/bluefin", title: "ci is red", headSha: "2".repeat(40), ciStatus: "failure", changedFiles: 1, autoMergeEnabled: true },
+		{ id: 12, repo: "projectbluefin/bluefin", title: "ci still running", headSha: "3".repeat(40), ciStatus: "pending", changedFiles: 1, autoMergeEnabled: true },
+	];
+	const baseFetch = hiveBackedFetch(items);
+	const fetchImpl = async (url, init) => {
+		if (String(url).includes("/files")) {
+			return {
+				ok: true,
+				status: 200,
+				statusText: "OK",
+				json: async () => [{ filename: "README.md", status: "modified", additions: 1, deletions: 0 }],
+			};
+		}
+		return baseFetch(url, init);
+	};
+	const pi = fakeHost();
+	pi.flagValues.set("autoslay", true);
+	const review = createReviewExtension(pi, { org: "projectbluefin", fetchImpl, env: ISOLATED_ENV });
+	const ctx = fakeCtx();
+	ctx.ui.parent = ctx;
+
+	await pi.events.get("session_start")({}, ctx);
+	await review.whenStarted();
+	for (let turn = 0; turn < 8; turn += 1) {
+		const { promise, resolve } = Promise.withResolvers();
+		setImmediate(resolve);
+		await promise;
+	}
+
+	assert.equal(pi.messages.length, 1, "the green pull request dispatches on the first pass");
+	assert.match(pi.messages[0], /projectbluefin\/bluefin#10/);
+	assert.doesNotMatch(pi.messages[0], /projectbluefin\/bluefin#11/, "a failing pull request never enters the batch");
+	assert.doesNotMatch(pi.messages[0], /projectbluefin\/bluefin#12/, "a pending pull request never enters the batch");
+
+	const batch = pi.entries.filter((entry) => entry.customType === BATCH_ENTRY).map((entry) => entry.data).at(-1);
+	assert.equal(batch.totalItems, 1, "the batch carries only dispatchable work");
+	assert.notEqual(batch.state, "blocked", "a known-red pull request must not block the batch");
 });

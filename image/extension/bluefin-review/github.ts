@@ -90,6 +90,7 @@ const PR_ITEM_FIELDS = `
 		nodes { path }
 	}
 	autoMergeRequest { enabledAt }
+	isInMergeQueue
 	commits(last: 1) {
 		nodes {
 			commit {
@@ -223,6 +224,7 @@ interface SearchNode {
 	closed?: boolean;
 	changedFiles?: number;
 	autoMergeRequest?: { enabledAt?: string } | null;
+	isInMergeQueue?: boolean | null;
 	author?: { login?: string } | null;
 	repository?: { nameWithOwner?: string } | null;
 	labels?: { nodes?: Array<{ name?: string }> } | null;
@@ -249,22 +251,26 @@ interface SearchNode {
 	} | null;
 }
 
-function toCiStatus(
+export function toCiStatus(
 	state?: string,
 	checkSuites?: { pageInfo?: { hasNextPage?: boolean }; nodes?: Array<{ status?: string; conclusion?: string | null }> } | null,
 ): CiStatus | undefined {
-	const rollup = state?.toUpperCase();
+	const rollup = state?.trim().toUpperCase();
+	if (rollup === "SUCCESS") return "success";
+	if (rollup === "FAILURE" || rollup === "ERROR") return "failure";
+	if (rollup) return "pending";
+
 	const suites = checkSuites?.nodes ?? [];
 	const failedSuite = suites.some((suite) => {
 		if (suite.status?.toUpperCase() !== "COMPLETED") return false;
 		const conclusion = suite.conclusion?.toUpperCase();
 		return conclusion !== undefined && !["SUCCESS", "NEUTRAL", "SKIPPED"].includes(conclusion);
 	});
-	if (failedSuite || rollup === "FAILURE" || rollup === "ERROR") return "failure";
+	if (failedSuite) return "failure";
 	const pendingSuite = checkSuites?.pageInfo?.hasNextPage === true
 		|| suites.some((suite) => suite.status?.toUpperCase() !== "COMPLETED" || !suite.conclusion);
-	if (pendingSuite || (rollup !== undefined && rollup !== "SUCCESS")) return "pending";
-	if (rollup === "SUCCESS" || suites.length > 0) return "success";
+	if (pendingSuite) return "pending";
+	if (suites.length > 0) return "success";
 	return undefined;
 }
 
@@ -315,7 +321,7 @@ function toQueueItem(node: SearchNode, mode: QueueMode): QueueItem | undefined {
 		deletions: node.deletions,
 		changedFiles: node.changedFiles,
 		headSha: node.headRefOid,
-		autoMergeEnabled: Boolean(node.autoMergeRequest?.enabledAt),
+		autoMergeEnabled: Boolean(node.autoMergeRequest?.enabledAt || node.isInMergeQueue),
 		workflowFiles:
 			mode === "prs"
 				? (node.files?.nodes ?? []).map((file) => file.path ?? "").filter((path) => path.startsWith(".github/workflows/"))
@@ -690,6 +696,14 @@ export interface DiffResult {
 	additions: number;
 	deletions: number;
 	truncated: boolean;
+	/**
+	 * Exact head SHA the diff was fetched against. A remote diff proves only what
+	 * GitHub says, never what is on disk, so executable verification must
+	 * materialize this exact head and refuse on any mismatch (projectbluefin
+	 * /review#471). Null when the head cannot be resolved: the files are still
+	 * returned, but verification must refuse until an exact head exists.
+	 */
+	headSha: string | null;
 	error?: string;
 }
 
@@ -768,12 +782,52 @@ export async function fetchDiff(repo: string, pullRequest: number, options: Diff
 				patch,
 			});
 		}
+		result.headSha = await fetchPrHeadSha(repo, pullRequest, { token, signal, fetchImpl: options.fetchImpl });
 		return result;
 	} catch (error) {
 		result.error = error instanceof Error ? error.message : String(error);
 		return result;
 	}
 }
+
+/**
+ * The pull request's head commit SHA, read from the PR itself rather than the
+ * file list. A diff of files says nothing about which commit is on disk, so the
+ * head is fetched from the PR that owns them.
+ */
+async function fetchPrHeadSha(
+	repo: string,
+	pullRequest: number,
+	options: FetchOptions = {},
+): Promise<string | null> {
+	const doFetch = options.fetchImpl ?? fetch;
+	try {
+		const response = await doFetch(
+			`https://api.github.com/repos/${repo}/pulls/${pullRequest}`,
+			{ headers: headers(options.token), signal: options.signal, redirect: "error" },
+		);
+		if (!response.ok) return null;
+		const payload = (await response.json()) as { head?: { sha?: string | null } | null } | null;
+		return payload?.head?.sha ?? null;
+	} catch {
+		// An unreadable PR must not sink the diff: the files are still returned and
+		// the verification gate refuses when headSha is null.
+		return null;
+	}
+}
+
+/**
+ * Exact-head verification gate for executable verification. Execution may only
+ * proceed when an exact head was expected and the materialized workspace is that
+ * very head. A missing expected head, an unreadable workspace, or any mismatch
+ * all refuse: a fetched diff does not prove the workspace contains that head
+ * (projectbluefin/review#471). Pure and side-effect free so the gate is testable
+ * in isolation from the worktree materialization that produces `workspaceSha`.
+ */
+export function exactHeadVerified(expectedSha: string | null | undefined, workspaceSha: string | null | undefined): boolean {
+	return typeof expectedSha === "string" && expectedSha === workspaceSha;
+}
+
 export interface CollaboratorPermissionResult {
 	permission?: string;
 	isCollaborator: boolean;

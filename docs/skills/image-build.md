@@ -1,7 +1,7 @@
 ---
 name: image-build
-version: "3.3"
-last_updated: 2026-09-15
+version: "3.5"
+last_updated: 2026-09-16
 id: image-build
 one_line_purpose: Build and pin the OMP review and contributor images.
 entry_point: docs/skills/image-build.md
@@ -11,10 +11,10 @@ optimization_status: draft
 status: active
 dependencies: []
 tags: [containerfile, image, digest, pinning, omp, hive]
-description: "Use when maintaining the distroless OMP review appliance or the OMP Hive contributor image."
+description: "Use when maintaining the OMP review/contributor images, release pins, SBOM inputs, or multi-architecture publication workflows."
 metadata:
   type: procedure
-  context7-sources: [/websites/podman_io_en, /websites/github_en_actions]
+  context7-sources: [/websites/podman_io_en, /websites/github_en_actions, /renovatebot/renovate]
 ---
 # Image Build
 
@@ -62,16 +62,51 @@ model-specific runtime. Both OCI images leave model and effort selection to OMP.
 14. Bundle review-appliance MCP definitions beside the packaged review
     extension in `.mcp.json`. Do not place them under `/home/bluefin`: the
     launcher's persistent home volume masks image content at that path.
+15. OMP version and digest pins move as one release unit in both Containerfiles.
+    The scheduled Renovate workflow refreshes the GitHub release asset digests,
+    merges the validated OMP update, and lets the resulting `main` push publish
+    both images.
+16. Each image owns its OMP settings overlay, and both load it the same way:
+    `PI_CONFIG_FILES` in the image environment, the documented wrapper seam
+    that lands in the CLI-overlay layer above user and project settings. The
+    contributor cannot use `--config` at all, because Hive owns the `omp` argv
+    inside its tmux session, and `--config` is a flag of the main run, so it
+    reaches no subcommand and cannot be observed from inside the image. Both
+    overlays set `startup.checkUpdate: false`, since a read-only image cannot
+    perform the `omp update` the banner advertises, and `symbolPreset: nerd`,
+    since the default `unicode` preset draws fallback glyphs in a Bluefin
+    terminal and makes OMP ask the operator for a font the image cannot
+    install. Assert what OMP resolved, never that the file is present.
 
 ## Pin maintenance
 
-Hive's source pin appears in `justfile` and `image/contribute/Containerfile`.
-Move both together from Hive's `v4` branch. The review and contribute image
-revision files are separate product revisions.
+Hive's source pin appears in `justfile` and `image/contribute/Containerfile`;
+move both together from Hive's `v4` branch. OMP pins appear in both
+Containerfiles. `node scripts/update-omp-pins.mjs <version>` reads the published
+GitHub release asset digests and updates both files atomically. Renovate runs
+that command daily after changing `OMP_VERSION`, then automerges only after
+repository checks pass. The merge triggers `publish-appliance.yml` and
+`publish-contribute.yml`; those workflows build and execute both native
+architectures before updating their published indexes. The review and
+contribute image revision files remain separate product revisions.
+Derived checksum automation for GitHub CLI, Node.js, tmux, and `requirements-ci.lock`
+runs in their respective Renovate branches via `node scripts/update-gh-pins.mjs`,
+`node scripts/update-node-pins.mjs`, `node scripts/update-tmux-pins.mjs`, and
+`node scripts/update-requirements-ci-hashes.mjs`.
+
+OMP releases are automated through the repository's existing Renovate workflow.
+Renovate runs every 15 minutes, groups the two Containerfile `OMP_VERSION`
+updates, and invokes `node scripts/update-omp-pins.mjs` as an allowlisted
+post-upgrade task. The updater reads GitHub release-asset digests and refreshes
+the x86_64 and arm64 SHA-256 pins in both images. The OMP-only Renovate PR
+automerge exception applies only after repository checks pass; its merge to
+`main` triggers both native multi-architecture publish workflows.
 
 ## Verification
 
 ```bash
+node --test tests/update-omp-pins.test.mjs
+node --test tests/update-derived-pins.test.mjs
 bash tests/appliance-contract.sh
 bash tests/contribute-contract.sh
 python3 tests/appliance_sbom_contract.py

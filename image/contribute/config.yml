@@ -1,0 +1,20 @@
+# Invocation overlay owned by the immutable contributor image. Hive owns the
+# `omp` command line inside the tmux session, so this reaches OMP through
+# PI_CONFIG_FILES rather than `--config`; it loads above user and project
+# settings and below Hive's own runtime flags.
+#
+# A packaged binary never advertises an in-place update: `omp update` cannot
+# write to a read-only image, and the banner is pure noise on an attended
+# terminal whose whole purpose is the agent below it.
+startup:
+  checkUpdate: false
+  # A contributor starts on a fresh state volume, and Hive drives the session
+  # unattended inside tmux. The onboarding wizard would sit on the pane
+  # waiting for an answer nobody is there to give.
+  setupWizard: false
+
+# The attended terminal is a Bluefin terminal, which ships a Nerd Font. Left at
+# the `unicode` default OMP draws the fallback glyph set and then asks the
+# operator to "use nerdfont" on every launch, which is neither actionable
+# inside a distroless image nor true of the terminal it is running in.
+symbolPreset: nerd

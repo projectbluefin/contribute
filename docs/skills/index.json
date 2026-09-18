@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-15",
+  "generated_at": "2026-09-16",
   "schema_version": "1.0",
   "skills": [
     {
@@ -112,15 +112,15 @@
         "omp",
         "hive"
       ],
-      "description": "Use when maintaining the distroless OMP review appliance or the OMP Hive contributor image.",
-      "version": "3.3",
-      "last_updated": "2026-09-15",
+      "description": "Use when maintaining the OMP review/contributor images, release pins, SBOM inputs, or multi-architecture publication workflows.",
+      "version": "3.5",
+      "last_updated": "2026-09-16",
       "doc_type": "procedure"
     },
     {
       "id": "launcher",
       "name": "launcher",
-      "one_line_purpose": "Change review just recipes without breaking the launch contract.",
+      "one_line_purpose": "Change the Bluefin application launcher without breaking its runtime contracts.",
       "entry_point": "docs/skills/launcher.md",
       "category": "ci-ops",
       "status": "active",
@@ -210,8 +210,8 @@
         "workflowz"
       ],
       "description": "Maintains the OMP review workbench. Use for queue ordering, slay or autoslay, workflowz issue batches, durable batch state, dashboard controls, or mutation guards.",
-      "version": "5.3",
-      "last_updated": "2026-09-15",
+      "version": "5.4",
+      "last_updated": "2026-09-16",
       "doc_type": "runbook"
     },
     {

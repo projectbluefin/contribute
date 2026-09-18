@@ -77,7 +77,7 @@ const HELP: readonly string[] = [
 	"  alt+s            repair returned PRs, then implement issue waves",
 	"  c                comment on selected item(s)",
 	"  f                fix selected item(s) in isolated workspaces",
-	"  d                inspect bounded diff evidence",
+	"  d                inspect evidence (PR diff, issue discussion)",
 	"  enter            cite the selection in the prompt",
 	"  ?                close this help",
 	"  q, esc           close the workbench",
@@ -1100,15 +1100,27 @@ export class ReviewDashboard {
 		if (!item) return [];
 		const work = this.mode.hiveWorkFor(item);
 		const priority = this.mode.priorityFor(item);
-		if (!work && priority?.hiveRank === undefined) return [];
+		if (!work && priority?.hiveRank === undefined && priority?.category !== "blocked") return [];
 
 		const rows: string[] = [];
+		if (priority?.category === "blocked") {
+			rows.push(truncateToWidth(`  ${this.painter.fg("error", "BLOCKED")}${this.painter.fg("dim", ` ${GLYPH.dot} ${priority.reason}`)}`, width));
+			if (item.workflowFiles && item.workflowFiles.length > 0) {
+				for (const file of item.workflowFiles) {
+					rows.push(truncateToWidth(this.painter.fg("dim", `  changes ${file}`), width));
+				}
+			} else if (item.changedFilesComplete === false) {
+				rows.push(truncateToWidth(this.painter.fg("dim", "  complete changed-file list unavailable"), width));
+			}
+		}
 		const rank = priority?.hiveRank === undefined ? "" : `hive #${priority.hiveRank + 1}`;
 		const stage = work?.level ? ` ${GLYPH.dot} stage ${work.level}` : "";
-		rows.push(truncateToWidth(`  ${this.painter.fg("accent", rank)}${this.painter.fg("dim", stage)}`, width));
+		if (rank) {
+			rows.push(truncateToWidth(`  ${this.painter.fg("accent", rank)}${this.painter.fg("dim", stage)}`, width));
+		}
 		// The reason only earns a row when it says something the rank and stage
 		// above it do not: `hive <level> #<n>` is the same sentence twice.
-		if (priority?.reason && priority.hiveRank === undefined) {
+		if (priority?.reason && priority.hiveRank === undefined && priority.category !== "blocked") {
 			rows.push(truncateToWidth(this.painter.fg("dim", `  ${priority.reason}`), width));
 		}
 		const claimedBy = this.mode.claimFor(item);

@@ -39,12 +39,33 @@ grep -qF 'supports only AGENT_BACKEND=omp' image/contribute/entrypoint.sh || fai
 image_hive_commit="$(sed -n 's/^ARG HIVE_COMMIT=//p' "$containerfile")"
 launcher_hive_commit="$(sed -n 's/^hive_commit := "\([0-9a-f]\{40\}\)"$/\1/p' justfile)"
 [[ -n "$image_hive_commit" && "$image_hive_commit" == "$launcher_hive_commit" ]] || fail "launcher and contributor image must pin the same Hive commit"
-if grep -R -nE 'AGENT_MODEL|AGENT_REASONING_EFFORT' justfile image/contribute deploy/contribute.yaml; then
+# bin/bluefin is the launcher; its offline fallback is the value that ships when
+# the justfile is absent.
+grep -qF "$image_hive_commit" bin/bluefin || fail "bin/bluefin must pin the same Hive commit as the container"
+if grep -R -nE 'AGENT_MODEL|AGENT_REASONING_EFFORT' justfile bin/bluefin image/contribute deploy/contribute.yaml; then
   fail "provider, model, and effort belong to OMP configuration"
 fi
 [[ ! -d image/tui ]] || fail "legacy Textual UI must not ship"
 [[ ! -e image/Containerfile ]] || fail "legacy compatibility image must not ship"
 grep -qF 'COPY image/tmux.conf /etc/tmux.conf' "$containerfile" || fail "missing shared tmux.conf (mouse, truecolor, history-limit)"
+grep -qF 'set -g default-terminal "tmux-256color"' image/tmux.conf || fail "contributor panes must advertise tmux-256color"
+grep -qF 'tmux_fallback_term=xterm-256color' image/contribute/entrypoint.sh || fail "contributor attach fallback must match review xterm-256color"
+grep -qE '^ +LANG=C\.UTF-8 \\$' "$containerfile" || fail "contributor image must default to a UTF-8 locale; without it tmux downgrades the attached client to non-UTF-8"
+# Hive owns the `omp` argv inside its tmux session, so the image's own OMP
+# settings have to reach the agent through the documented wrapper seam. Without
+# them OMP runs at its `unicode` default and nags the operator to "use
+# nerdfont" on every launch, and advertises an `omp update` that cannot write
+# to a read-only image.
+grep -qF 'COPY image/contribute/config.yml /usr/share/bluefin/contribute/omp-config.yml' "$containerfile" ||
+  fail "contributor image must ship its OMP settings overlay"
+grep -qE '^ +PI_CONFIG_FILES=/usr/share/bluefin/contribute/omp-config\.yml \\$' "$containerfile" ||
+  fail "contributor image must load its OMP settings overlay through PI_CONFIG_FILES"
+grep -qF 'symbolPreset: nerd' image/contribute/config.yml || fail "contributor overlay must select the Nerd Font symbol preset"
+grep -qF 'checkUpdate: false' image/contribute/config.yml || fail "contributor overlay must not advertise an in-place update"
+if grep -qF 'xterm-direct' image/contribute/entrypoint.sh || grep -qF 'tmux-direct' image/tmux.conf; then
+  fail "contributor must not reintroduce direct-color TERM entries"
+fi
+grep -qF 'set -g set-titles-string "contribute - #{pane_title}"' image/tmux.conf || fail "contributor terminal title must identify contribute mode"
 # Positive control: the attended path must actually show the OMP session in
 # the launching terminal instead of leaving the operator staring at relay
 # logs with no way to see the agent (the entrypoint used to `exec` straight
@@ -71,6 +92,20 @@ test "$(inspect '{{.Config.WorkingDir}}')" = /home/bluefin/workspace || fail "im
 test "$(inspect '{{json .Config.Entrypoint}}')" = '["/usr/local/bin/contribute-entrypoint"]' || fail "image entrypoint"
 # shellcheck disable=SC2016 # the single-quoted $HOME expands inside the container, not this shell
 "$engine" run --rm --entrypoint /usr/bin/bash "$image" -c 'set -eu; omp --version; node -e "require.resolve(\"ws\")"; python3 --version >/dev/null; gh --version >/dev/null; tmux -V; git --version >/dev/null; curl --version >/dev/null; find --version >/dev/null; grep --version >/dev/null; sed --version >/dev/null; cmp --version >/dev/null; test -w "$HOME"; test -w "$HOME/workspace"; test -f /usr/local/bin/contributor-relay.js; test -f /usr/local/bin/pi-backend.js; test -f /usr/local/bin/lib/pane-classifier.js; test ! -e /usr/bin/npm; test ! -e /usr/bin/corepack' >/dev/null || fail "runtime closure"
+# The image's default locale must be UTF-8 *and* actually installed: a LANG
+# naming an absent locale degrades to C just as silently as no LANG at all,
+# and tmux then writes box drawing to the attached terminal as DEC ACS and
+# every other non-ASCII cell as `_`. Bash reports a multibyte character as one
+# character only when the effective locale resolved to UTF-8.
+# shellcheck disable=SC2016 # the probe expands inside the container, not this shell
+width="$("$engine" run --rm --entrypoint /usr/bin/bash "$image" -c 'x=$(printf "\xe2\x94\x80"); printf %s "${#x}"')"
+test "$width" = 1 || fail "image locale is not UTF-8 (U+2500 measured as ${width} characters, not 1)"
+# Shipping the overlay file is not the contract; OMP resolving it is. A wrong
+# path, an unreadable file, or a renamed key leaves the file in the image and
+# the agent still rendering fallback glyphs behind an update banner.
+resolved="$("$engine" run --rm --entrypoint /usr/bin/bash "$image" -c 'omp config get symbolPreset; omp config get startup.checkUpdate' | tr '\n' ' ')"
+test "$resolved" = "nerd false " ||
+  fail "OMP did not resolve the shipped overlay (symbolPreset/startup.checkUpdate = ${resolved})"
 if "$engine" run --rm --env AGENT_BACKEND=goose "$image" >/dev/null 2>&1; then
   fail "alternate agent backends must be rejected"
 fi

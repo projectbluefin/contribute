@@ -29,7 +29,7 @@ declare -a roots=()
 while IFS= read -r name; do
   roots+=("$name")
 done < <(
-  grep -oE 'tests/[A-Za-z0-9_.-]+\.(sh|py|test\.ts)' "$workflow" | sed 's|^tests/||' | sort -u
+  grep -oE 'tests/[A-Za-z0-9_.-]+\.(sh|py|mjs|test\.ts)' "$workflow" | sed 's|^tests/||' | sort -u
 )
 
 ((${#roots[@]} > 0)) || fail "validate.yml names no test files at all"
@@ -54,7 +54,7 @@ while IFS= read -r path; do
   checked=$((checked + 1))
   is_referenced_by_roots "$name" ||
     fail "tests/$name is never executed by .github/workflows/validate.yml"
-done < <(find "$tests_dir" -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.test.ts' \) | sort)
+done < <(find "$tests_dir" -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.mjs' -o -name '*.test.ts' \) | sort)
 
 # A root that names a file which does not exist is the same defect inverted:
 # CI would fail late, or the reference silently rots.

@@ -5,6 +5,19 @@
   ],
   "customManagers": [
     {
+      "description": "Track the shared OMP release version in both image Containerfiles; the post-upgrade task supplies verified per-architecture digests.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/(^|/)image/(appliance|contribute)/Containerfile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=github-releases depName=can1357/oh-my-pi\\nARG OMP_VERSION=(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)"
+      ],
+      "depNameTemplate": "can1357/oh-my-pi",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver-coerced"
+    },
+    {
       "description": "Track hivecommons/hive origin/v4 as a pinned commit SHA. The SHA is duplicated in the launcher, contributor image, and README; one depName keeps every match in a single Renovate branch and PR.",
       "customType": "regex",
       "managerFilePatterns": [
@@ -23,7 +36,46 @@
       "datasourceTemplate": "git-refs"
     },
     {
-      "description": "Track requirements-ci.lock, a pip-compile (--require-hashes) lockfile of pre-commit and its dependency tree. The file uses a non-standard .lock name and a custom header, so a regex manager matches each pkg==version line directly; pypi resolves the newest version and CI regenerates the hashes with `uv pip compile --generate-hashes`.",
+      "description": "Track the shared GitHub CLI release version in both image Containerfiles; the post-upgrade task supplies verified per-architecture digests.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/(^|/)image/(appliance|contribute)/Containerfile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=github-releases depName=cli/cli\\nARG GH_VERSION=(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)"
+      ],
+      "depNameTemplate": "cli/cli",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver-coerced"
+    },
+    {
+      "description": "Track Node.js releases in the contributor image Containerfile; the post-upgrade task supplies verified per-architecture digests.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/(^|/)image/contribute/Containerfile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=node-version depName=node\\nARG NODE_VERSION=(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)"
+      ],
+      "depNameTemplate": "node",
+      "datasourceTemplate": "node-version",
+      "versioningTemplate": "node"
+    },
+    {
+      "description": "Track tmux static build releases in the contributor image Containerfile; the post-upgrade task supplies verified per-architecture digests.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/(^|/)image/contribute/Containerfile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=github-releases depName=tmux/tmux-builds\\nARG TMUX_VERSION=(?<currentValue>[0-9]+\\.[0-9]+[a-z]?)"
+      ],
+      "depNameTemplate": "tmux/tmux-builds",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "loose"
+    },
+    {
+      "description": "Track requirements-ci.lock package versions; the post-upgrade task regenerates sha256 hashes from PyPI metadata.",
       "customType": "regex",
       "managerFilePatterns": [
         "/(^|/)requirements-ci\\.lock$/"
@@ -36,7 +88,7 @@
   ],
   "packageRules": [
     {
-      "description": "Immutable-ref housekeeping (pin and pinDigest) automerges — these updates only move a floating reference to an immutable one and carry no upstream code change. automergeType and automergeStrategy are stated rather than inherited: branch-mode automerge cannot land here because branch protection requires a pull request, and squash is the only merge this repository allows. digest, patch, minor, major, rollback, and replacement updates are intentionally NOT automerged: a human reviews every upstream code change before it lands on main (supply-chain review gate, projectbluefin/review#499).",
+      "description": "Immutable-ref housekeeping automerges by default. Other code-changing updates require review under the supply-chain gate projectbluefin/review#499 unless a later dependency-specific rule opts into validated automerge; the OMP rule below is that explicit exception. Pull-request automerge and squash are stated because branch protection rejects branch-mode automerge.",
       "matchUpdateTypes": [
         "pin",
         "pinDigest"
@@ -45,6 +97,31 @@
       "automergeType": "pr",
       "automergeStrategy": "squash",
       "platformAutomerge": true
+    },
+    {
+      "description": "Track every stable OMP GitHub release, refresh both verified binary digests, and merge after repository checks so both image publishers run from main.",
+      "matchDatasources": [
+        "github-releases"
+      ],
+      "matchPackageNames": [
+        "can1357/oh-my-pi"
+      ],
+      "groupName": "OMP runtime",
+      "rangeStrategy": "replace",
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash",
+      "platformAutomerge": true,
+      "postUpgradeTasks": {
+        "commands": [
+          "node scripts/update-omp-pins.mjs"
+        ],
+        "fileFilters": [
+          "image/appliance/Containerfile",
+          "image/contribute/Containerfile"
+        ],
+        "executionMode": "branch"
+      }
     },
     {
       "description": "Keep FSDK base and builder image digests in Containerfiles current",
@@ -56,6 +133,82 @@
         "ghcr.io/projectbluefin/base"
       ],
       "pinDigests": true
+    },
+    {
+      "description": "Track GitHub CLI releases and refresh both verified binary digests.",
+      "matchDatasources": [
+        "github-releases"
+      ],
+      "matchPackageNames": [
+        "cli/cli"
+      ],
+      "groupName": "GitHub CLI runtime",
+      "rangeStrategy": "replace",
+      "postUpgradeTasks": {
+        "commands": [
+          "node scripts/update-gh-pins.mjs"
+        ],
+        "fileFilters": [
+          "image/appliance/Containerfile",
+          "image/contribute/Containerfile"
+        ],
+        "executionMode": "branch"
+      }
+    },
+    {
+      "description": "Track Node.js releases and refresh verified binary digests.",
+      "matchDatasources": [
+        "node-version"
+      ],
+      "matchPackageNames": [
+        "node"
+      ],
+      "groupName": "Node.js runtime",
+      "rangeStrategy": "replace",
+      "postUpgradeTasks": {
+        "commands": [
+          "node scripts/update-node-pins.mjs"
+        ],
+        "fileFilters": [
+          "image/contribute/Containerfile"
+        ],
+        "executionMode": "branch"
+      }
+    },
+    {
+      "description": "Track tmux static builds and refresh verified binary digests.",
+      "matchDatasources": [
+        "github-releases"
+      ],
+      "matchPackageNames": [
+        "tmux/tmux-builds"
+      ],
+      "groupName": "tmux runtime",
+      "rangeStrategy": "replace",
+      "postUpgradeTasks": {
+        "commands": [
+          "node scripts/update-tmux-pins.mjs"
+        ],
+        "fileFilters": [
+          "image/contribute/Containerfile"
+        ],
+        "executionMode": "branch"
+      }
+    },
+    {
+      "description": "Regenerate requirements-ci.lock sha256 hashes when managed PyPI package versions change.",
+      "matchDatasources": [
+        "pypi"
+      ],
+      "postUpgradeTasks": {
+        "commands": [
+          "node scripts/update-requirements-ci-hashes.mjs"
+        ],
+        "fileFilters": [
+          "requirements-ci.lock"
+        ],
+        "executionMode": "branch"
+      }
     }
   ]
 }

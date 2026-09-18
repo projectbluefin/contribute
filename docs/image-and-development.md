@@ -16,6 +16,13 @@ architecture-specific SHA-256. The contributor image installs the root
 `package-lock.json` solely for Hive's pinned `ws` dependency. Hive retains
 assignment, lease, prompt, credential, and completion authority.
 
+The daily Renovate workflow follows stable `can1357/oh-my-pi` GitHub releases.
+Its allowlisted post-upgrade task runs `node scripts/update-omp-pins.mjs`, which
+requires both Containerfiles to name the same OMP version and replaces their
+per-architecture digests from the matching release assets. After checks pass,
+the OMP-only Renovate PR automerges; that `main` push publishes both native
+multi-architecture images.
+
 ## Development
 
 ```bash
@@ -43,6 +50,8 @@ just --list
 bash tests/just-onboarding.sh
 bash tests/readme-quickstart.sh
 bash tests/test-registry.sh
+node --test tests/update-omp-pins.test.mjs
+node --test tests/update-derived-pins.test.mjs
 bash tests/omp-review-mode.sh
 bash tests/appliance-contract.sh
 bash tests/contribute-contract.sh

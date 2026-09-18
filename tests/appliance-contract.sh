@@ -98,7 +98,7 @@ require "$containerfile" \
   'io.projectbluefin.review.appliance="true"' \
   'org.opencontainers.image.version="${REVIEW_VERSION}"' \
   'org.opencontainers.image.revision="${REVIEW_REVISION}"'
-require image/appliance/config.yml 'advisor: "@default"' 'syncBacklog: 1'
+require image/appliance/config.yml 'advisor: "@default"' 'syncBacklog: 1' 'symbolPreset: nerd'
 python3 - image/extension/bluefin-review/.mcp.json <<'PY' || fail "bundled MCP configuration is invalid"
 import json
 import sys
@@ -313,16 +313,24 @@ run '
 run 'set -eu; test -w "$HOME"; test "$HOME" = /home/bluefin' >/dev/null ||
   fail "HOME must exist and be writable by the nonroot user"
 
+# The overlay OMP resolves is the contract; a present file proves nothing. At
+# the `unicode` default the workbench draws fallback glyphs and asks the
+# operator to "use nerdfont" on an image that cannot install one. `--config` is
+# a flag of the main omp run, so it never reaches a subcommand and cannot be
+# observed from inside the image; PI_CONFIG_FILES is the same overlay layer for
+# every invocation, so the appliance uses it and this can assert the result.
 # shellcheck disable=SC2016 # Expanded by the container's shell, not this one.
 run '
   set -eu
   test -x /usr/bin/bluefin-review-appliance
-  grep -q "checkUpdate: false" /usr/share/bluefin/review/appliance-config.yml
+  test "$PI_CONFIG_FILES" = /usr/share/bluefin/review/appliance-config.yml
+  test "$(omp config get symbolPreset)" = nerd
+  test "$(omp config get startup.checkUpdate)" = false
   test -f /usr/share/bluefin/review/extension/index.ts
   test -d /usr/share/bluefin/review/extension/agents
   test -f /usr/share/bluefin/review/extension/.mcp.json
   test -f /usr/share/bluefin/review/sbom.spdx.json
-' >/dev/null || fail "the review mode or its SBOM is missing from the image"
+' >/dev/null || fail "the review mode, its settings overlay, or its SBOM is missing from the image"
 
 # Nothing inside may install anything.
 # shellcheck disable=SC2016 # Expanded by the container's shell, not this one.

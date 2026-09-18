@@ -57,7 +57,7 @@ hive_repo_url := "https://github.com/hivecommons/hive"
 # kubestellar/hive#6670 (fix: scope OMP's login/onboarding checks to the
 # pane's last 3 lines instead of a 15-line tail a tip or a finished turn's
 # own prose could still land in).
-hive_commit := "feaac6859a46d22c143420102cc3ab4e8687cd65"
+hive_commit := "67530919a135cbc466d1e0961770028842c80876"
 contribute_image := env("CONTRIBUTE_IMAGE", "ghcr.io/projectbluefin/contribute:stable")
 
 # Shared bash, 'eval''d at the top of every recipe script that needs it:
@@ -116,7 +116,7 @@ require_apptainer_fallback() {
 }
 prepare_apptainer_environment() {
   local name host_file
-  for name in GH_TOKEN GITHUB_TOKEN COPILOT_GITHUB_TOKEN GITHUB_COPILOT_TOKEN ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN OPENAI_API_KEY GEMINI_API_KEY CONTEXT7_API_KEY HIVE_HUB BLUEFIN_REVIEW_ORG TERM COLORTERM; do
+  for name in GH_TOKEN GITHUB_TOKEN COPILOT_GITHUB_TOKEN GITHUB_COPILOT_TOKEN ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN OPENAI_API_KEY GEMINI_API_KEY CONTEXT7_API_KEY AWS_BEARER_TOKEN_BEDROCK AWS_REGION AWS_DEFAULT_REGION HIVE_HUB BLUEFIN_REVIEW_ORG TERM COLORTERM; do
     [[ -v "$name" ]] && export "APPTAINERENV_${name}=${!name}"
   done
   APPTAINER_HOST_ARGS=()
@@ -198,8 +198,90 @@ ensure_image() {
   echo "  Set ${override} to a published tag or digest, or build ${containerfile}." >&2
   return 1
 }
+MIN_REVIEW_APPLIANCE_VERSION="26.08.06"
+MIN_CONTRIBUTOR_VERSION="26.08.02"
+EXPECTED_IMAGE_SERIES="26.08"
+
+launcher_revision() {
+  local rev=""
+  if command -v git >/dev/null 2>&1 && [[ -d ".git" ]]; then
+    rev="$(git rev-parse --short HEAD 2>/dev/null || true)"
+  fi
+  if [[ -z "$rev" && -f "image/appliance/REVISION" ]]; then
+    local tool_rev
+    tool_rev="$(tr -d '[:space:]' <"image/appliance/REVISION" 2>/dev/null || true)"
+    if [[ "$tool_rev" =~ ^[0-9]+$ ]]; then
+      rev=$(printf '%s.%02d' "$EXPECTED_IMAGE_SERIES" "$((10#$tool_rev))")
+    fi
+  fi
+  printf '%s\n' "${rev:-${BLUEFIN_LAUNCHER_VERSION:-26.08.08}}"
+}
+
+report_launcher_identity() {
+  local rev
+  rev="$(launcher_revision)"
+  echo "✓ bluefin launcher revision: ${rev}" >&2
+}
+
+check_image_compatibility() {
+  local ref="$1" product="$2" version="$3" min_version="$4" is_override="${5:-0}"
+  [[ -n "$version" && "$version" != "unknown" ]] || {
+    if [[ "$is_override" -eq 1 ]]; then
+      echo "! ${product} image ${ref} has unknown version; proceeding with explicit override." >&2
+    fi
+    return 0
+  }
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: ${product} image ${ref} has malformed version label '${version}'; expected numeric MAJOR.MINOR.PATCH." >&2
+    return 1
+  fi
+  local ver_series="${version%.*}"
+  if [[ "$ver_series" != "$EXPECTED_IMAGE_SERIES" ]]; then
+    if [[ "$is_override" -eq 1 ]]; then
+      echo "WARNING: ${product} image ${ref} series (${ver_series}) differs from expected (${EXPECTED_IMAGE_SERIES}); proceeding with explicit override." >&2
+      return 0
+    fi
+    echo "ERROR: ${product} image ${ref} (version ${version}) is incompatible with this launcher (expected series ${EXPECTED_IMAGE_SERIES})." >&2
+    return 1
+  fi
+  local ver_num="${version##*.}" min_num="${min_version##*.}"
+  if [[ "$ver_num" =~ ^[0-9]+$ && "$min_num" =~ ^[0-9]+$ ]]; then
+    if (( 10#$ver_num < 10#$min_num )); then
+      if [[ "$is_override" -eq 1 ]]; then
+        echo "WARNING: ${product} image ${ref} (version ${version}) is older than recommended minimum (${min_version}); proceeding with explicit override." >&2
+        return 0
+      fi
+      echo "ERROR: ${product} image ${ref} (version ${version}) is incompatible with this launcher (requires >= ${min_version})." >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+migrate_legacy_state() {
+  local legacy_dir="$1" target_home="$2" sif_name="$3"
+  [[ -d "$legacy_dir" ]] || return 0
+  [[ -d "$target_home" ]] || return 0
+  local item base migrated=0
+  for item in "$legacy_dir"/* "$legacy_dir"/.*; do
+    [[ -e "$item" ]] || continue
+    base="${item##*/}"
+    [[ "$base" == "." || "$base" == ".." || "$base" == "$sif_name" ]] && continue
+    if [[ ! -e "$target_home/$base" ]]; then
+      if ! cp -a "$item" "$target_home/" 2>/dev/null; then
+        echo "ERROR: failed to migrate legacy state item ${item} to ${target_home}; check permissions and available space." >&2
+        return 1
+      fi
+      migrated=1
+    fi
+  done
+  if [[ "$migrated" -eq 1 ]]; then
+    echo "✓ migrated user configuration from ${legacy_dir} to ${target_home}" >&2
+  fi
+}
+
 report_podman_image_identity() {
-  local ref="$1" product="$2" identity version revision digest
+  local ref="$1" product="$2" is_override="${3:-0}" min_version="${4:-$MIN_REVIEW_APPLIANCE_VERSION}"
+  local identity version revision digest
   identity="$(podman image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}|{{ index .Config.Labels "org.opencontainers.image.revision" }}|{{ .Digest }}' "$ref" 2>/dev/null)" || {
     echo "! ${product} image identity unavailable for ${ref}." >&2
     return 0
@@ -209,7 +291,56 @@ report_podman_image_identity() {
   [[ -n "$revision" && "$revision" != "<no value>" ]] || revision=unknown
   [[ -n "$digest" && "$digest" != "<no value>" ]] || digest=unknown
   echo "✓ ${product} image ${ref}: version=${version} revision=${revision} digest=${digest}" >&2
+  check_image_compatibility "$ref" "$product" "$version" "$min_version" "$is_override"
 }
+
+inspect_apptainer_image() {
+  local ref="$1"
+  local identity=""
+  if [[ -f "$ref" ]] && command -v apptainer >/dev/null 2>&1; then
+    local json
+    json="$(apptainer inspect --json "$ref" 2>/dev/null || true)"
+    if [[ -n "$json" ]] && command -v python3 >/dev/null 2>&1; then
+      identity="$(python3 -c '
+import json, sys
+def parse():
+    try:
+        d = json.loads(sys.argv[1])
+        labels = d.get("data", {}).get("attributes", {}).get("labels", {})
+        v = labels.get("org.opencontainers.image.version", "")
+        r = labels.get("org.opencontainers.image.revision", "")
+        return f"{v}|{r}|unknown"
+    except Exception:
+        return ""
+res = parse()
+if res:
+    print(res)
+' "$json" 2>/dev/null || true)"
+    fi
+  elif command -v skopeo >/dev/null 2>&1; then
+    local skopeo_ref="$ref"
+    [[ "$skopeo_ref" == *://* ]] || skopeo_ref="docker://${skopeo_ref}"
+    identity="$(skopeo inspect --format '{{ index .Labels "org.opencontainers.image.version" }}|{{ index .Labels "org.opencontainers.image.revision" }}|{{ .Digest }}' "$skopeo_ref" 2>/dev/null || true)"
+  fi
+  printf '%s\n' "$identity"
+}
+
+report_apptainer_image_identity() {
+  local ref="$1" product="$2" is_override="${3:-0}" min_version="${4:-$MIN_REVIEW_APPLIANCE_VERSION}"
+  local identity version revision digest
+  identity="$(inspect_apptainer_image "$ref")"
+  if [[ -z "$identity" ]]; then
+    echo "! ${product} image identity unavailable for ${ref}." >&2
+    return 0
+  fi
+  IFS='|' read -r version revision digest <<<"$identity"
+  [[ -n "$version" && "$version" != "<no value>" ]] || version=unknown
+  [[ -n "$revision" && "$revision" != "<no value>" ]] || revision=unknown
+  [[ -n "$digest" && "$digest" != "<no value>" ]] || digest=unknown
+  echo "✓ ${product} image ${ref}: version=${version} revision=${revision} digest=${digest}" >&2
+  check_image_compatibility "$ref" "$product" "$version" "$min_version" "$is_override"
+}
+
 
 
 resolve_gh_token() {
@@ -651,17 +782,31 @@ contribute mode="" count="":
     mkdir -p "$INSTANCE_HOME/workspace"
     CONTAINER_NAME="bluefin-contribute-${INSTANCE_KEY}-$(date +%s)-$$"
     CONTRIBUTOR_VOLUME="${BLUEFIN_CONTRIBUTE_VOLUME:-bluefin-contribute-${INSTANCE_KEY}-home}"
-    CONTRIBUTOR_IMAGE="{{contribute_image}}"
+    IS_OVERRIDE=0
+    if [[ -n "${CONTRIBUTE_IMAGE:-}" ]]; then
+      CONTRIBUTOR_IMAGE="$CONTRIBUTE_IMAGE"
+      IS_OVERRIDE=1
+    elif [[ -n "${BLUEFIN_CONTRIBUTE_IMAGE:-}" ]]; then
+      CONTRIBUTOR_IMAGE="$BLUEFIN_CONTRIBUTE_IMAGE"
+      IS_OVERRIDE=1
+    elif [[ -n "${BLUEFIN_CONTRIBUTE_SIF:-}" ]]; then
+      CONTRIBUTOR_IMAGE="$BLUEFIN_CONTRIBUTE_SIF"
+      IS_OVERRIDE=1
+    else
+      CONTRIBUTOR_IMAGE="{{contribute_image}}"
+    fi
+    migrate_legacy_state "${XDG_STATE_HOME:-${HOME}/.local/state}/bluefin-contribute" "$INSTANCE_HOME" "bluefin-contribute.sif"
+    report_launcher_identity
     resolve_gh_token
     if [[ -n "${GH_TOKEN_VALUE:-}" ]]; then export GH_TOKEN="$GH_TOKEN_VALUE"; report_gh_token_blast_radius "$GH_TOKEN_SOURCE"; else report_missing_gh_token; fi
 
     KVM_FAILURE=""
-    if kvm_runtime_ready; then
+    if kvm_runtime_ready && [[ "$CONTRIBUTOR_IMAGE" != *.sif && ! -f "$CONTRIBUTOR_IMAGE" ]]; then
       REMOTE_HIVE_TARGET=""; REMOTE_HIVE_DIR=""; REMOTE_HIVE_ENV=""; REMOTE_HIVE_SSH_ARGS=()
       trap 'cleanup_remote_hive_registration' EXIT
       stage_hive_registration_for_remote_podman
       ensure_image "$CONTRIBUTOR_IMAGE" "contributor" "image/contribute/Containerfile" "CONTRIBUTE_IMAGE"
-      report_podman_image_identity "$CONTRIBUTOR_IMAGE" "contributor"
+      report_podman_image_identity "$CONTRIBUTOR_IMAGE" "contributor" "$IS_OVERRIDE" "$MIN_CONTRIBUTOR_VERSION"
       CONTAINER_ARGS=(podman run --runtime=krun --rm --interactive --tty --name "$CONTAINER_NAME" --userns "keep-id:uid=65532,gid=65532")
       CONTAINER_ARGS+=(--volume "${CONTRIBUTOR_VOLUME}:/home/bluefin:rw" --volume "${HIVE_CONTRIBUTOR_ENV}:/home/bluefin/.config/hive/contributor.env:ro,z" --env AGENT_BACKEND=omp --env "HIVE_CONTAINER_NAME=${CONTAINER_NAME}" --env HIVE_CONTAINER_RUNTIME=podman --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}")
       for name in GITHUB_COPILOT_TOKEN COPILOT_GITHUB_TOKEN GITHUB_TOKEN ANTHROPIC_API_KEY ANTHROPIC_OAUTH_TOKEN OPENAI_API_KEY GEMINI_API_KEY; do
@@ -676,7 +821,8 @@ contribute mode="" count="":
 
     require_apptainer_fallback
     [[ "$CONTRIBUTOR_IMAGE" != localhost/* ]] || { echo "ERROR: Apptainer cannot resolve local Podman image ${CONTRIBUTOR_IMAGE}." >&2; exit 1; }
-    APPTAINER_IMAGE="$CONTRIBUTOR_IMAGE"; [[ "$APPTAINER_IMAGE" == *://* ]] || APPTAINER_IMAGE="docker://${APPTAINER_IMAGE}"
+    APPTAINER_IMAGE="$CONTRIBUTOR_IMAGE"; [[ "$APPTAINER_IMAGE" == *://* || "$APPTAINER_IMAGE" == *.sif || -f "$APPTAINER_IMAGE" ]] || APPTAINER_IMAGE="docker://${APPTAINER_IMAGE}"
+    report_apptainer_image_identity "$CONTRIBUTOR_IMAGE" "contributor" "$IS_OVERRIDE" "$MIN_CONTRIBUTOR_VERSION"
     echo "✓ starting isolated Apptainer contributor ${INSTANCE_KEY}. Choose model and effort in OMP."
     prepare_apptainer_environment
     exec apptainer run --containall --no-eval "${APPTAINER_HOST_ARGS[@]}" --home "${INSTANCE_HOME}:/home/bluefin" --pwd /home/bluefin/workspace \
@@ -706,7 +852,19 @@ review-appliance *appliance_args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{shared_functions}}
-    IMAGE="${REVIEW_APPLIANCE_IMAGE:-ghcr.io/projectbluefin/review:stable}"
+    IS_OVERRIDE=0
+    if [[ -n "${REVIEW_APPLIANCE_IMAGE:-}" ]]; then
+      IMAGE="$REVIEW_APPLIANCE_IMAGE"
+      IS_OVERRIDE=1
+    elif [[ -n "${BLUEFIN_REVIEW_IMAGE:-}" ]]; then
+      IMAGE="$BLUEFIN_REVIEW_IMAGE"
+      IS_OVERRIDE=1
+    elif [[ -n "${BLUEFIN_REVIEW_SIF:-}" ]]; then
+      IMAGE="$BLUEFIN_REVIEW_SIF"
+      IS_OVERRIDE=1
+    else
+      IMAGE="ghcr.io/projectbluefin/review:stable"
+    fi
 
     # The token is resolved on the host and inherited by name. It is never an
     # argument, mount payload, image layer, or log value.
@@ -743,11 +901,13 @@ review-appliance *appliance_args:
     INSTANCE_WORKSPACE="${INSTANCE_ROOT}/workspace"
     INSTANCE_TMP="${INSTANCE_ROOT}/tmp"
     mkdir -p "$INSTANCE_HOME" "$INSTANCE_WORKSPACE" "$INSTANCE_TMP"
+    migrate_legacy_state "${XDG_STATE_HOME:-${HOME}/.local/state}/bluefin-review" "$INSTANCE_HOME" "bluefin-review.sif"
+    report_launcher_identity
     CONTAINER_NAME="bluefin-review-${INSTANCE_KEY}-$(date +%s)-$$"
     KVM_FAILURE=""
-    if kvm_runtime_ready; then
+    if kvm_runtime_ready && [[ "$IMAGE" != *.sif && ! -f "$IMAGE" ]]; then
       ensure_image "$IMAGE" "review appliance" "image/appliance/Containerfile" "REVIEW_APPLIANCE_IMAGE"
-      report_podman_image_identity "$IMAGE" "review appliance"
+      report_podman_image_identity "$IMAGE" "review appliance" "$IS_OVERRIDE" "$MIN_REVIEW_APPLIANCE_VERSION"
       ARGS=(run --runtime=krun --rm --interactive --tty --name "$CONTAINER_NAME")
       ARGS+=(--userns "keep-id:uid=65532,gid=65532")
       ARGS+=(
@@ -756,6 +916,7 @@ review-appliance *appliance_args:
         --volume "bluefin-review-${INSTANCE_KEY}-tmp:/tmp:rw"
         --env GH_TOKEN --env GITHUB_TOKEN --env COPILOT_GITHUB_TOKEN --env GITHUB_COPILOT_TOKEN
         --env ANTHROPIC_API_KEY --env ANTHROPIC_OAUTH_TOKEN --env OPENAI_API_KEY --env GEMINI_API_KEY --env CONTEXT7_API_KEY
+        --env AWS_BEARER_TOKEN_BEDROCK --env AWS_REGION --env AWS_DEFAULT_REGION
         --env HIVE_HUB --env BLUEFIN_REVIEW_ORG
         --env "TERM=${TERM:-xterm-256color}" --env "COLORTERM=${COLORTERM:-truecolor}"
       )
@@ -764,7 +925,8 @@ review-appliance *appliance_args:
 
     require_apptainer_fallback
     [[ "$IMAGE" != localhost/* ]] || { echo "ERROR: Apptainer cannot resolve local Podman image ${IMAGE}." >&2; exit 1; }
-    APPTAINER_IMAGE="$IMAGE"; [[ "$APPTAINER_IMAGE" == *://* ]] || APPTAINER_IMAGE="docker://${APPTAINER_IMAGE}"
+    APPTAINER_IMAGE="$IMAGE"; [[ "$APPTAINER_IMAGE" == *://* || "$APPTAINER_IMAGE" == *.sif || -f "$APPTAINER_IMAGE" ]] || APPTAINER_IMAGE="docker://${APPTAINER_IMAGE}"
+    report_apptainer_image_identity "$IMAGE" "review appliance" "$IS_OVERRIDE" "$MIN_REVIEW_APPLIANCE_VERSION"
     prepare_apptainer_environment
     exec apptainer run --containall --no-eval "${APPTAINER_HOST_ARGS[@]}" --home "${INSTANCE_HOME}:/home/bluefin" --pwd /workspace \
       --bind "${INSTANCE_WORKSPACE}:/workspace,${INSTANCE_TMP}:/tmp" "$APPTAINER_IMAGE" ${APPLIANCE_ARGS[@]+"${APPLIANCE_ARGS[@]}"}

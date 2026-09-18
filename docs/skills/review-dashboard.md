@@ -1,7 +1,7 @@
 ---
 name: review-dashboard
-version: "5.3"
-last_updated: 2026-09-15
+version: "5.4"
+last_updated: 2026-09-16
 id: review-dashboard
 one_line_purpose: Maintain the queue, slay lifecycles, and workflowz workbench.
 entry_point: docs/skills/review-dashboard.md
@@ -73,7 +73,7 @@ palette and warm issue palette.
 | `s` | Slay selected PRs, or implement selected issues through submitted PRs |
 | `Alt-S` | Repair returned PRs first, then implement the visible issue backlog |
 | `f` | Fix selected items in isolated workspaces |
-| `d` | Inspect bounded diff evidence |
+| `d` | Inspect bounded evidence (PR diff, issue discussion) |
 | `p` | Pause or resume later wave admission |
 | `r` | Refetch GitHub and Hive projections |
 | `o` | Change repository or organization scope |
@@ -112,8 +112,8 @@ visible issue backlog. Work is partitioned into type-homogeneous,
 repository-local waves of at most 25 items. OMP's advisor is always enabled and
 resolves through `@default`, following the maintainer's selected model.
 
-The ordinary PR landing lane omits `.github/workflows/` changes and incomplete
-file lists. Returned PRs remain eligible because their lane cannot land them.
+The PR queue keeps `.github/workflows/` changes and incomplete file lists visible,
+marking them blocked from automated review, repair, or landing. Returned PRs remain eligible.
 Ordinary PR slay excludes failing or pending CI before reviewer dispatch and
 rechecks it before each wave; returned PR repair may address failing CI but
 cannot run approval or merge commands. Slay never removes holds, uses admin

@@ -8,7 +8,7 @@
 import { execFileSync } from "node:child_process";
 import { type DashboardAction, ReviewDashboard } from "./dashboard.ts";
 import type { QueueItem } from "./github.ts";
-import { DEFAULT_ORG, fetchIssueAdmission, fetchItemsByKey, parseScope, resolveToken } from "./github.ts";
+import { DEFAULT_ORG, exactHeadVerified, fetchIssueAdmission, fetchItemsByKey, parseScope, resolveToken } from "./github.ts";
 import { isRepairRequested, type Priority } from "./priority.ts";
 import { BATCH_LIMIT, ReviewMode, type PersistedSelection } from "./mode.ts";
 import { workbenchPainter } from "./paint.ts";
@@ -16,6 +16,7 @@ import { type RailKey, ReviewRail, statusSegment } from "./rail.ts";
 import type { KeyMatcher } from "./keys.ts";
 import { type ToolHost, registerTools } from "./tools.ts";
 import { hiveFailureStatus } from "./hive.ts";
+import { landingState, landingReason } from "./landing.ts";
 import { BLUEBERRY_WELCOME_MESSAGE, assertBlueberryActionAllowed, checkBlueberryPermission } from "./blueberry.ts";
 import { GENERIC_WORKBENCH_POLICY, managedPolicyFor, type WorkbenchPolicy } from "./policy.ts";
 import {
@@ -96,15 +97,26 @@ function slayBashBlockReason(command: string): string | undefined {
 	return undefined;
 }
 
-function slayCiBlockReason(command: string, items: readonly QueueItem[]): string | undefined {
+function slayLandingBlockReason(
+	command: string,
+	items: readonly QueueItem[],
+	policy?: WorkbenchPolicy,
+): string | undefined {
 	const mutatesLanding = command.split(/\r?\n|&&|\|\||;/).some((segment) =>
 		/\bgh\s+pr\s+merge\b/.test(segment)
 		|| (/\bgh\s+pr\s+review\b/.test(segment) && /(?:^|\s)--approve(?:[=\s]|$)/.test(segment)),
 	);
 	if (!mutatesLanding) return undefined;
-	const blocked = items.find((item) => item.type === "pr" && (item.ciStatus === "failure" || item.ciStatus === "pending"));
-	if (!blocked) return undefined;
-	return `${blocked.repo}#${blocked.id} CI is ${blocked.ciStatus}; refresh and wait for successful checks before approval or merge`;
+	// Never approve or merge a pull request that is not genuinely ready to land:
+	// CI alone never implies ready. Every policy input blocks, so a queued hold or
+	// a requested-changes review stops the mutation just as a failing check does.
+	for (const item of items) {
+		if (item.type !== "pr") continue;
+		const state = landingState(item, policy);
+		if (state === "ready-to-land") continue;
+		return `${item.repo}#${item.id} ${landingReason(state)}; refresh and clear it before approval or merge`;
+	}
+	return undefined;
 }
 
 export const RAIL_KEYS: readonly RailKey[] = [
@@ -243,19 +255,22 @@ export function actionPrompt(
 	const repairWave = allPullRequests && priority?.category === "repair-requested";
 	const evidence = "Evidence is bounded and read once. Start with `hive_workbench_diff` using both `pull_request` and explicit `repo`; child agents do not inherit the coordinator's selected repository. Use `gh pr diff <n> --repo <r> --name-only` only to confirm filenames, inspect only relevant hunks or failing logs, and cite file:line evidence. Never sleep or poll. Never assume a checkout exists. Check a repository-specific validator once; if the minimal appliance lacks that toolchain, use hosted check evidence and report the local verification gap instead of installing packages or retrying the absent command. Treat `merge=dirty` as repair work: merge the base into the branch, resolve deliberately, and never rebase, force-push, or choose `--ours`/`--theirs` wholesale. Revalidate live state before any comment, label, assignment, close, push, approval, or merge.";
 	const reviewFinish = "Report one terminal outcome per item, then stop. The workbench owns the next repository wave. Never approve or merge.";
-	const slayFinish = "The maintainer's slay action authorizes review, repair, and landing for exactly these pull requests and their captured heads. Review each head with a fresh bluefin-reviewer. If it has findings, dispatch one fresh isolated fixer with the exact repository, pull-request number, and head. Fixers use `gh repo clone` and `gh pr checkout` under `$HOME/worktrees`; never assume the working directory is a checkout, clone into `/tmp`, or assume a fork branch exists on the base remote. Push without force, read the new head, and run a fresh review of that head. Before landing, re-read the live head, base, labels, reviews, checks, mergeability, and effective rules via `gh api repos/<owner>/<repo>/rules/branches/<branch>`. The reviewed head must equal the live head. Submit the current maintainer's approval only for a clean PR they did not author; never fabricate reviewers or a fixed approval threshold. Then run `gh pr merge <n> --repo <r> --auto --squash`; GitHub rules remain authoritative and may leave it queued or blocked on additional required human reviews. If GitHub says the merge queue owns the strategy, its effective squash rule wins: do not disable and re-arm auto-merge because `autoMergeRequest.mergeMethod` says `MERGE`. An accepted auto-merge request is terminal for this wave: report the outstanding approval gate and move on. Never use `--admin`, remove holds, weaken protections, or force-push. Report one terminal outcome per item, then stop. The workbench owns the next repository wave.";
+	const slayFinish = "The maintainer's slay action authorizes review, repair, and landing for exactly these pull requests and their captured heads. Review each head with a fresh bluefin-reviewer. If it has findings, dispatch one fresh isolated fixer with the exact repository, pull-request number, and head. Fixers use `gh repo clone` and `gh pr checkout` under `$HOME/worktrees`; never assume the working directory is a checkout, clone into `/tmp`, or assume a fork branch exists on the base remote. Fixers commit with the authenticated GitHub account's identity (e.g. `$(gh api user --jq '\"\\(.id)+\\(.login)@users.noreply.github.com\"')`) and repository-local git config to ensure attribution and avoid breaking unattributed-change rules. Push without force, read the new head, and run a fresh review of that head. Before landing, re-read the live head, base, labels, reviews, checks, mergeability, and effective rules via `gh api repos/<owner>/<repo>/rules/branches/<branch>`. The reviewed head must equal the live head. If the repository requires auto-merge to enqueue (`GraphQL: Auto merge is not allowed for this repository`), enable it via `gh api --method PATCH repos/<owner>/<repo> -F allow_auto_merge=true`. Submit the current maintainer's approval only for a clean PR they did not author; never fabricate reviewers or a fixed approval threshold. Then run `gh pr merge <n> --repo <r> --auto --squash`; GitHub rules remain authoritative and may leave it queued or blocked on additional required human reviews. If GitHub says the merge queue owns the strategy, its effective squash rule wins: do not disable and re-arm auto-merge because `autoMergeRequest.mergeMethod` says `MERGE`. An accepted auto-merge request is terminal for this wave: report the outstanding approval gate and move on. Never use `--admin`, remove holds, weaken protections, or force-push. Report one terminal outcome per item, then stop. The workbench owns the next repository wave.";
 	const repairFinish = "These pull requests were returned to their authenticated author with requested changes. Read the review threads and failing checks, diagnose every requested correction, then dispatch one fresh isolated fixer per pull request. Fixers use `gh repo clone` and `gh pr checkout` under `$HOME/worktrees`, make the smallest complete correction, run focused verification, and push a new head without force. Never review, approve, auto-merge, or merge the author's own pull request. A repair is terminal only after GitHub shows a new head SHA. Report the pushed head and pull-request URL for every item, then stop; the workbench owns the next repository wave.";
 	const issueEvidence = "Evidence is bounded and read once. Inspect the complete issue description and the supplied Hive queue and knowledge evidence before deciding how to implement it. Examine relevant source files and tests and cite file:line evidence. Never sleep or poll. In a clean workspace, diagnose the root cause, make the smallest complete change, run focused verification, and open a review-ready pull request whose body contains `Closes <owner/repo>#<number>`. Never merge or approve your own pull request. The issue is not terminal until GitHub has accepted that pull request.";
+	const issueInspectEvidence = "Evidence is bounded and read once. Read the complete issue body and discussion with `gh issue view <n> --repo <r> --comments`, list the pull requests linked to it, and inspect only the relevant source files, citing file:line evidence. `hive_workbench_diff` is pull-request-only and must not be called for an issue. Never sleep or poll. Never assume a checkout exists. Report the request, its current state, and concrete risks.";
 	const issueWorkflow = "Before dispatching, call `hive_workbench_lookup` with target `queue` and then target `knowledge`. Match every issue key to Hive's entry and include the relevant queue and knowledge evidence in that worker's prompt; report unavailable Hive evidence instead of inventing it. Use the `task` tool once with one fresh isolated item per issue through OMP workflowz. Do not share a checkout or conversation between items.";
 
 	if (selected.length > 1) {
 		const repository = selected[0]!.repo;
 		if (selected.some((item) => item.repo !== repository)) return undefined;
 		const list = selected.map((item) => `- ${cite(item)}: ${item.url}${stateOf(item)}`).join("\n");
+
 		const reviewRules = `<<<SUBAGENT-RULES\n${evidence} ${reviewFinish}\nSUBAGENT-RULES>>>`;
 		const slayRules = `<<<SUBAGENT-RULES\n${evidence} ${slayFinish}\nSUBAGENT-RULES>>>`;
 		const repairRules = `<<<SUBAGENT-RULES\n${evidence} ${repairFinish}\nSUBAGENT-RULES>>>`;
 		const issueRules = `<<<SUBAGENT-RULES\n${issueEvidence} ${reviewFinish}\nSUBAGENT-RULES>>>`;
+		const issueInspectRules = `<<<SUBAGENT-RULES\n${issueInspectEvidence} ${reviewFinish}\nSUBAGENT-RULES>>>`;
 		switch (action.kind) {
 			case "slay":
 				if (allIssues) {
@@ -266,7 +281,9 @@ export function actionPrompt(
 				}
 				return `Slay this repository wave for ${repository} through review, repair, and landing:\n\n${list}\n\nUse the \`task\` tool once with one fresh bluefin-reviewer item per pull request through OMP workflowz. Do not use eval workpool: its generated boolean output schema is rejected by the current Copilot provider. Keep repair agents isolated, and never reuse a reviewer for the post-fix head. Coordinate the complete lifecycle after the review workers return. Copy this block verbatim into every worker prompt:\n${slayRules}`;
 			case "diff":
-				return `Inspect this repository wave for ${repository}:\n\n${list}\n\nUse the \`task\` tool once with one fresh item per issue or pull request through OMP workflowz. Do not reuse a worker across repositories. Use hive_workbench_diff and report the changed files and concrete risks. Copy this block verbatim into every worker prompt:\n${reviewRules}`;
+				return allIssues
+					? `Inspect this issue wave for ${repository}:\n\n${list}\n\nUse the \`task\` tool once with one fresh item per issue through OMP workflowz. Do not reuse a worker across repositories. Read each issue's body, discussion, and linked pull requests, and report the request, its current state, and concrete risks. Copy this block verbatim into every worker prompt:\n${issueInspectRules}`
+					: `Inspect this repository wave for ${repository}:\n\n${list}\n\nUse the \`task\` tool once with one fresh item per issue or pull request through OMP workflowz. Do not reuse a worker across repositories. Use hive_workbench_diff and report the changed files and concrete risks. Copy this block verbatim into every worker prompt:\n${reviewRules}`;
 			case "fix":
 				return allIssues
 					? `Implement this repository wave for ${repository}, opening one review-ready pull request per issue:\n\n${list}\n\nUse the \`task\` tool once with one fresh isolated item per issue through OMP workflowz. Do not share a checkout or conversation between write-capable items. Diagnose each root cause, implement the smallest complete fix, and run focused verification. Copy this block verbatim into every worker prompt:\n${issueRules}`
@@ -297,7 +314,9 @@ export function actionPrompt(
 			}
 			return `Slay ${cite(item)} through review, repair, and landing. Use hive_workbench_diff and hive_workbench_trace, then run the complete lifecycle with fresh review and isolated fix agents. ${workflow} ${authority} ${slayFinish}`;
 		case "diff":
-			return `Call hive_workbench_diff for ${cite(item)} and summarize the changed files and concrete risks. ${workflow} ${authority} ${reviewFinish}`;
+			return item.type === "issue"
+				? `Inspect ${cite(item)} as an issue. Read its complete body and discussion with \`gh issue view ${item.id} --repo ${item.repo} --comments\`, list the pull requests linked to it, and inspect the relevant source files. Summarize the request, its current state, and concrete risks with file:line evidence. Do not call \`hive_workbench_diff\`; it is pull-request-only. ${workflow} ${authority} ${reviewFinish}`
+				: `Call hive_workbench_diff for ${cite(item)} and summarize the changed files and concrete risks. ${workflow} ${authority} ${reviewFinish}`;
 		case "fix":
 			return item.type === "issue"
 				? `Implement ${cite(item)} in an isolated workspace. Diagnose the root cause, make the smallest complete change, run focused verification, and open a review-ready pull request whose body contains \`Closes ${item.repo}#${item.id}\`. ${workflow} ${authority} ${reviewFinish}`
@@ -337,6 +356,14 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 	let activeBatch: PersistedRepositoryBatch | undefined;
 	let batchRequestGeneration = 0;
 	let commentInFlight = false;
+	// `--autoslay` is an unattended run, not a single batch: the queue is the
+	// unit of work. `autoslayAttempted` is what bounds it — every dispatched
+	// item is recorded before the wave starts, so each pass selects strictly
+	// new work and the run ends on a drained queue rather than looping on an
+	// item that can never land.
+	let autoslayContinuous = false;
+	let autoslayResuming = false;
+	const autoslayAttempted = new Set<string>();
 	pi.setLabel("Hive Workbench");
 	pi.registerFlag("pr", { description: "Preselect a pull request or issue number", type: "string" });
 	pi.registerFlag("issues", { description: "Start in issues mode instead of pull requests", type: "boolean", default: false });
@@ -357,9 +384,9 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		if (activeItem) {
 			const kind = activeItem.type === "pr" ? "PR" : "ISSUE";
 			const repo = activeItem.repo.includes("/") ? activeItem.repo.split("/")[1] : activeItem.repo;
-			ctx.ui.setTitle(`hive workbench · ${kind} #${activeItem.id} (${repo}) ${activeItem.title}`);
+			ctx.ui.setTitle(`review - ${kind} #${activeItem.id} (${repo}) ${activeItem.title}`);
 		} else {
-			ctx.ui.setTitle(`hive workbench · ${mode.queueMode} (${mode.position()})`);
+			ctx.ui.setTitle(`review - ${mode.queueMode} (${mode.position()})`);
 		}
 		repaint();
 	};
@@ -416,6 +443,33 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		activeBatch = batch;
 		pi.appendEntry(BATCH_ENTRY, batch);
 		syncBatchProgress(ctx);
+		// Every batch state change flows through here, so this is the one place
+		// that can see a slay run settle. Unattended, both terminal states mean
+		// "take the next batch": `complete` because the queue is the unit of
+		// work, and `blocked` because one unlandable pull request must not end
+		// the run. The blocked batch keeps its recorded error for the operator.
+		const settled = batch.state === "complete" || batch.state === "blocked";
+		if (autoslayContinuous && batch.kind === "slay" && settled && !autoslayResuming) {
+			// A batch that settled without dispatching a single wave was stopped by
+			// the pre-dispatch check, and would be reselected verbatim by the next
+			// pass. Every blocker names the item it rejected, so record just that
+			// one: the rest of the batch is still good work and stays eligible.
+			// Without a nameable culprit, record the whole batch — a shrinking
+			// candidate set is what stops the loop from spinning.
+			const waveItems = batch.waves.flatMap((wave) => [...wave.items]);
+			if (!waveItems.some((item) => autoslayAttempted.has(`${item.repo}#${item.id}`))) {
+				const named = waveItems.filter((item) => batch.error?.includes(`${item.repo}#${item.id}`) === true);
+				for (const item of named.length > 0 ? named : waveItems) {
+					autoslayAttempted.add(`${item.repo}#${item.id}`);
+				}
+			}
+			autoslayResuming = true;
+			queueMicrotask(() => {
+				void continueAutoslay(ctx).finally(() => {
+					autoslayResuming = false;
+				});
+			});
+		}
 	};
 
 	const batchBlocker = async (kind: RepositoryBatchKind, items: readonly QueueItem[]): Promise<string | undefined> => {
@@ -425,6 +479,17 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		if (kind === "slay" && !allPullRequests && !allIssues) return "Slay waves must not mix pull requests and issues";
 
 		if (kind === "slay" && allPullRequests) {
+			for (const item of items) {
+				const wasRepair = isRepairRequested(item, mode.currentUserLogin);
+				if (!wasRepair) {
+					if ((item.workflowFiles?.length ?? 0) > 0) {
+						return `Cannot dispatch ${item.repo}#${item.id}: changes ${item.workflowFiles![0]}`;
+					}
+					if (item.changedFilesComplete === false) {
+						return `Cannot dispatch ${item.repo}#${item.id}: complete changed-file list unavailable`;
+					}
+				}
+			}
 			const live = await fetchItemsByKey(
 				items.map((item) => `${item.repo}#${item.id}`),
 				"prs",
@@ -434,7 +499,7 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			for (const item of items) {
 				const current = live.items.find((candidate) => candidate.repo === item.repo && candidate.id === item.id);
 				if (!current) return `Cannot dispatch ${item.repo}#${item.id}: pull request is closed or unreadable`;
-				if (!current.headSha || current.headSha !== item.headSha) return `Cannot dispatch ${item.repo}#${item.id}: pull request head changed`;
+				if (!exactHeadVerified(item.headSha, current.headSha)) return `Cannot dispatch ${item.repo}#${item.id}: pull request head changed`;
 				const wasRepair = isRepairRequested(item, mode.currentUserLogin);
 				if (wasRepair !== isRepairRequested(current, mode.currentUserLogin)) {
 					return `Cannot dispatch ${item.repo}#${item.id}: requested-changes state changed`;
@@ -444,6 +509,22 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 				}
 			}
 			return undefined;
+		}
+
+		if (kind === "fix") {
+			for (const item of items) {
+				if (item.type === "pr") {
+					const wasRepair = isRepairRequested(item, mode.currentUserLogin);
+					if (!wasRepair) {
+						if ((item.workflowFiles?.length ?? 0) > 0) {
+							return `Cannot dispatch ${item.repo}#${item.id}: changes ${item.workflowFiles![0]}`;
+						}
+						if (item.changedFilesComplete === false) {
+							return `Cannot dispatch ${item.repo}#${item.id}: complete changed-file list unavailable`;
+						}
+					}
+				}
+			}
 		}
 
 		if (kind === "slay" && allIssues) {
@@ -503,7 +584,7 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			for (const item of managedPullRequests) {
 				const current = live.items.find((candidate) => candidate.repo === item.repo && candidate.id === item.id);
 				if (!current) return `Cannot dispatch ${item.repo}#${item.id}: pull request is closed or unreadable`;
-				if (!current.headSha || current.headSha !== item.headSha) return `Cannot dispatch ${item.repo}#${item.id}: pull request head changed`;
+				if (!exactHeadVerified(item.headSha, current.headSha)) return `Cannot dispatch ${item.repo}#${item.id}: pull request head changed`;
 				const denied = managedPolicyFor(item.repo, policy)?.deniedLabels.find((label) => current.labels.includes(label));
 				if (denied) return `Cannot dispatch ${item.repo}#${item.id}: pull request has ${denied} label`;
 			}
@@ -548,17 +629,23 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			return;
 		}
 		ctx.ui.notify(`Dispatching ${wave.repo} wave ${activeBatch.currentWave + 1}/${activeBatch.waves.length}`, "info");
+		// An item counts as attempted exactly when its wave reaches the agent, so
+		// a batch abandoned mid-run leaves its undispatched waves eligible for
+		// the next pass instead of discarding them with the batch.
+		if (autoslayContinuous) {
+			for (const item of wave.items) autoslayAttempted.add(`${item.repo}#${item.id}`);
+		}
 		pi.sendUserMessage(prompt, deliverAs ? { deliverAs } : undefined);
 	};
 
-	const startRepositoryBatch = async (ctx: CtxLike, kind: RepositoryBatchKind, items: readonly QueueItem[]) => {
+	const startRepositoryBatch = async (ctx: CtxLike, kind: RepositoryBatchKind, items: readonly QueueItem[]): Promise<boolean> => {
 		const generation = ++batchRequestGeneration;
 		if (activeBatch?.state === "running" || activeBatch?.state === "paused") {
 			ctx.ui.notify(`Run ${activeBatch.id} is already ${activeBatch.state}`, "warning");
-			return;
+			return false;
 		}
 		const waves = mode.repositoryWaves(items);
-		if (waves.length === 0) return;
+		if (waves.length === 0) return false;
 		const startedAt = Date.now();
 		const batch: PersistedRepositoryBatch = {
 			version: 1,
@@ -579,12 +666,37 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		if (blocker) {
 			persistBatch(ctx, { ...batch, state: "blocked", error: blocker });
 			ctx.ui.notify(blocker, "error");
-			return;
+			return false;
 		}
 		mode.clearSelected();
 		persist();
 		persistBatch(ctx, batch);
 		await dispatchCurrentWave(ctx, undefined, true);
+		return true;
+	};
+
+	const filterUnsupportedSlayItems = (ctx: CtxLike, items: readonly QueueItem[]): QueueItem[] => {
+		const eligible: QueueItem[] = [];
+		for (const item of items) {
+			if (item.type !== "pr") {
+				eligible.push(item);
+				continue;
+			}
+			if (isRepairRequested(item, mode.currentUserLogin)) {
+				eligible.push(item);
+				continue;
+			}
+			if ((item.workflowFiles?.length ?? 0) > 0) {
+				ctx.ui.notify(`Skipping ${item.repo}#${item.id}: changes ${item.workflowFiles![0]}`, "warning");
+				continue;
+			}
+			if (item.changedFilesComplete === false) {
+				ctx.ui.notify(`Skipping ${item.repo}#${item.id}: complete changed-file list unavailable`, "warning");
+				continue;
+			}
+			eligible.push(item);
+		}
+		return eligible;
 	};
 
 	const filterCompletedIssueSlayItems = (ctx: CtxLike, items: readonly QueueItem[]): QueueItem[] => {
@@ -602,25 +714,87 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		return eligible;
 	};
 
-	const startSlay = async (ctx: CtxLike, candidates: readonly QueueItem[] = mode.slayableItems(BATCH_LIMIT)) => {
-		if (candidates.length === 0) {
-			ctx.ui.notify("No queue items available to slay", "warning");
-			return;
+	const startSlay = async (
+		ctx: CtxLike,
+		candidates: readonly QueueItem[] = mode.slayableItems(BATCH_LIMIT),
+		continuing = false,
+	): Promise<boolean> => {
+		// Attempted work is only skipped for an unattended run. An operator
+		// pressing the slay key expects the visible queue, including anything a
+		// previous automatic pass already tried.
+		const fresh = autoslayContinuous
+			? candidates.filter((item) => !autoslayAttempted.has(`${item.repo}#${item.id}`))
+			: candidates;
+		if (fresh.length === 0) {
+			if (!continuing) ctx.ui.notify("No queue items available to slay", "warning");
+			return false;
 		}
-		const items = filterCompletedIssueSlayItems(ctx, candidates);
-		if (items.length === 0) return;
-		await startRepositoryBatch(ctx, "slay", items);
+		const supported = filterUnsupportedSlayItems(ctx, fresh);
+		const items = supported.length === 0 ? [] : filterCompletedIssueSlayItems(ctx, supported);
+		// Candidates the filters rejected were still inspected this pass; an
+		// unattended run must not reselect them or it never reaches the rest of
+		// the queue. Unsupported pull requests stay visible for the operator.
+		if (autoslayContinuous) {
+			for (const item of fresh) {
+				if (!items.includes(item)) autoslayAttempted.add(`${item.repo}#${item.id}`);
+			}
+		}
+		if (items.length === 0) return false;
+		return await startRepositoryBatch(ctx, "slay", items);
 	};
 
-	const startAutoslay = async (ctx: CtxLike) => {
-		if (mode.queueMode === "issues") {
-			await startSlay(ctx, mode.visibleItems());
-			return;
-		}
+	/**
+	 * Candidates for one autoslay pass.
+	 *
+	 * Autoslay works the queue you asked for and does not change modes: started
+	 * on pull requests it reviews, repairs, and lands pull requests, and only
+	 * `--issues` puts it on the issue backlog. Within the pull-request queue,
+	 * requested-changes items come first — a pull request already returned to
+	 * its author is the work that is actually blocked.
+	 *
+	 * Pull requests the pre-dispatch check would reject are dropped here rather
+	 * than carried into a batch. That check rejects the whole batch on the first
+	 * bad item and costs a live re-read of every candidate, so leaving them in
+	 * spends one full pass per unusable pull request before any work is
+	 * dispatched. Requested-changes items keep their red CI: repairing it is the
+	 * job.
+	 */
+	const autoslayCandidates = async (_ctx: CtxLike): Promise<QueueItem[]> => {
+		if (mode.queueMode === "issues") return [...mode.visibleItems()];
 		const repairs = mode.repairRequestedItems();
-		mode.toggleMode();
+		const repairKeys = new Set(repairs.map((item) => `${item.repo}#${item.id}`));
+		const reviewable = mode.visibleItems().filter(
+			(item) =>
+				!repairKeys.has(`${item.repo}#${item.id}`)
+				&& item.ciStatus !== "failure"
+				&& item.ciStatus !== "pending",
+		);
+		return [...repairs, ...reviewable];
+	};
+
+	const startAutoslay = async (ctx: CtxLike, continuing = false): Promise<boolean> =>
+		await startSlay(ctx, await autoslayCandidates(ctx), continuing);
+
+	/**
+	 * Drive the queue after a slay run settles.
+	 *
+	 * `--autoslay` is asked to churn a queue, so a settled batch is a cue to take
+	 * the next one rather than to stop. The loop retries when a whole pass is
+	 * filtered out — every candidate unsupported or already answered — and
+	 * terminates because `autoslayAttempted` grows on every pass, so the
+	 * candidate set strictly shrinks toward empty.
+	 */
+	const continueAutoslay = async (ctx: CtxLike): Promise<void> => {
+		if (!autoslayContinuous || mode.paused) return;
 		await refreshQueue(ctx);
-		await startSlay(ctx, [...repairs, ...mode.visibleItems()]);
+		while (autoslayContinuous && !mode.paused) {
+			if (await startAutoslay(ctx, true)) return;
+			const remaining = await autoslayCandidates(ctx);
+			if (remaining.every((item) => autoslayAttempted.has(`${item.repo}#${item.id}`))) break;
+		}
+		if (mode.paused) return;
+		autoslayContinuous = false;
+		ctx.ui.notify(`Autoslay finished: ${autoslayAttempted.size} queue item(s) attempted, nothing left to slay`, "info");
 	};
 
 	/**
@@ -766,10 +940,17 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 
 		if (action.kind === "slay") {
 			activeCtx = ctx;
-			await startRepositoryBatch(ctx, "slay", capturedItems);
+			await startSlay(ctx, capturedItems);
 			return;
 		}
-		if (action.kind === "fix" || action.kind === "diff") {
+		if (action.kind === "fix") {
+			activeCtx = ctx;
+			const supported = filterUnsupportedSlayItems(ctx, capturedItems);
+			if (supported.length === 0) return;
+			await startRepositoryBatch(ctx, action.kind, supported);
+			return;
+		}
+		if (action.kind === "diff") {
 			activeCtx = ctx;
 			await startRepositoryBatch(ctx, action.kind, capturedItems);
 		}
@@ -823,7 +1004,7 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 	const startSession = async (ctx: CtxLike, persisted: PersistedSelection | undefined) => {
 		const hive = await mode.refreshHive();
 		if (hive.configured && hive.error) {
-			ctx.ui.notify(`${hiveFailureStatus(hive.error)}; browse-only mode`, "warning");
+			ctx.ui.notify(`${hiveFailureStatus(hive.error)}; queue order falls back to GitHub, and review, fix, and slay remain available`, "warning");
 		}
 		await refreshQueue(ctx);
 		if (persisted?.id) mode.selectById(persisted.repo, persisted.id);
@@ -850,7 +1031,14 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			}
 		}
 		syncStatus(ctx);
-		if (pi.getFlag("autoslay") === true) await startAutoslay(ctx);
+		if (pi.getFlag("autoslay") === true) {
+			// Arm before the first pass so its settle re-arms the next one. A pass
+			// that dispatches nothing is not the end of the queue, so hand off to
+			// the same continuation the settle path uses; it owns the outcome
+			// message, which is why the one-shot warning is suppressed here.
+			autoslayContinuous = true;
+			if (!(await startAutoslay(ctx, true))) await continueAutoslay(ctx);
+		}
 		void openDashboard(ctx);
 	};
 
@@ -984,7 +1172,7 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 			return;
 		}
 
-		ctx.ui.setTitle("hive workbench");
+		ctx.ui.setTitle("review - loading");
 		ctx.ui.setWidget(
 			"hive-workbench-rail",
 			(hostTui: unknown, theme: unknown) => {
@@ -1058,8 +1246,8 @@ export function createReviewExtension(pi: ReviewExtensionHost, options: Extensio
 		const currentItems = (wave?.items ?? []).map((item) =>
 			visible.find((candidate) => candidate.repo === item.repo && candidate.id === item.id) ?? item,
 		);
-		const ciReason = slayCiBlockReason(command, currentItems);
-		if (ciReason) return { block: true, reason: `Hive workbench slay guard: ${ciReason}` };
+		const landingBlocker = slayLandingBlockReason(command, currentItems, policy);
+		if (landingBlocker) return { block: true, reason: `Hive workbench slay guard: ${landingBlocker}` };
 	});
 
 	pi.on("tool_execution_start", (event) => {

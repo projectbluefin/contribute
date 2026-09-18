@@ -11,6 +11,24 @@ if [ "${BLUEFIN_REVIEW_INHERIT_OMP_CONFIG:-0}" = 1 ]; then
   profile="review"
 fi
 
+# Set up default git identity from the authenticated GitHub user if git identity is unset.
+# This ensures fixers and automated merges do not fail with 'Committer identity unknown'
+# or commit with unverified/unattributed emails that trip branch protection rulesets.
+if [ -z "$(git config --global user.email 2>/dev/null || true)" ]; then
+  if command -v gh >/dev/null 2>&1; then
+    gh_user_json="$(gh api user 2>/dev/null || true)"
+    if [ -n "$gh_user_json" ]; then
+      user_login="$(echo "$gh_user_json" | jq -r '.login // empty' 2>/dev/null || true)"
+      user_id="$(echo "$gh_user_json" | jq -r '.id // empty' 2>/dev/null || true)"
+      user_name="$(echo "$gh_user_json" | jq -r '.name // .login // empty' 2>/dev/null || true)"
+      if [ -n "$user_login" ] && [ -n "$user_id" ]; then
+        git config --global user.email "${user_id}+${user_login}@users.noreply.github.com"
+        git config --global user.name "${user_name:-$user_login}"
+      fi
+    fi
+  fi
+fi
+
 case "${1:-}" in
 update)
   cat >&2 <<'EOF'
@@ -22,7 +40,7 @@ EOF
 --help | -h | help)
   # OMP owns the rest of the help text. Remove its mutable-install update
   # command and replace it with the appliance contract below.
-  omp --profile "$profile" --config /usr/share/bluefin/review/appliance-config.yml \
+  omp --profile "$profile" \
     --extension /usr/share/bluefin/review/extension "$@" |
     sed '/^[[:space:]]*update[[:space:]]/d'
   cat <<'EOF'
@@ -45,5 +63,4 @@ if [ "$advisor" = false ]; then
 fi
 
 exec omp --profile "$profile" \
-  --config /usr/share/bluefin/review/appliance-config.yml \
   --extension /usr/share/bluefin/review/extension "${args[@]}"

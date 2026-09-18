@@ -61,10 +61,10 @@ function resolveRepo(mode: ReviewMode, params: Record<string, unknown>): string 
 function orderLine(mode: ReviewMode): string {
 	const hive = mode.hive;
 	if (!hive.configured) {
-		return "order: unranked — no hive hub configured; GitHub evidence is browse-only";
+		return "order: unranked — no hive hub configured; queue order falls back to GitHub, and review, fix, and slay remain available";
 	}
 	if (!hive.online) {
-		return `order: unavailable — ${hiveFailureStatus(hive.error)}; GitHub evidence is browse-only`;
+		return `order: unavailable — ${hiveFailureStatus(hive.error)}; queue order falls back to GitHub, and review, fix, and slay remain available`;
 	}
 	const actionable = hive.actionableItems === undefined ? "" : `, ${hive.actionableItems} actionable overall`;
 	const coverage = mode.hiveCoverage();
@@ -111,6 +111,8 @@ export function registerTools(pi: ToolHost, mode: ReviewMode, whenReady: () => P
 					`selected ${item.repo}#${item.id} — ${item.title}`,
 					`author @${item.author}${item.draft ? " (draft)" : ""} ci=${item.ciStatus ?? "unknown"} merge=${item.mergeState} review=${item.reviewState} labels=${item.labels.join(",") || "none"}`,
 					priority ? `priority: ${priority.category} (${priority.reason}, ${priority.source})` : "priority: unranked",
+					`landing: ${mode.landingStateFor(item)}`,
+					`head: ${item.headSha ? `${item.headSha.slice(0, 12)}...${item.headSha}` : "unknown"}`,
 					item.url,
 					"",
 					traceToText(mode.session.roots(), now),
@@ -137,11 +139,12 @@ export function registerTools(pi: ToolHost, mode: ReviewMode, whenReady: () => P
 						error: hive.error ?? null,
 					},
 					selected_priority: priority ?? null,
+				landing_state: item ? mode.landingStateFor(item) : null,
 					total_items: mode.items.length,
 					visible_items: mode.visibleItems().length,
 					queue_error: mode.queueError ?? null,
 					ci: tally,
-					selected: item ?? null,
+					selected: { ...item, head_sha: item.headSha ?? null },
 				},
 			};
 		},
@@ -235,6 +238,7 @@ export function registerTools(pi: ToolHost, mode: ReviewMode, whenReady: () => P
 					additions: diff.additions,
 					deletions: diff.deletions,
 					truncated: diff.truncated,
+					head_sha: diff.headSha,
 					error: diff.error ?? null,
 				},
 				isError: Boolean(diff.error),

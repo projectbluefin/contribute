@@ -96,7 +96,7 @@ for arg in "$@"; do
 done
 if [[ "${EXPECT_APPTAINER_CREDENTIALS:-}" == 1 ]]; then
   injected=()
-  for name in GH_TOKEN OPENAI_API_KEY CONTEXT7_API_KEY HIVE_HUB; do
+  for name in GH_TOKEN OPENAI_API_KEY CONTEXT7_API_KEY HIVE_HUB AWS_BEARER_TOKEN_BEDROCK AWS_REGION AWS_DEFAULT_REGION; do
     source_name="APPTAINERENV_${name}"
     [[ -v "$source_name" ]] && injected+=("$name=${!source_name}")
   done
@@ -105,6 +105,9 @@ if [[ "${EXPECT_APPTAINER_CREDENTIALS:-}" == 1 ]]; then
     [[ "$GH_TOKEN" == test-gh-token &&
        "$OPENAI_API_KEY" == "test-provider-token" &&
        "$HIVE_HUB" == https://hive.example.test &&
+       ( -z "$AWS_BEARER_TOKEN_BEDROCK" || "$AWS_BEARER_TOKEN_BEDROCK" == "test-bedrock-token" ) &&
+       ( -z "$AWS_REGION" || "$AWS_REGION" == "us-west-2" ) &&
+       ( -z "$AWS_DEFAULT_REGION" || "$AWS_DEFAULT_REGION" == "us-west-2" ) &&
        ( "$EXPECT_CONTEXT7_CREDENTIAL" != 1 || "$CONTEXT7_API_KEY" == "test-context7-token" ) ]]
   ' || exit 19
 fi
@@ -352,6 +355,31 @@ log_contains '--env CONTEXT7_API_KEY' "$podman_log"
 run_just review-queue autoslay
 [[ "$status" -eq 17 ]] || fail "expected fake container exit 17, got $status"
 log_contains 'ghcr.io/projectbluefin/review:stable --autoslay --advisor' "$podman_log"
+
+scenario="Bedrock bearer-token credentials forward through the Podman/krun path"
+: >"$podman_log"
+set +e
+bedrock_output="$(env HOME="$home" PATH="$fake_bin:/usr/bin:/bin" PODMAN_LOG="$podman_log" KUBECTL_LOG="$kubectl_log" REVIEW_TEST_KVM_DEVICE="$kvm" REVIEW_TEST_FUSE_DEVICE="/dev/null" FAKE_PODMAN_INFO_FAIL=0 FAKE_NO_SKOPEO=0 FAKE_PULL_FAIL=0 FAKE_IMAGE_MISSING=0 REVIEW_GH_TOKEN=test-gh-token TERM=xterm-256color COLORTERM=truecolor AWS_BEARER_TOKEN_BEDROCK=test-bedrock-token AWS_REGION=us-west-2 AWS_DEFAULT_REGION=us-west-2 "$real_just" --justfile "$root/justfile" review-queue owner/repo 2>&1)"
+bedrock_status=$?
+set -e
+[[ "$bedrock_status" -eq 17 ]] || fail "expected fake container exit 17 with Bedrock credentials, got $bedrock_status"
+bedrock_podman_call="$(cat "$podman_log")"
+for bedrock_var in AWS_BEARER_TOKEN_BEDROCK AWS_REGION AWS_DEFAULT_REGION; do
+  [[ "$bedrock_podman_call" == *"--env $bedrock_var"* ]] || fail "review Podman/krun did not forward $bedrock_var: $bedrock_podman_call"
+done
+log_not_contains 'test-bedrock-token' "$podman_log"
+log_not_contains 'test-bedrock-token' "$bedrock_output"
+
+scenario="Bedrock bearer-token credentials reach the contained Apptainer process"
+: >"$apptainer_log"
+set +e
+bedrock_apptainer_output="$(env HOME="$home" PATH="$fake_bin:/usr/bin:/bin" PODMAN_LOG="$podman_log" KUBECTL_LOG="$kubectl_log" APPTAINER_LOG="$apptainer_log" REVIEW_TEST_KVM_DEVICE="$kvm" GH_TOKEN=test-gh-token OPENAI_API_KEY=test-provider-token HIVE_HUB=https://hive.example.test AWS_BEARER_TOKEN_BEDROCK=test-bedrock-token AWS_REGION=us-west-2 AWS_DEFAULT_REGION=us-west-2 EXPECT_APPTAINER_CREDENTIALS=1 FAKE_PODMAN_INFO_FAIL=1 "$real_just" --justfile "$root/justfile" review-queue owner/repo 2>&1)"
+bedrock_apptainer_status=$?
+set -e
+[[ "$bedrock_apptainer_status" -eq 18 ]] || fail "expected fake Apptainer exit 18 with Bedrock credentials, got $bedrock_apptainer_status"
+log_contains 'run --containall' "$apptainer_log"
+log_not_contains 'test-bedrock-token' "$apptainer_log"
+log_not_contains 'test-bedrock-token' "$bedrock_apptainer_output"
 
 scenario="review repositories use independent microVM state"
 run_just review-queue owner/repo

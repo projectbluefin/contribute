@@ -94,6 +94,8 @@ jobs:
       - name: Review mode and contribute contracts
         run: |
           set -euo pipefail
+          node --test tests/update-omp-pins.test.mjs
+          node --test tests/update-derived-pins.test.mjs
           bash tests/omp-review-mode.sh
           bash tests/contribute-contract.sh
 

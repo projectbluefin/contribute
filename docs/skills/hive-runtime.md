@@ -129,6 +129,14 @@ recognized `TERM`; tmux's pane terminal is configured separately. Enable tmux
 mouse support so the wheel enters copy-mode for long output. Do not alter
 Hive's session creation to accomplish either behavior.
 
+Give the image a UTF-8 locale that it actually ships (`LANG=C.UTF-8`). tmux
+decides UTF-8 support from the client's `LANG`/`LC_ALL`/`LC_CTYPE` alone, so an
+unset or uninstalled locale leaves the attached terminal in non-UTF-8 mode:
+box drawing arrives as DEC ACS escapes and every other non-ASCII cell as `_`,
+which reads as broken fonts rather than a broken locale. No launcher forwards a
+locale, so image `ENV` is the only source for the Podman, Apptainer, and cluster
+paths alike.
+
 ## Red Flags
 
 - Creating or naming tmux sessions, injecting prompts, or scraping pane output

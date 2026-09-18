@@ -1,8 +1,9 @@
 # The review appliance
 
-`ghcr.io/projectbluefin/review` is one OCI image that reviews Project Bluefin
-pull requests. The `bluefin` launcher prefers a dedicated libkrun microVM and
-falls back cleanly to an isolated Apptainer container when KVM is unavailable.
+`ghcr.io/projectbluefin/review` is one OCI image that implements selected
+Project Bluefin issues and reviews, repairs, and lands selected pull requests.
+The `bluefin` launcher prefers a dedicated libkrun microVM and falls back
+cleanly to an isolated Apptainer container when KVM is unavailable.
 
 ```bash
 podman run --runtime=krun --rm -it \

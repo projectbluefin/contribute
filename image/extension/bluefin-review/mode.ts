@@ -19,6 +19,8 @@ import {
 } from "./github.ts";
 import { type HiveSnapshot, type HiveWorkItem, EMPTY_HIVE, fetchHive, fetchHiveKnowledge, fetchHiveMe } from "./hive.ts";
 import { type PrioritizedQueue, type Priority, isRepairRequested, itemKey, prioritize } from "./priority.ts";
+import { type LandingState, landingState } from "./landing.ts";
+import { GENERIC_WORKBENCH_POLICY, type WorkbenchPolicy } from "./policy.ts";
 import { SessionTrace } from "./session.ts";
 
 export interface ReviewModeOptions {
@@ -26,6 +28,8 @@ export interface ReviewModeOptions {
 	token?: string;
 	fetchImpl?: typeof fetch;
 	env?: NodeJS.ProcessEnv;
+	/** Managed-repository policy, so landing state honours the same holds as the gate. */
+	policy?: WorkbenchPolicy;
 }
 /**
  * Most items one dispatch may carry.
@@ -103,9 +107,9 @@ export class ReviewMode {
 	private token?: string;
 	private fetchImpl?: typeof fetch;
 	private env: NodeJS.ProcessEnv;
+	private policy: WorkbenchPolicy;
 	private inflight?: AbortController;
 	private ranked: PrioritizedQueue = { items: [], priorities: new Map(), source: "local", hiveRanked: 0 };
-	private excludedKeys = new Set<string>();
 	skipRepos: Set<string>;
 
 	constructor(options: ReviewModeOptions) {
@@ -114,6 +118,7 @@ export class ReviewMode {
 		this.token = options.token;
 		this.fetchImpl = options.fetchImpl;
 		this.env = options.env ?? process.env;
+		this.policy = options.policy ?? GENERIC_WORKBENCH_POLICY;
 		const envSkip = (this.env.BLUEFIN_REVIEW_SKIP_REPOS ?? "")
 			.split(",")
 			.map((s) => s.trim().toLowerCase())
@@ -149,21 +154,6 @@ export class ReviewMode {
 		this.queueTruncated = false;
 	}
 
-
-	private excludeUnsupportedPullRequests(items: readonly QueueItem[]): QueueItem[] {
-		if (this.queueMode !== "prs") return [...items];
-		const supported: QueueItem[] = [];
-		for (const item of items) {
-			const unsafeForLanding = (item.workflowFiles?.length ?? 0) > 0 || item.changedFilesComplete === false;
-			if (unsafeForLanding && !isRepairRequested(item, this.currentUserLogin)) {
-				this.excludedKeys.add(itemKey(item));
-				continue;
-			}
-			supported.push(item);
-		}
-		return supported;
-	}
-
 	/** Why this item sits where it sits. */
 	priorityFor(item: QueueItem): Priority | undefined {
 		return this.ranked.priorities.get(itemKey(item));
@@ -171,6 +161,15 @@ export class ReviewMode {
 
 	priorities(): ReadonlyMap<string, Priority> {
 		return this.ranked.priorities;
+	}
+
+	/**
+	 * Authoritative landing state for a pull request: CI, reviews, holds, and
+	 * mergeability evaluated together. Only the extension and the status tool
+	 * project this, so the UI maps to the same state the slay gate enforces.
+	 */
+	landingStateFor(item: QueueItem): LandingState {
+		return landingState(item, this.policy);
 	}
 
 	/** Which provider ordered the queue: Hive's priority, or local categories. */
@@ -437,11 +436,17 @@ export class ReviewMode {
 	 * Items available for slay execution: chosen items first, then visible items,
 	 * falling back to unranked items in local priority order when the Hive-only
 	 * filter leaves zero items.
+	 *
+	 * `exclude` drops already-attempted work at every tier before the limit is
+	 * applied, which is what lets an unattended run take a genuinely new batch
+	 * each pass instead of re-selecting the same head of the queue forever.
 	 */
-	slayableItems(limit = BATCH_LIMIT): QueueItem[] {
-		const chosen = this.chosenItems();
+	slayableItems(limit = BATCH_LIMIT, exclude?: ReadonlySet<string>): QueueItem[] {
+		const keep = (items: QueueItem[]): QueueItem[] =>
+			exclude === undefined ? items : items.filter((item) => !exclude.has(itemKey(item)));
+		const chosen = keep(this.chosenItems());
 		if (chosen.length > 0) return chosen.slice(0, limit);
-		const visible = this.visibleItems();
+		const visible = keep(this.visibleItems());
 		if (visible.length > 0) return visible.slice(0, limit);
 		let base = this.ranked.items.length === this.items.length ? this.ranked.items : this.items;
 		if (this.skipRepos.size > 0) {
@@ -451,7 +456,7 @@ export class ReviewMode {
 				return !this.skipRepos.has(repoLower) && !this.skipRepos.has(shortName);
 			});
 		}
-		return base.slice(0, limit);
+		return keep(base).slice(0, limit);
 	}
 
 
@@ -489,7 +494,6 @@ export class ReviewMode {
 		this.inflight?.abort();
 		const controller = new AbortController();
 		this.inflight = controller;
-		this.excludedKeys.clear();
 		this.loading = true;
 
 		try {
@@ -522,7 +526,7 @@ export class ReviewMode {
 			this.fetchedAt = result.fetchedAt;
 			if (result.viewerLogin) this.currentUserLogin = result.viewerLogin;
 			const previousKey = this.selectedKey();
-			this.items = this.excludeUnsupportedPullRequests([...result.items, ...missing]);
+			this.items = [...result.items, ...missing];
 			this.reprioritize();
 			if (previousKey) {
 				const index = this.visibleItems().findIndex((item) => itemKey(item) === previousKey);
@@ -547,12 +551,12 @@ export class ReviewMode {
 		const keys = new Set<string>();
 		for (const item of this.hive.items) {
 			if (this.queueMode === "issues") {
-				if (!GITHUB_PULL_URL.test(item.url) && this.inScope(item.key) && !this.excludedKeys.has(item.key)) keys.add(item.key);
+				if (!GITHUB_PULL_URL.test(item.url) && this.inScope(item.key)) keys.add(item.key);
 				continue;
 			}
 
 			const key = pullRequestKey(item);
-			if (key && this.inScope(key) && !this.excludedKeys.has(key)) keys.add(key);
+			if (key && this.inScope(key)) keys.add(key);
 		}
 		return [...keys];
 	}
@@ -586,7 +590,7 @@ export class ReviewMode {
 	hiveCoverage(): { present: number; total: number } {
 		const expected = new Set(this.hiveKeysForMode());
 		for (const item of this.items) {
-			if (this.priorityFor(item)?.source === "hive" && !this.excludedKeys.has(itemKey(item))) expected.add(itemKey(item));
+			if (this.priorityFor(item)?.source === "hive") expected.add(itemKey(item));
 		}
 		return { present: this.hiveRankedCount(), total: expected.size };
 	}

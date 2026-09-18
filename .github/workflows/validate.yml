@@ -91,6 +91,8 @@ jobs:
       - name: Review mode and appliance contracts
         run: |
           set -euo pipefail
+          node --test tests/update-omp-pins.test.mjs
+          node --test tests/update-derived-pins.test.mjs
           bash tests/omp-review-mode.sh
           bash tests/appliance-contract.sh
           bash tests/contribute-contract.sh

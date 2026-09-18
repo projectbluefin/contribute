@@ -44,9 +44,7 @@ has_terminfo() {
 }
 
 if ! has_terminfo "${TERM:-}"; then
-  case "${COLORTERM:-}" in
-  truecolor | 24bit) tmux_fallback_term=xterm-direct ;;
-  esac
+  tmux_fallback_term=xterm-256color
   note "TERM=${TERM:-<unset>} has no terminfo; using ${tmux_fallback_term}"
   export TERM="$tmux_fallback_term"
 fi

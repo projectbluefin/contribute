@@ -11,6 +11,7 @@ import type { QueueItem } from "./github.ts";
 import type { HiveSnapshot } from "./hive.ts";
 
 export type PriorityCategory =
+	| "blocked"
 	| "repair-requested"
 	| "hive"
 	| "personal_request"
@@ -76,6 +77,18 @@ export function isRepairRequested(item: QueueItem, currentUserLogin?: string): b
 		&& item.author.toLowerCase() === currentUserLogin!.toLowerCase();
 }
 
+/** Why an open pull request is unsupported for automated action. */
+export function unsupportedReason(item: QueueItem): string | undefined {
+	if (item.type !== "pr") return undefined;
+	if ((item.workflowFiles?.length ?? 0) > 0) {
+		return "workflow change";
+	}
+	if (item.changedFilesComplete === false) {
+		return "incomplete changed-file list";
+	}
+	return undefined;
+}
+
 /**
  * The local fallback: the dashboard's classifier, first match wins.
  *
@@ -87,6 +100,10 @@ export function categorize(item: QueueItem, context: PrioritizeContext): { categ
 	if (item.type === "issue") return { category: "triage", reason: "issue awaiting triage" };
 	if (isRepairRequested(item, context.currentUserLogin)) {
 		return { category: "repair-requested", reason: "changes requested on your pull request" };
+	}
+	const blockedReason = unsupportedReason(item);
+	if (blockedReason) {
+		return { category: "blocked", reason: blockedReason };
 	}
 	if (context.currentUserLogin && item.requestedReviewers && item.requestedReviewers.includes(context.currentUserLogin)) {
 		return { category: "personal_request", reason: "review requested from you" };
@@ -171,6 +188,17 @@ export function prioritize(items: readonly QueueItem[], context: PrioritizeConte
 			});
 			continue;
 		}
+		if (local.category === "blocked") {
+			if (rank !== undefined) hiveRanked += 1;
+			priorities.set(key, {
+				category: local.category,
+				source: rank === undefined ? "local" : "hive",
+				reason: local.reason,
+				hiveRank: rank,
+				demotion: 0,
+			});
+			continue;
+		}
 		if (rank !== undefined) {
 			hiveRanked += 1;
 			priorities.set(key, {
@@ -215,6 +243,7 @@ export function prioritize(items: readonly QueueItem[], context: PrioritizeConte
 /** Counts per category, for the headline. */
 export function categoryTally(priorities: ReadonlyMap<string, Priority>): Record<PriorityCategory, number> {
 	const tally: Record<PriorityCategory, number> = {
+		blocked: 0,
 		"repair-requested": 0,
 		hive: 0,
 		personal_request: 0,
