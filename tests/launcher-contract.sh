@@ -748,6 +748,21 @@ exit 0
 EOF
 chmod +x "$mock_cred_bin/omp"
 
+# This credential PATH deliberately keeps /usr/bin so bin/bluefin can reach
+# coreutils, but CI runners also ship a real gh there. Without a stub ahead of
+# it, verify_image_provenance would run a real `gh attestation verify` against
+# the network and abort a test that is only about credential resolution.
+cat >"$mock_cred_bin/gh" <<'EOF'
+#!/usr/bin/env bash
+# Only the provenance check is neutralized. `gh auth token` must still fail so
+# the credential precedence under test (BLUEFIN_OMP_STATE wins) is unchanged.
+case "${1:-} ${2:-}" in
+  "attestation verify") exit 0 ;;
+esac
+exit 1
+EOF
+chmod +x "$mock_cred_bin/gh"
+
 bluefin_cred_out="$(env -i PATH="$mock_cred_bin:/usr/bin:/bin" HOME="$scratch/home" BLUEFIN_OMP_STATE="$custom_state" REVIEW_TEST_KVM_DEVICE="$kvm" "${repo_root}/bin/bluefin" review projectbluefin/review 2>/dev/null)" || fail "bin/bluefin credential test failed"
 assert_eq "$bluefin_cred_out" "custom-omp-token copilot-developer-cli" "bin/bluefin resolves BLUEFIN_OMP_STATE and COPILOT_INTEGRATION_ID"
 
