@@ -25,12 +25,9 @@ ext_dir="$repo_root/image/extension/bluefin-review"
 entrypoint="index.ts"
 
 # Modules known to be unreachable, each with the issue that owns its
-# disposition. Remove an entry when the module is wired or deleted.
-# See projectbluefin/review#569.
-declare -A QUARANTINE=(
-  ["ci_mode.ts"]="projectbluefin/review#569 — tested, never imported; extension.ts emits the ci_mode prompt inline"
-  ["reviewer_requests.ts"]="projectbluefin/review#569 — tested, never imported; forks priority.ts:95 and github.ts toReviewState"
-)
+# disposition. Add an entry only alongside a tracking issue; remove it when the
+# module is wired or deleted. Empty is the intended steady state.
+declare -A QUARANTINE=()
 
 failures=0
 fail() {
