@@ -6,6 +6,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 readme="$repo_root/README.md"
 failures=0
 
+# The other README/launcher alignment this repository depends on: the
+# configuration key roster, which README restates twice and which only
+# bin/hive-contribute's load_config() actually decides. Unconditional — it
+# holds regardless of how the onboarding section below is worded.
+bash "$repo_root/tests/config-key-contract.sh"
+
 require_text() {
   local text="$1"
   if ! grep -Fq -- "$text" "$readme"; then
