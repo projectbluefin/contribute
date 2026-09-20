@@ -97,6 +97,14 @@ test("blueberry can donate an advisory review to the project", () => {
 	assert.match(prompt, /gh pr review 101 --repo projectbluefin\/review --comment -b/);
 	assert.match(prompt, /Never approve, merge, or apply landing labels/);
 
+	// An advisory reviewer is only advisory about its conclusions, never about its
+	// evidence: it must be sent at the tools this extension actually registers, and
+	// it must label what it could not verify instead of filling the gap with prose.
+	assert.match(prompt, /hive_workbench_diff/);
+	assert.match(prompt, /hive_workbench_trace/);
+	assert.doesNotMatch(prompt, /bluefin_review_/);
+	assert.match(prompt, /State explicitly what you verified and what you could not/);
+
 	// 2. Format a real donated review comment body
 	const reviewFindings = "doctrine: PASS\ncorrectness: PASS\nsimplicity: PASS\nVerified clean diff.";
 	const donatedReviewBody = formatBlueberryAdvisoryReview(reviewFindings, "gemini-3.8-flash");

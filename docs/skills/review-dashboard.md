@@ -165,7 +165,7 @@ keeping a second, unwired behavior model.
 
 The registered inspection tools are `hive_workbench_status`,
 `hive_workbench_queue`, `hive_workbench_diff`, `hive_workbench_trace`, and
-`hive_workbench_lookup`.
+`hive_workbench_lookup`. A contract test pins every prompt that names one.
 
 ## Common Rationalizations
 
