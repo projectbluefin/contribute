@@ -64,7 +64,13 @@ async function fetchRelease(requestedVersion, fetchImpl) {
 		headers,
 		redirect: "error",
 	});
-	if (!response.ok) throw new Error(`GitHub release lookup failed: ${response.status} ${response.statusText}`);
+	if (!response.ok) {
+		// Name the authentication state: Renovate builds post-upgrade command
+		// environments from its own allowlist, so a missing token here means the
+		// command never received one, not that the release is missing.
+		const credentials = token ? "authenticated" : "anonymous";
+		throw new Error(`GitHub release lookup failed: ${response.status} ${response.statusText} (${credentials} request)`);
+	}
 	return releasePins(await response.json(), requestedVersion);
 }
 

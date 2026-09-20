@@ -95,12 +95,28 @@ runs in their respective Renovate branches via `node scripts/update-gh-pins.mjs`
 `node scripts/update-requirements-ci-hashes.mjs`.
 
 OMP releases are automated through the repository's existing Renovate workflow.
-Renovate runs every 15 minutes, groups the two Containerfile `OMP_VERSION`
-updates, and invokes `node scripts/update-omp-pins.mjs` as an allowlisted
-post-upgrade task. The updater reads GitHub release-asset digests and refreshes
-the x86_64 and arm64 SHA-256 pins in both images. The OMP-only Renovate PR
-automerge exception applies only after repository checks pass; its merge to
-`main` triggers both native multi-architecture publish workflows.
+Renovate polls daily, groups the two Containerfile `OMP_VERSION` updates, and
+invokes `node scripts/update-omp-pins.mjs` as an allowlisted post-upgrade task.
+The updater reads GitHub release-asset digests and refreshes the x86_64 and
+arm64 SHA-256 pins in both images. The OMP-only Renovate PR automerge exception
+applies only after repository checks pass; its merge to `main` triggers both
+native multi-architecture publish workflows.
+
+A post-upgrade command does not inherit the workflow job's environment.
+Renovate builds that environment from its own `basicEnvVars` allowlist — proxy,
+`HOME`, `PATH`, locale, CA-certificate, and container-runtime variables — so no
+GitHub credential reaches a pin synchronizer unless `customEnvVariables` hands
+one over. Every release lookup then runs anonymously against the runner's shared
+egress address, exhausts the unauthenticated quota, and the branch keeps the
+bumped version beside the previous release's digests. Pass the app token through
+`RENOVATE_CUSTOM_ENV_VARIABLES`; do not reach for `exposeAllEnv`, which opens the
+whole environment to every command Renovate runs.
+
+Keep the workflow at `LOG_LEVEL: debug`. Renovate logs post-upgrade command
+compilation, execution, and file filtering at debug, and a rejected command at
+warn. At `info` a synchronizer that never produced a digest is indistinguishable
+from one that did, and the only remaining detector is `sha256sum --check`
+failing inside the image build on a branch that has no pull request.
 
 ## Verification
 

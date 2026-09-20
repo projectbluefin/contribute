@@ -52,7 +52,25 @@ jobs:
           configurationFile: renovate.json
           token: ${{ steps.app-token.outputs.token }}
         env:
-          LOG_LEVEL: ${{ inputs.dry_run == true && 'debug' || 'info' }}
+          # Renovate logs post-upgrade command compilation, execution, and the
+          # resulting file filtering at debug. At info a pin synchronizer that
+          # failed is indistinguishable from one that succeeded, which is how
+          # renovate/omp-runtime stayed red for 28 consecutive validate runs
+          # without a single signal. Debug is the permanent setting, not a
+          # dry-run nicety.
+          LOG_LEVEL: debug
           RENOVATE_DRY_RUN: ${{ inputs.dry_run == true && 'full' || '' }}
           RENOVATE_REPOSITORIES: ${{ github.repository }}
           RENOVATE_ALLOWED_COMMANDS: '["^node scripts/update-omp-pins\\.mjs$", "^node scripts/update-gh-pins\\.mjs$", "^node scripts/update-node-pins\\.mjs$", "^node scripts/update-tmux-pins\\.mjs$", "^node scripts/update-requirements-ci-hashes\\.mjs$"]'
+          # Post-upgrade commands do not inherit this job's environment.
+          # Renovate builds their environment from its own `basicEnvVars`
+          # allowlist (proxy, HOME, PATH, locale, CA-certificate and container
+          # variables) unless `exposeAllEnv` is set, so RENOVATE_TOKEN and
+          # GITHUB_TOKEN never reach them. Every pin synchronizer that reads a
+          # GitHub release therefore called api.github.com anonymously and was
+          # rate-limited against the runner's shared egress address, leaving the
+          # version bumped and the digests stale. Hand the commands the same
+          # app token through customEnvVariables rather than opening the whole
+          # environment: Renovate already redacts this value from its logs, and
+          # the app-token action masks it in the Actions log.
+          RENOVATE_CUSTOM_ENV_VARIABLES: '{"GH_TOKEN": "${{ steps.app-token.outputs.token }}"}'

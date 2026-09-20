@@ -119,3 +119,53 @@ test("Renovate follows OMP releases and both image publishers validate the pin s
 		assert.match(workflow, /node --test tests\/update-omp-pins\.test\.mjs/);
 	}
 });
+
+test("every post-upgrade pin synchronizer is handed a GitHub token and runs observably", async () => {
+	const workflow = await readFile(".github/workflows/renovate.yml", "utf8");
+
+	// Renovate assembles post-upgrade command environments from its own
+	// allowlist, which carries no GitHub credential, so the job's token never
+	// reaches the command unless customEnvVariables hands it over. Without it
+	// every release lookup is anonymous, the shared runner address exhausts the
+	// unauthenticated quota, and the branch lands a version bump with stale
+	// digests that only the image build rejects.
+	const customEnv = /RENOVATE_CUSTOM_ENV_VARIABLES: '(?<json>\{.*\})'/.exec(workflow)?.groups?.json;
+	assert.ok(customEnv, "renovate.yml must hand post-upgrade commands a GitHub token");
+	assert.match(customEnv, /steps\.app-token\.outputs\.token/);
+	const tokenName = ["RENOVATE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"].find((name) => customEnv.includes(`"${name}"`));
+	assert.ok(tokenName, "customEnvVariables must carry a variable the pin synchronizers read");
+	for (const script of ["omp", "gh", "tmux"]) {
+		const source = await readFile(`scripts/update-${script}-pins.mjs`, "utf8");
+		assert.match(source, new RegExp(`process\\.env\\.${tokenName}\\b`), `update-${script}-pins.mjs must read ${tokenName}`);
+	}
+
+	// Renovate logs post-upgrade compilation, execution, and file filtering at
+	// debug. At info a synchronizer that never ran reads exactly like one that
+	// succeeded.
+	assert.match(workflow, /^ {10}LOG_LEVEL: debug$/m);
+});
+
+test("a failed release lookup reports whether the request carried credentials", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "omp-pins-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	await mkdir(join(root, "image/appliance"), { recursive: true });
+	await mkdir(join(root, "image/contribute"), { recursive: true });
+	await writeFile(join(root, "image/appliance/Containerfile"), RENOVATED_CONTAINERFILE);
+	await writeFile(join(root, "image/contribute/Containerfile"), RENOVATED_CONTAINERFILE);
+
+	const tokenNames = ["RENOVATE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
+	const saved = Object.fromEntries(tokenNames.map((name) => [name, process.env[name]]));
+	t.after(() => {
+		for (const [name, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+	});
+
+	const rateLimited = async () => ({ ok: false, status: 403, statusText: "rate limit exceeded", json: async () => ({}) });
+	for (const name of tokenNames) delete process.env[name];
+	await assert.rejects(syncOmpPins({ root, fetchImpl: rateLimited }), /403 rate limit exceeded \(anonymous request\)/);
+
+	process.env.GH_TOKEN = "post-upgrade-token";
+	await assert.rejects(syncOmpPins({ root, fetchImpl: rateLimited }), /\(authenticated request\)/);
+});
