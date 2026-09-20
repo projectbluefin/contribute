@@ -2879,6 +2879,94 @@ test("diff prompts match the object: issues inspect discussion, pull requests di
 	assert.match(prWave, /hive_workbench_diff/);
 });
 
+/**
+ * Every generated instruction, classified by the authority its action carries.
+ *
+ * Issue #479: the batch helper used to hand one evidence string to `d` and to
+ * slay alike, so a review-only pull-request wave inherited slay's instruction to
+ * merge a base branch into a conflicted head. A table is the check that scales:
+ * a new action or a reworded helper has to declare its authority here, and the
+ * forbidden-phrase lists below fail the moment one contract borrows another's.
+ */
+function promptFixtures() {
+	const pr = queueItem({ ciStatus: "success" });
+	const prSibling = queueItem({ id: 43, repo: pr.repo, ciStatus: "success" });
+	const issue = queueItem({ id: 8, type: "issue", reviewState: "unknown" });
+	const issueSibling = queueItem({ id: 9, type: "issue", reviewState: "unknown" });
+	const repair = { category: "repair-requested", source: "local", reason: "changes requested", demotion: 0 };
+	return [
+		{ name: "review/single/pr", authority: "read-only", shape: "pr", action: { kind: "review", item: pr } },
+		{ name: "diff/single/pr", authority: "read-only", shape: "pr", action: { kind: "diff", item: pr } },
+		{ name: "diff/single/issue", authority: "read-only", shape: "issue", action: { kind: "diff", item: issue } },
+		{ name: "diff/batch/pr", authority: "read-only", shape: "pr", action: { kind: "diff", item: pr, items: [pr, prSibling] } },
+		{ name: "diff/batch/issue", authority: "read-only", shape: "issue", action: { kind: "diff", item: issue, items: [issue, issueSibling] } },
+		{ name: "fix/single/pr", authority: "write", shape: "pr", action: { kind: "fix", item: pr } },
+		{ name: "fix/batch/pr", authority: "write", shape: "pr", action: { kind: "fix", item: pr, items: [pr, prSibling] } },
+		{ name: "fix/single/issue", authority: "write", shape: "issue", action: { kind: "fix", item: issue } },
+		{ name: "fix/batch/issue", authority: "write", shape: "issue", action: { kind: "fix", item: issue, items: [issue, issueSibling] } },
+		{ name: "slay/single/issue", authority: "write", shape: "issue", action: { kind: "slay", item: issue } },
+		{ name: "slay/batch/issue", authority: "write", shape: "issue", action: { kind: "slay", item: issue, items: [issue, issueSibling] } },
+		{ name: "slay/single/repair", authority: "write", shape: "pr", action: { kind: "slay", item: pr }, priority: repair },
+		{ name: "slay/batch/repair", authority: "write", shape: "pr", action: { kind: "slay", item: pr, items: [pr, prSibling] }, priority: repair },
+		{ name: "slay/single/pr", authority: "land", shape: "pr", action: { kind: "slay", item: pr } },
+		{ name: "slay/batch/pr", authority: "land", shape: "pr", action: { kind: "slay", item: pr, items: [pr, prSibling] } },
+	].map((fixture) => ({ ...fixture, prompt: actionPrompt(fixture.action, fixture.priority) }));
+}
+
+test("action contracts never borrow another action's authority (#479)", () => {
+	// Implementation, delivery, and landing language, in the order a review-only
+	// action would acquire it: edit the head, deliver a pull request, land it.
+	const implementation = [
+		/merge the base into the branch/,
+		/make the smallest complete change/,
+		/dispatch one fresh isolated fixer/,
+		/push (?:one clean commit|repaired heads|a new head|without force)/,
+	];
+	const delivery = [/open a review-ready pull request/, /Closes </, /pull request per issue/];
+	const landing = [/gh pr merge/, /--auto --squash/, /authorizes review, repair, and landing/, /Never use `--admin`/];
+
+	for (const { name, authority, prompt } of promptFixtures()) {
+		assert.ok(prompt, `${name} generated no prompt`);
+		// Autonomy is preserved everywhere: no contract adds a per-tool gate.
+		assert.doesNotMatch(prompt, /(?:confirmation|permission) (?:before|for) (?:every|each) tool/i, name);
+
+		if (authority === "read-only") {
+			assert.match(prompt, /Do not edit files, commit, push, branch, or open or update a pull request\./, name);
+			for (const forbidden of [...implementation, ...delivery, ...landing]) {
+				assert.doesNotMatch(prompt, forbidden, `${name} inherited ${forbidden}`);
+			}
+			continue;
+		}
+		// Human merge authority: only slay on pull requests may land, and it is
+		// the only contract that may name a merge command.
+		if (authority === "write") {
+			for (const forbidden of landing) assert.doesNotMatch(prompt, forbidden, `${name} inherited ${forbidden}`);
+			assert.match(prompt, /Never (?:approve or merge|merge or approve|review, approve, auto-merge, or merge)/, name);
+			continue;
+		}
+		assert.match(prompt, /gh pr merge <n> --repo <r> --auto --squash/, name);
+		assert.match(prompt, /Never use `--admin`/, name);
+	}
+});
+
+test("issue slay states one PR-grouping policy, identically everywhere (#479)", () => {
+	const grouping = /Deliver exactly one review-ready pull request per issue; never consolidate issues into a shared pull request, and never split one issue across several\./g;
+	const implementsIssues = promptFixtures().filter(
+		(fixture) => fixture.shape === "issue" && fixture.authority !== "read-only",
+	);
+	assert.equal(implementsIssues.length, 4, "single-item and batch slay and fix all implement issues");
+
+	for (const { name, prompt } of implementsIssues) {
+		assert.equal(prompt.match(grouping)?.length, 1, `${name} must state the grouping policy exactly once`);
+		// The contradiction this replaces: a per-repository consolidation rule
+		// riding along with a per-issue delivery rule.
+		assert.doesNotMatch(prompt, /one (?:pull request|PR) per repo(?:sitory)?/i, name);
+		assert.doesNotMatch(prompt, /consolidates?\s+(?:all\s+)?changes|land them (?:all )?together/i, name);
+		// A worker is still told to close exactly the issue it was given.
+		assert.match(prompt, /Closes <owner\/repo>#<number>|Closes projectbluefin\/review#8/, name);
+	}
+});
+
 
 test("hive work the search never returned is still admitted to the queue", async () => {
 	// Hive queues an issue that is nowhere near the top of a recency-ordered

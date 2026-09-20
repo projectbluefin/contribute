@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-16",
+  "generated_at": "2026-09-20",
   "schema_version": "1.0",
   "skills": [
     {
@@ -210,8 +210,8 @@
         "workflowz"
       ],
       "description": "Maintains the OMP review workbench. Use for queue ordering, slay or autoslay, workflowz issue batches, durable batch state, dashboard controls, or mutation guards.",
-      "version": "5.4",
-      "last_updated": "2026-09-16",
+      "version": "5.5",
+      "last_updated": "2026-09-20",
       "doc_type": "runbook"
     },
     {

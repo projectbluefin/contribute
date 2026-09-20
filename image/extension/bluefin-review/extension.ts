@@ -253,12 +253,29 @@ export function actionPrompt(
 	const allPullRequests = selected.every((item) => item.type === "pr");
 	if (action.kind === "slay" && !allIssues && !allPullRequests) return undefined;
 	const repairWave = allPullRequests && priority?.category === "repair-requested";
-	const evidence = "Evidence is bounded and read once. Start with `hive_workbench_diff` using both `pull_request` and explicit `repo`; child agents do not inherit the coordinator's selected repository. Use `gh pr diff <n> --repo <r> --name-only` only to confirm filenames, inspect only relevant hunks or failing logs, and cite file:line evidence. Never sleep or poll. Never assume a checkout exists. Check a repository-specific validator once; if the minimal appliance lacks that toolchain, use hosted check evidence and report the local verification gap instead of installing packages or retrying the absent command. Treat `merge=dirty` as repair work: merge the base into the branch, resolve deliberately, and never rebase, force-push, or choose `--ours`/`--theirs` wholesale. Revalidate live state before any comment, label, assignment, close, push, approval, or merge.";
+	// How every action reads. Nothing here authorizes a change, so the review-only
+	// actions can carry all of it. Authority is added per action below: a shared
+	// helper that carries both mechanics and authority hands `d` slay's write
+	// instructions the moment one action reuses it.
+	const readEvidence = "Evidence is bounded and read once. Start with `hive_workbench_diff` using both `pull_request` and explicit `repo`; child agents do not inherit the coordinator's selected repository. Use `gh pr diff <n> --repo <r> --name-only` only to confirm filenames, inspect only relevant hunks or failing logs, and cite file:line evidence. Never sleep or poll. Never assume a checkout exists. Check a repository-specific validator once; if the minimal appliance lacks that toolchain, use hosted check evidence and report the local verification gap instead of installing packages or retrying the absent command.";
+	// Read-only actions name what they may not do. A conflicted head is still
+	// reported, never resolved: `merge=dirty` travels in the queue read either way.
+	// Blueberry review is advisory, not silent, so it takes the narrower clause:
+	// it may not write code, but submitting its review is the point of the action.
+	const noWriteAuthority = "Do not edit files, commit, push, branch, or open or update a pull request.";
+	const readOnlyAuthority = `This action is read-only: inspect and report. ${noWriteAuthority} Do not comment, label, assign, close, approve, or merge.`;
+	// Write-capable pull-request actions only.
+	const repairAuthority = "Treat `merge=dirty` as repair work: merge the base into the branch, resolve deliberately, and never rebase, force-push, or choose `--ours`/`--theirs` wholesale. Revalidate live state before any comment, label, assignment, close, push, approval, or merge.";
+	const inspectEvidence = `${readEvidence} ${readOnlyAuthority}`;
+	const repairEvidence = `${readEvidence} ${repairAuthority}`;
+	// One statement of issue grouping, shared by every path that implements
+	// issues, so single-item and batch delivery cannot drift apart.
+	const issueDelivery = "Deliver exactly one review-ready pull request per issue; never consolidate issues into a shared pull request, and never split one issue across several.";
 	const reviewFinish = "Report one terminal outcome per item, then stop. The workbench owns the next repository wave. Never approve or merge.";
 	const slayFinish = "The maintainer's slay action authorizes review, repair, and landing for exactly these pull requests and their captured heads. Review each head with a fresh bluefin-reviewer. If it has findings, dispatch one fresh isolated fixer with the exact repository, pull-request number, and head. Fixers use `gh repo clone` and `gh pr checkout` under `$HOME/worktrees`; never assume the working directory is a checkout, clone into `/tmp`, or assume a fork branch exists on the base remote. Fixers commit with the authenticated GitHub account's identity (e.g. `$(gh api user --jq '\"\\(.id)+\\(.login)@users.noreply.github.com\"')`) and repository-local git config to ensure attribution and avoid breaking unattributed-change rules. Push without force, read the new head, and run a fresh review of that head. Before landing, re-read the live head, base, labels, reviews, checks, mergeability, and effective rules via `gh api repos/<owner>/<repo>/rules/branches/<branch>`. The reviewed head must equal the live head. If the repository requires auto-merge to enqueue (`GraphQL: Auto merge is not allowed for this repository`), enable it via `gh api --method PATCH repos/<owner>/<repo> -F allow_auto_merge=true`. Submit the current maintainer's approval only for a clean PR they did not author; never fabricate reviewers or a fixed approval threshold. Then run `gh pr merge <n> --repo <r> --auto --squash`; GitHub rules remain authoritative and may leave it queued or blocked on additional required human reviews. If GitHub says the merge queue owns the strategy, its effective squash rule wins: do not disable and re-arm auto-merge because `autoMergeRequest.mergeMethod` says `MERGE`. An accepted auto-merge request is terminal for this wave: report the outstanding approval gate and move on. Never use `--admin`, remove holds, weaken protections, or force-push. Report one terminal outcome per item, then stop. The workbench owns the next repository wave.";
 	const repairFinish = "These pull requests were returned to their authenticated author with requested changes. Read the review threads and failing checks, diagnose every requested correction, then dispatch one fresh isolated fixer per pull request. Fixers use `gh repo clone` and `gh pr checkout` under `$HOME/worktrees`, make the smallest complete correction, run focused verification, and push a new head without force. Never review, approve, auto-merge, or merge the author's own pull request. A repair is terminal only after GitHub shows a new head SHA. Report the pushed head and pull-request URL for every item, then stop; the workbench owns the next repository wave.";
 	const issueEvidence = "Evidence is bounded and read once. Inspect the complete issue description and the supplied Hive queue and knowledge evidence before deciding how to implement it. Examine relevant source files and tests and cite file:line evidence. Never sleep or poll. In a clean workspace, diagnose the root cause, make the smallest complete change, run focused verification, and open a review-ready pull request whose body contains `Closes <owner/repo>#<number>`. Never merge or approve your own pull request. The issue is not terminal until GitHub has accepted that pull request.";
-	const issueInspectEvidence = "Evidence is bounded and read once. Read the complete issue body and discussion with `gh issue view <n> --repo <r> --comments`, list the pull requests linked to it, and inspect only the relevant source files, citing file:line evidence. `hive_workbench_diff` is pull-request-only and must not be called for an issue. Never sleep or poll. Never assume a checkout exists. Report the request, its current state, and concrete risks.";
+	const issueInspectEvidence = `Evidence is bounded and read once. Read the complete issue body and discussion with \`gh issue view <n> --repo <r> --comments\`, list the pull requests linked to it, and inspect only the relevant source files, citing file:line evidence. \`hive_workbench_diff\` is pull-request-only and must not be called for an issue. Never sleep or poll. Never assume a checkout exists. Report the request, its current state, and concrete risks. ${readOnlyAuthority}`;
 	const issueWorkflow = "Before dispatching, call `hive_workbench_lookup` with target `queue` and then target `knowledge`. Match every issue key to Hive's entry and include the relevant queue and knowledge evidence in that worker's prompt; report unavailable Hive evidence instead of inventing it. Use the `task` tool once with one fresh isolated item per issue through OMP workflowz. Do not share a checkout or conversation between items.";
 
 	if (selected.length > 1) {
@@ -266,15 +283,20 @@ export function actionPrompt(
 		if (selected.some((item) => item.repo !== repository)) return undefined;
 		const list = selected.map((item) => `- ${cite(item)}: ${item.url}${stateOf(item)}`).join("\n");
 
-		const reviewRules = `<<<SUBAGENT-RULES\n${evidence} ${reviewFinish}\nSUBAGENT-RULES>>>`;
-		const slayRules = `<<<SUBAGENT-RULES\n${evidence} ${slayFinish}\nSUBAGENT-RULES>>>`;
-		const repairRules = `<<<SUBAGENT-RULES\n${evidence} ${repairFinish}\nSUBAGENT-RULES>>>`;
+		// One rules block per action contract. `diff` is review-only and gets the
+		// read-only contract; `fix` and slay are write-capable and get the repair
+		// contract. They are never the same block, so neither can inherit the
+		// other's authority through a shared helper.
+		const inspectRules = `<<<SUBAGENT-RULES\n${inspectEvidence} ${reviewFinish}\nSUBAGENT-RULES>>>`;
+		const fixRules = `<<<SUBAGENT-RULES\n${repairEvidence} ${reviewFinish}\nSUBAGENT-RULES>>>`;
+		const slayRules = `<<<SUBAGENT-RULES\n${repairEvidence} ${slayFinish}\nSUBAGENT-RULES>>>`;
+		const repairRules = `<<<SUBAGENT-RULES\n${repairEvidence} ${repairFinish}\nSUBAGENT-RULES>>>`;
 		const issueRules = `<<<SUBAGENT-RULES\n${issueEvidence} ${reviewFinish}\nSUBAGENT-RULES>>>`;
 		const issueInspectRules = `<<<SUBAGENT-RULES\n${issueInspectEvidence} ${reviewFinish}\nSUBAGENT-RULES>>>`;
 		switch (action.kind) {
 			case "slay":
 				if (allIssues) {
-					return `Implement this issue wave for ${repository}, opening one review-ready pull request per issue:\n\n${list}\n\n${issueWorkflow} Copy this block verbatim into every worker prompt:\n${issueRules}`;
+					return `Implement this issue wave for ${repository}:\n\n${list}\n\n${issueDelivery} ${issueWorkflow} Copy this block verbatim into every worker prompt:\n${issueRules}`;
 				}
 				if (repairWave) {
 					return `Repair this returned pull-request wave for ${repository}:\n\n${list}\n\nUse the \`task\` tool once with one fresh isolated fixer per pull request through OMP workflowz. Do not share a checkout or conversation between items. Copy this block verbatim into every worker prompt:\n${repairRules}`;
@@ -283,11 +305,11 @@ export function actionPrompt(
 			case "diff":
 				return allIssues
 					? `Inspect this issue wave for ${repository}:\n\n${list}\n\nUse the \`task\` tool once with one fresh item per issue through OMP workflowz. Do not reuse a worker across repositories. Read each issue's body, discussion, and linked pull requests, and report the request, its current state, and concrete risks. Copy this block verbatim into every worker prompt:\n${issueInspectRules}`
-					: `Inspect this repository wave for ${repository}:\n\n${list}\n\nUse the \`task\` tool once with one fresh item per issue or pull request through OMP workflowz. Do not reuse a worker across repositories. Use hive_workbench_diff and report the changed files and concrete risks. Copy this block verbatim into every worker prompt:\n${reviewRules}`;
+					: `Inspect this repository wave for ${repository}:\n\n${list}\n\nUse the \`task\` tool once with one fresh item per issue or pull request through OMP workflowz. Do not reuse a worker across repositories. Use hive_workbench_diff and report the changed files and concrete risks. Copy this block verbatim into every worker prompt:\n${inspectRules}`;
 			case "fix":
 				return allIssues
-					? `Implement this repository wave for ${repository}, opening one review-ready pull request per issue:\n\n${list}\n\nUse the \`task\` tool once with one fresh isolated item per issue through OMP workflowz. Do not share a checkout or conversation between write-capable items. Diagnose each root cause, implement the smallest complete fix, and run focused verification. Copy this block verbatim into every worker prompt:\n${issueRules}`
-					: `Fix this repository wave for ${repository}:\n\n${list}\n\nUse the \`task\` tool once with one fresh isolated item per issue or pull request through OMP workflowz. Do not share a checkout or conversation between write-capable items. Address findings at source, run focused verification, and push repaired heads for independent review. Copy this block verbatim into every worker prompt:\n${reviewRules}`;
+					? `Implement this repository wave for ${repository}:\n\n${list}\n\n${issueDelivery} Use the \`task\` tool once with one fresh isolated item per issue through OMP workflowz. Do not share a checkout or conversation between write-capable items. Diagnose each root cause, implement the smallest complete fix, and run focused verification. Copy this block verbatim into every worker prompt:\n${issueRules}`
+					: `Fix this repository wave for ${repository}:\n\n${list}\n\nUse the \`task\` tool once with one fresh isolated item per issue or pull request through OMP workflowz. Do not share a checkout or conversation between write-capable items. Address findings at source, run focused verification, and push repaired heads for independent review. Copy this block verbatim into every worker prompt:\n${fixRules}`;
 		}
 	}
 
@@ -302,12 +324,12 @@ export function actionPrompt(
 	switch (action.kind) {
 		case "review":
 			if (options?.isBlueberry) {
-				return `Review ${cite(action.item)} in Blueberry advisory mode. Read the bounded diff with bluefin_review_diff and the recorded pipeline with bluefin_review_trace before judging. As a non-maintainer Blueberry contributor, donate your review to the project as an advisory submission. Format your review with \`[Blueberry Advisory Review | Model: ${options.model ?? "default"}]\` and submit it as a GitHub pull request comment or advisory review (\`gh pr review ${action.item.id} --repo ${action.item.repo} --comment -b "..."\`). Never approve, merge, or apply landing labels. ${authority} ${reviewFinish}`;
+				return `Review ${cite(action.item)} in Blueberry advisory mode. Read the bounded diff with bluefin_review_diff and the recorded pipeline with bluefin_review_trace before judging. As a non-maintainer Blueberry contributor, donate your review to the project as an advisory submission. Format your review with \`[Blueberry Advisory Review | Model: ${options.model ?? "default"}]\` and submit it as a GitHub pull request comment or advisory review (\`gh pr review ${action.item.id} --repo ${action.item.repo} --comment -b "..."\`). Never approve, merge, or apply landing labels. ${noWriteAuthority} ${authority} ${reviewFinish}`;
 			}
-			return `Review ${cite(action.item)}. Read bounded diffs and recorded pipelines before judging. Report findings by severity with file:line evidence, covering doctrine, correctness, security, tests, and simplicity. State explicitly what you verified and what you could not. ${authority} ${reviewFinish}`;
+			return `Review ${cite(action.item)}. Read bounded diffs and recorded pipelines before judging. Report findings by severity with file:line evidence, covering doctrine, correctness, security, tests, and simplicity. State explicitly what you verified and what you could not. ${readOnlyAuthority} ${authority} ${reviewFinish}`;
 		case "slay":
 			if (allIssues) {
-				return `Implement ${cite(item)} as an issue. ${issueWorkflow} ${authority} ${issueEvidence} ${reviewFinish}`;
+				return `Implement ${cite(item)} as an issue. ${issueDelivery} ${issueWorkflow} ${authority} ${issueEvidence} ${reviewFinish}`;
 			}
 			if (repairWave) {
 				return `Repair ${cite(item)} after requested changes. Use hive_workbench_diff and read the review threads, then push a corrected head. ${workflow} ${authority} ${repairFinish}`;
@@ -315,11 +337,11 @@ export function actionPrompt(
 			return `Slay ${cite(item)} through review, repair, and landing. Use hive_workbench_diff and hive_workbench_trace, then run the complete lifecycle with fresh review and isolated fix agents. ${workflow} ${authority} ${slayFinish}`;
 		case "diff":
 			return item.type === "issue"
-				? `Inspect ${cite(item)} as an issue. Read its complete body and discussion with \`gh issue view ${item.id} --repo ${item.repo} --comments\`, list the pull requests linked to it, and inspect the relevant source files. Summarize the request, its current state, and concrete risks with file:line evidence. Do not call \`hive_workbench_diff\`; it is pull-request-only. ${workflow} ${authority} ${reviewFinish}`
-				: `Call hive_workbench_diff for ${cite(item)} and summarize the changed files and concrete risks. ${workflow} ${authority} ${reviewFinish}`;
+				? `Inspect ${cite(item)} as an issue. Read its complete body and discussion with \`gh issue view ${item.id} --repo ${item.repo} --comments\`, list the pull requests linked to it, and inspect the relevant source files. Summarize the request, its current state, and concrete risks with file:line evidence. Do not call \`hive_workbench_diff\`; it is pull-request-only. ${readOnlyAuthority} ${workflow} ${authority} ${reviewFinish}`
+				: `Call hive_workbench_diff for ${cite(item)} and summarize the changed files and concrete risks. ${readOnlyAuthority} ${workflow} ${authority} ${reviewFinish}`;
 		case "fix":
 			return item.type === "issue"
-				? `Implement ${cite(item)} in an isolated workspace. Diagnose the root cause, make the smallest complete change, run focused verification, and open a review-ready pull request whose body contains \`Closes ${item.repo}#${item.id}\`. ${workflow} ${authority} ${reviewFinish}`
+				? `Implement ${cite(item)} in an isolated workspace. Diagnose the root cause, make the smallest complete change, run focused verification, and open a review-ready pull request whose body contains \`Closes ${item.repo}#${item.id}\`. ${issueDelivery} ${workflow} ${authority} ${reviewFinish}`
 				: `Fix ${cite(item)} in an isolated workspace. Re-read the live diff and failing checks, diagnose each root cause, run focused verification, and push one clean commit for independent review. ${workflow} ${authority} ${reviewFinish}`;
 		case "request_reviewer":
 			return `Request review on ${cite(action.item)} from repository collaborators. Use \`gh pr edit ${action.item.id} --repo ${action.item.repo} --add-reviewer <reviewer>\` to assign reviewers and prioritize in their maintainer queue.`;

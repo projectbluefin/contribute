@@ -1,7 +1,7 @@
 ---
 name: review-dashboard
-version: "5.4"
-last_updated: 2026-09-16
+version: "5.5"
+last_updated: 2026-09-20
 id: review-dashboard
 one_line_purpose: Maintain the queue, slay lifecycles, and workflowz workbench.
 entry_point: docs/skills/review-dashboard.md
@@ -47,6 +47,10 @@ contributor assignment behavior.
   and presentation.
 - Humans own approval and merge decisions; confirmed slay intent delegates the
   bounded coordinator lifecycle that executes them.
+- Each action owns its prompt contract. Helpers share evidence mechanics, never
+  authority: `r`/`d` take the read-only clause, `f` and returned-PR repair the
+  conflicted-head clause, and only PR slay names a merge command. A fixture
+  table in `tests/omp-review-mode.test.ts` rejects a borrowed phrase.
 
 ## Screen
 
@@ -102,9 +106,11 @@ A returned PR is terminal only when GitHub shows a new head SHA.
 
 Issue slay reads the complete issue plus Hive's queue entry and curated
 knowledge before deciding and implementing. A multi-issue wave uses one
-workflowz `task` call with a fresh isolated item per issue. Each worker opens a
-review-ready PR with a closing reference; the issue is terminal only when
-GitHub reports that submitted PR. The worker never approves or merges it.
+workflowz `task` call with a fresh isolated item per issue. One constant states
+that grouping — exactly one PR per issue, never consolidated by repository — so
+single-item and batch dispatch cannot disagree. Each worker opens a review-ready
+PR with a closing reference; the issue is terminal only when GitHub reports that
+submitted PR. The worker never approves or merges it.
 
 `--autoslay` and `Alt-S` use the same repair-first plan: unless explicitly
 started in issue mode, repair all visible returned PRs, then switch to the
@@ -183,6 +189,8 @@ The registered inspection tools are `hive_workbench_status`,
 - `s`, `Alt-S`, or `--autoslay` bypasses the common wave validation machinery.
 - A reviewer agent approves, merges, or edits instead of returning evidence to
   the coordinator.
+- One prompt helper carries both evidence mechanics and write authority, so a
+  review-only action inherits repair, delivery, or landing instructions.
 - Slay lands without revalidating the exact reviewed head and live GitHub rules.
 - A repository wave advances before its OMP jobs settle.
 - An issue wave skips Hive queue/knowledge evidence or advances without a submitted PR.
