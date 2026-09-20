@@ -2896,6 +2896,15 @@ function promptFixtures() {
 	const repair = { category: "repair-requested", source: "local", reason: "changes requested", demotion: 0 };
 	return [
 		{ name: "review/single/pr", authority: "read-only", shape: "pr", action: { kind: "review", item: pr } },
+		// Blueberry review is the one action taking the narrower no-write clause:
+		// it submits an advisory review, so it may comment but never write code.
+		{
+			name: "review/single/blueberry",
+			authority: "read-only",
+			shape: "pr",
+			action: { kind: "review", item: pr },
+			options: { isBlueberry: true, model: "test-model" },
+		},
 		{ name: "diff/single/pr", authority: "read-only", shape: "pr", action: { kind: "diff", item: pr } },
 		{ name: "diff/single/issue", authority: "read-only", shape: "issue", action: { kind: "diff", item: issue } },
 		{ name: "diff/batch/pr", authority: "read-only", shape: "pr", action: { kind: "diff", item: pr, items: [pr, prSibling] } },
@@ -2910,7 +2919,7 @@ function promptFixtures() {
 		{ name: "slay/batch/repair", authority: "write", shape: "pr", action: { kind: "slay", item: pr, items: [pr, prSibling] }, priority: repair },
 		{ name: "slay/single/pr", authority: "land", shape: "pr", action: { kind: "slay", item: pr } },
 		{ name: "slay/batch/pr", authority: "land", shape: "pr", action: { kind: "slay", item: pr, items: [pr, prSibling] } },
-	].map((fixture) => ({ ...fixture, prompt: actionPrompt(fixture.action, fixture.priority) }));
+	].map((fixture) => ({ ...fixture, prompt: actionPrompt(fixture.action, fixture.priority, fixture.options) }));
 }
 
 test("action contracts never borrow another action's authority (#479)", () => {

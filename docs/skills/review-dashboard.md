@@ -48,9 +48,9 @@ contributor assignment behavior.
 - Humans own approval and merge decisions; confirmed slay intent delegates the
   bounded coordinator lifecycle that executes them.
 - Each action owns its prompt contract. Helpers share evidence mechanics, never
-  authority: `r`/`d` take the read-only clause, `f` and returned-PR repair the
-  conflicted-head clause, and only PR slay names a merge command. A fixture
-  table in `tests/omp-review-mode.test.ts` rejects a borrowed phrase.
+  authority: `r`/`d` take the read-only clause, batch pull-request `f`, repair,
+  and slay take the conflicted-head clause; only PR slay names a merge command.
+  A fixture table in `tests/omp-review-mode.test.ts` rejects a borrowed phrase.
 
 ## Screen
 
