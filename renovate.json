@@ -3,6 +3,10 @@
   "extends": [
     "local>projectbluefin/renovate-config"
   ],
+  "gitIgnoredAuthors": [
+    "267480593+mergeraptor[bot]@users.noreply.github.com",
+    "295290144+bluefin-ghost-arc[bot]@users.noreply.github.com"
+  ],
   "customManagers": [
     {
       "description": "Track OMP release version in the contributor image Containerfile; the post-upgrade task supplies verified per-architecture digests.",
