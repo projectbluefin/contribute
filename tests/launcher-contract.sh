@@ -78,6 +78,10 @@ case "\${1:-} \${2:-}" in
     ;;
   "image inspect")
     printf 'image inspect %s\n' "\${*:2}" >>"$podman_log"
+    if [[ "\$*" == *'{{.Digest}}'* ]]; then
+      printf 'sha256:1111111111111111111111111111111111111111111111111111111111111111\n'
+      exit 0
+    fi
     printf 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n'
     exit 0
     ;;
@@ -116,6 +120,11 @@ case "\${1:-} \${2:-}" in
     printf '%s\n' "\${FAKE_GH_TOKEN_VALUE:-fake-gh-auth-token-12345}"
     exit 0
     ;;
+  "attestation verify")
+    [[ "\${FAKE_GH_ATTESTATION_FAIL:-0}" != 1 ]] || { echo "✗ attestation verification failed" >&2; exit 1; }
+    echo "✓ Verification succeeded!"
+    exit 0
+    ;;
 esac
 exit 0
 EOF
@@ -147,6 +156,7 @@ clean_env() {
   unset FAKE_PODMAN_INFO_FAIL FAKE_PODMAN_REMOTE FAKE_PODMAN_PULL_FAIL FAKE_PODMAN_IMAGE_EXISTS FAKE_PODMAN_NO_KRUN
   unset FAKE_PODMAN_RUN_STATUS
   unset FAKE_GH_AUTH_STATUS_FAIL FAKE_GH_TOKEN_FAIL FAKE_GH_TOKEN_VALUE
+  unset FAKE_GH_ATTESTATION_FAIL HIVE_CONTRIBUTE_NO_VERIFY
   rm -rf "${fake_home:?}"
   mkdir -p "$fake_home"
   cat >"$fake_bin/krun" <<'EOF'
@@ -316,6 +326,13 @@ EOF
   assert_contains "$run_cmd" "--cpus 2" "cpu ceiling"
   assert_contains "$run_cmd" "ghcr.io/projectbluefin/contribute:stable" "image name"
 
+  # Provenance is verified against the digest Podman actually pulled, not the
+  # tag, and against the publishing repository — before the container runs.
+  local gh_calls
+  gh_calls="$(cat "$gh_log")"
+  assert_contains "$gh_calls" "attestation verify oci://ghcr.io/projectbluefin/contribute@sha256:1111111111111111111111111111111111111111111111111111111111111111" "provenance verified against the pulled digest"
+  assert_contains "$gh_calls" "--repo projectbluefin/contribute" "provenance verified against the publishing repo"
+
   # Crucial security assertion: NO credential value anywhere in recorded argv!
   assert_not_contains "$run_cmd" "not-a-real-registration-token" "registration token value in argv"
   assert_not_contains "$run_cmd" "not-a-real-gh-token" "GH token value in argv"
@@ -427,6 +444,44 @@ EOF
   output="$("$launcher" doctor)"
   assert_contains "$output" "Podman container runtime ready" "doctor reports podman container runtime"
   assert_contains "$output" "checks passed, 0 failed" "doctor summary passes on container fallback"
+}
+
+# -----------------------------------------------------------------------------
+# Scenario: provenance fails closed. When gh is present and the attestation
+#           does not verify, NO container may run — an isolation appliance
+#           that shrugs off a failed provenance check has no boundary left.
+#           HIVE_CONTRIBUTE_NO_VERIFY=1 is the loud operational override.
+# -----------------------------------------------------------------------------
+test_run_refuses_unverified_image() {
+  clean_env
+  local config_file="$fake_home/.config/hive-contribute.yml"
+  mkdir -p "$fake_home/.config/hive"
+  cat >"$config_file" <<EOF
+hub: wss://hub.example.com/contribute
+registration: $fake_home/.config/hive/contributor.env
+image: ghcr.io/projectbluefin/contribute:stable
+backend: omp
+EOF
+  chmod 600 "$config_file"
+  printf 'HIVE_HUB=wss://hub.example.com/contribute\nHIVE_REGISTRATION_TOKEN=t\nCONTRIBUTOR_ID=c-verify\n' \
+    >"$fake_home/.config/hive/contributor.env"
+  chmod 600 "$fake_home/.config/hive/contributor.env"
+
+  export FAKE_GH_ATTESTATION_FAIL=1
+  set +e
+  local output status
+  output="$("$launcher" run 2>&1)"
+  status=$?
+  set -e
+  assert_eq "$status" "1" "failed verification must fail the launch"
+  assert_contains "$output" "build-provenance verification failed" "refusal names the check"
+  assert_eq "$(grep -c '^run ' "$podman_log" || true)" "0" "no container ran after a failed verification"
+
+  # The override launches, and says out loud that verification was skipped.
+  export HIVE_CONTRIBUTE_NO_VERIFY=1
+  output="$("$launcher" run 2>&1)" || fail "HIVE_CONTRIBUTE_NO_VERIFY=1 must still launch"
+  assert_contains "$output" "WITHOUT provenance verification" "override warns"
+  assert_eq "$(grep -c '^run ' "$podman_log" || true)" "1" "override launched exactly once"
 }
 # Scenario 6: `doctor`: exits non-zero and says why when hub is unset or gh has no token;
 #             exits zero on healthy fake machine; never mounts credential (no container run).
@@ -613,6 +668,8 @@ test_run_podman_fallback_without_krun || exit 1
 echo "3d. Testing doctor preflight on Podman fallback..."
 test_doctor_podman_fallback || exit 1
 
+echo "3e. Testing that a ghcr image failing provenance verification does not run..."
+test_run_refuses_unverified_image || exit 1
 echo "4. Testing doctor preflight..."
 test_doctor_failures_and_success || exit 1
 echo "5. Testing setup against upstream's host-CLI preflight..."
