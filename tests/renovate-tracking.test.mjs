@@ -96,6 +96,32 @@ test("runtime pins are exempt from the PR queue that starved them", async () => 
 	}
 });
 
+test("both Renovate identities ignore each other's git author", async () => {
+	// Two GitHub App installations evaluate this one renovate.json: the
+	// `mergeraptor` token the workflow authenticates with, and a separately
+	// installed `bluefin-ghost-arc` app that files the Dependency Dashboard.
+	// Each installation's platform commits carry its own git author, and
+	// with platform commits active Renovate ignores `gitAuthor` entirely, so
+	// a branch pushed by one installation reads as a manual edit to the
+	// other. That is how `renovate/omp-runtime` and
+	// `renovate/hivecommons-hive-digest` got marked "PR has been edited" and
+	// silently stopped receiving updates. See #638.
+	const ignored = config.gitIgnoredAuthors ?? [];
+	for (const email of [
+		"267480593+mergeraptor[bot]@users.noreply.github.com",
+		"295290144+bluefin-ghost-arc[bot]@users.noreply.github.com",
+	]) {
+		assert.ok(
+			ignored.includes(email),
+			`gitIgnoredAuthors is missing ${email}: Renovate will treat that identity's commits as a manual edit and stop repairing the branch.`,
+		);
+	}
+	assert.ok(
+		config.extends?.includes("local>projectbluefin/renovate-config"),
+		"renovate.json no longer extends local>projectbluefin/renovate-config: config:recommended and the org preset would silently drop out.",
+	);
+});
+
 test("every postUpgradeTask command is allowlisted in the Renovate workflow", async () => {
 	const commands = config.packageRules.flatMap((rule) => rule.postUpgradeTasks?.commands ?? []);
 	assert.ok(commands.length > 0, "no postUpgradeTasks commands are configured");
