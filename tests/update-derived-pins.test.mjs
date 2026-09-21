@@ -285,6 +285,55 @@ foo==1.0.0 \\
 	assert.match(updated, /^    # via bar$/m);
 });
 
+test("updateLockfileContent keeps extras and environment markers, and refuses unparseable lines", async () => {
+	const hashPayload = response({
+		urls: [{ digests: { sha256: X64 } }, { digests: { sha256: ARM64 } }],
+	});
+	const lookups = [];
+	const fetchImpl = async (url) => {
+		lookups.push(String(url));
+		return hashPayload;
+	};
+
+	// An extras requirement does not start with `name==`, so a splitter that
+	// only recognises that shape folds it into the previous package's block and
+	// drops the package, its hashes, and nothing else says so.
+	const withExtras = `# Header
+foo==1.0.0 \\
+    --hash=sha256:${"1".repeat(64)}
+    # via bar
+coverage[toml]==7.6.0 \\
+    --hash=sha256:${"2".repeat(64)}
+    # via pytest-cov
+`;
+	const extrasUpdated = await updateLockfileContent(withExtras, fetchImpl);
+	assert.match(extrasUpdated, /^coverage\[toml\]==7\.6\.0 \\$/m);
+	assert.match(extrasUpdated, /^    # via pytest-cov$/m);
+	// PyPI is queried for the project, not for the extras selector.
+	assert.ok(lookups.some((url) => url.includes("/pypi/coverage/7.6.0/json")));
+
+	// The marker decides whether the package installs at all, so re-emitting
+	// the requirement without it silently changes what CI installs.
+	const withMarker = `# Header
+tomli==2.0.1 ; python_version < "3.11" \\
+    --hash=sha256:${"3".repeat(64)}
+    # via pytest
+`;
+	const markerUpdated = await updateLockfileContent(withMarker, fetchImpl);
+	assert.match(markerUpdated, /^tomli==2\.0\.1 ; python_version < "3\.11" \\$/m);
+
+	// Anything this cannot parse must stop the rewrite rather than be omitted
+	// from it.
+	await assert.rejects(
+		() =>
+			updateLockfileContent(
+				`# Header\nfoo==1.0.0 unexpected-token \\\n    --hash=sha256:${"4".repeat(64)}\n`,
+				fetchImpl,
+			),
+		/cannot parse requirement line/,
+	);
+});
+
 // --------------------------------------------------------------------------
 // Renovate configuration & workflow contracts
 // --------------------------------------------------------------------------
