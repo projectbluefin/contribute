@@ -29,7 +29,7 @@ note() { printf 'hive-contribute: %s\n' "$1" >&2; }
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # A flat `key: value` subset of YAML, parsed here rather than with a YAML
-# dependency the distroless image would have to carry: the file has six keys
+# dependency the distroless image would have to carry: the file has nine keys
 # and an appliance that needs a parser to read its own config is not simpler
 # than one that does not.
 CONFIG_PATH="${HIVE_CONTRIBUTE_CONFIG:-${XDG_CONFIG_HOME:-${HOME}/.config}/hive-contribute.yml}"
@@ -45,6 +45,14 @@ DEFAULT_BACKEND="omp"
 # or `0` removes the ceiling.
 DEFAULT_MEMORY="4g"
 DEFAULT_CPUS="2"
+# Local inference is OFF unless the operator names an endpoint. An appliance
+# that pointed a contributor's agent at a local daemon on its own would change
+# which model does the assigned work — and whose hardware pays for it — without
+# anyone choosing that, so the three llmman keys default to empty and the
+# cloud-provider path is byte-for-byte what it is today until one is set.
+DEFAULT_LLMMAN=""
+DEFAULT_LLMMAN_TOKEN=""
+DEFAULT_LLMMAN_MODEL=""
 # Hive's own tracking branch. Nothing here pins a commit: the appliance runs
 # upstream's current contributor runtime, and registration is performed by that
 # same branch's contribute-setup, so both follow one line. They are not the
@@ -83,12 +91,18 @@ write_default_config() {
 # backend      agent CLI Hive drives inside the container
 # memory       RAM ceiling for the worker (also the microVM's size); none = no limit
 # cpus         CPU ceiling for the worker (also the microVM's vCPUs); none = no limit
+# llmman       OpenAI-compatible base URL of YOUR llmman daemon; empty = cloud only
+# llmman_token file holding that daemon's API key (0600); empty = unauthenticated
+# llmman_model model the daemon must serve; 'doctor' checks it is loaded there
 hub: ${hub}
 registration: ${DEFAULT_REGISTRATION}
 image: ${DEFAULT_IMAGE}
 backend: ${DEFAULT_BACKEND}
 memory: ${DEFAULT_MEMORY}
 cpus: ${DEFAULT_CPUS}
+llmman: ${DEFAULT_LLMMAN}
+llmman_token: ${DEFAULT_LLMMAN_TOKEN}
+llmman_model: ${DEFAULT_LLMMAN_MODEL}
 EOF
   chmod 600 "$CONFIG_PATH"
 }
@@ -109,6 +123,11 @@ load_config() {
   BACKEND="$(config_value backend)"
   MEMORY="$(config_value memory)"
   CPUS="$(config_value cpus)"
+  # The llmman keys get no fallback below: empty IS the setting, and writing an
+  # endpoint into this file is the only way to select local inference.
+  LLMMAN="$(config_value llmman)"
+  LLMMAN_TOKEN="$(config_value llmman_token)"
+  LLMMAN_MODEL="$(config_value llmman_model)"
   REGISTRATION="${REGISTRATION:-$DEFAULT_REGISTRATION}"
   IMAGE="${IMAGE:-$DEFAULT_IMAGE}"
   BACKEND="${BACKEND:-$DEFAULT_BACKEND}"
@@ -300,6 +319,137 @@ ensure_image() {
   note "using the locally cached ${IMAGE}; the registry copy could not be checked."
 }
 
+# ── Local inference (llmman) ─────────────────────────────────────────────────
+# Bluefin's Agent Mode runs llmman as a rootless user service bound to the
+# host's loopback address. A container cannot reach that by default — which is
+# the whole reason this appliance could not honestly offer to donate local
+# inference — and the fix is neither a host-home mount nor a daemon exposed to
+# the LAN. It is one endpoint the operator names, reached through one declared
+# transport, with the key passed the same way every other credential is.
+#
+# What crosses the boundary when it is selected: an OPENAI_BASE_URL naming the
+# operator's own daemon, and an OPENAI_API_KEY forwarded by name. Nothing else
+# changes — the same read-only registration mount, the same userns, the same
+# isolated home volume, the same credential allowlist.
+#
+# This is a CLIENT of one endpoint. It never advertises this machine as an
+# llmman peer, never binds a port, and never publishes anything to the LAN:
+# aggregating peers is llmman's own feature, configured in llmman, not here.
+
+# slirp4netns's gateway address. `allow_host_loopback=true` is precisely what
+# lets a container connect THROUGH that gateway to a service bound to the
+# host's 127.0.0.1; without it the host loopback is unreachable by design.
+# Podman's default rootless network mode does not offer that route, so the
+# local-inference path asks for this one by name — and only then.
+SLIRP_HOST_LOOPBACK="10.0.2.2"
+# An OpenAI-compatible client sends no request without an API key, and the
+# ordinary loopback llmman daemon accepts any value. Naming the placeholder
+# here is what keeps the operator's REAL OpenAI key out of a local daemon's
+# logs: on this path OPENAI_API_KEY is always the appliance's value.
+LLMMAN_UNAUTHENTICATED_KEY="llmman-local"
+
+LLMMAN_FAILURE=""
+LLMMAN_NETWORK_ARG=""
+LLMMAN_CONTAINER_URL=""
+LLMMAN_TRANSPORT=""
+LLMMAN_TOKEN_VALUE=""
+
+local_inference_selected() { [[ -n "${LLMMAN:-}" ]]; }
+
+resolve_llmman_endpoint() {
+  # Split the configured base URL and decide which transport reaches it, so
+  # both `run` and `doctor` answer from one place.
+  LLMMAN_FAILURE=""
+  LLMMAN_NETWORK_ARG=""
+  LLMMAN_CONTAINER_URL=""
+  LLMMAN_TRANSPORT=""
+  local url="$LLMMAN"
+  [[ "$url" =~ ^https?://[^[:space:]/]+(/[^[:space:]]*)?$ ]] || {
+    LLMMAN_FAILURE="llmman '${url}' in ${CONFIG_PATH} is not an http:// or https:// base URL"
+    return 1
+  }
+  local scheme="${url%%://*}" rest="${url#*://}"
+  local authority="${rest%%/*}" path=""
+  [[ "$rest" == */* ]] && path="/${rest#*/}"
+  local host="$authority" port=""
+  if [[ "$authority" == \[*\]* ]]; then
+    # A bracketed IPv6 literal: the colons inside the brackets are the address.
+    host="${authority%%\]*}]"
+    port="${authority#"$host"}"
+  elif [[ "$authority" == *:* ]]; then
+    host="${authority%%:*}"
+    port=":${authority##*:}"
+  fi
+  case "$host" in
+  localhost | 127.* | "[::1]")
+    LLMMAN_NETWORK_ARG="slirp4netns:allow_host_loopback=true"
+    LLMMAN_CONTAINER_URL="${scheme}://${SLIRP_HOST_LOOPBACK}${port}${path}"
+    LLMMAN_TRANSPORT="slirp4netns host loopback (${SLIRP_HOST_LOOPBACK})"
+    ;;
+  *)
+    # An endpoint the operator reached over the network already: the container's
+    # ordinary network reaches it too, and rewriting it would break it.
+    LLMMAN_CONTAINER_URL="$url"
+    LLMMAN_TRANSPORT="the container's ordinary network"
+    ;;
+  esac
+  return 0
+}
+
+resolve_llmman_token() {
+  # From a file, never from the config file itself and never from argv: the
+  # config records WHERE the key lives so the key is not copied into a second
+  # place with its own permissions to get wrong.
+  LLMMAN_FAILURE=""
+  LLMMAN_TOKEN_VALUE=""
+  [[ -n "${LLMMAN_TOKEN:-}" ]] || return 0
+  [[ -e "$LLMMAN_TOKEN" ]] || {
+    LLMMAN_FAILURE="llmman_token ${LLMMAN_TOKEN} does not exist"
+    return 1
+  }
+  [[ -r "$LLMMAN_TOKEN" ]] || {
+    LLMMAN_FAILURE="llmman_token ${LLMMAN_TOKEN} is not readable"
+    return 1
+  }
+  LLMMAN_TOKEN_VALUE="$(head -1 "$LLMMAN_TOKEN" | tr -d '\r\n')"
+  [[ -n "$LLMMAN_TOKEN_VALUE" ]] || {
+    LLMMAN_FAILURE="llmman_token ${LLMMAN_TOKEN} is empty"
+    return 1
+  }
+  return 0
+}
+
+llmman_probe() {
+  # A read-only GET of the OpenAI-compatible model list, used by `doctor` only:
+  # reachability, authentication, and which models are loaded are one answer
+  # from one request. Prints the HTTP status on the first line and the body
+  # after it; returns non-zero when the request itself never completed.
+  #
+  # The bearer token rides a `--config -` stanza on stdin rather than a `-H`
+  # argument, because a header on the command line is a credential in `ps`.
+  #
+  # It probes the HOST's URL, not the container's: doctor runs here, and the
+  # question is whether this machine's daemon is up before a worker starts.
+  local url="${LLMMAN%/}/models"
+  local stdin_config="" body status
+  [[ -n "$LLMMAN_TOKEN_VALUE" ]] &&
+    stdin_config="$(printf 'header = "Authorization: Bearer %s"\n' "$LLMMAN_TOKEN_VALUE")"
+  body="$(printf '%s\n' "$stdin_config" |
+    curl --silent --show-error --max-time 5 --config - --write-out '\n%{http_code}' "$url" 2>/dev/null)" ||
+    return 1
+  status="${body##*$'\n'}"
+  printf '%s\n%s' "$status" "${body%$'\n'*}"
+  return 0
+}
+
+llmman_served_models() {
+  # The `id` fields of an OpenAI-compatible /models response, without a JSON
+  # dependency: `doctor` runs on a host that needs no toolchain, and `jq` is a
+  # registration prerequisite rather than a launch one.
+  grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' |
+    sed -E 's/.*"([^"]+)"$/\1/' | sort -u
+}
+
 # ── Launch ───────────────────────────────────────────────────────────────────
 
 # Named, never valued, on the Podman path: the runtime resolves `--env NAME`
@@ -319,6 +469,18 @@ launch_once() {
   slug="$(instance_slug)"
 
   podman_ready || fail "${PODMAN_FAILURE}."
+  if local_inference_selected; then
+    # Refuse before pulling an image or touching a credential: a malformed
+    # endpoint is a typo in the one file the operator edits, and a worker that
+    # started anyway would run the assigned task on a cloud provider while its
+    # operator believed they were donating local inference.
+    resolve_llmman_endpoint || fail "${LLMMAN_FAILURE}. Run 'hive-contribute doctor'."
+    resolve_llmman_token || fail "${LLMMAN_FAILURE}. Run 'hive-contribute doctor'."
+    # The appliance's value, always — an operator who opted into their own
+    # daemon does not also ship their cloud OpenAI key to it.
+    export OPENAI_BASE_URL="$LLMMAN_CONTAINER_URL"
+    export OPENAI_API_KEY="${LLMMAN_TOKEN_VALUE:-$LLMMAN_UNAUTHENTICATED_KEY}"
+  fi
   ensure_image
   local name
   name="hive-contribute-${slug}-$(date +%s)-$$"
@@ -330,6 +492,18 @@ launch_once() {
   else
     note "${KVM_FAILURE}; running container worker without KVM boundary."
     echo "✓ starting container worker ${name}. Choose model and effort in OMP."
+  fi
+  if local_inference_selected; then
+    echo "✓ local inference: ${LLMMAN_CONTAINER_URL} over ${LLMMAN_TRANSPORT}"
+    if [[ -n "$LLMMAN_TOKEN_VALUE" ]]; then
+      echo "  authenticated from ${LLMMAN_TOKEN} (value not shown)"
+    else
+      echo "  unauthenticated: no llmman_token is configured"
+    fi
+    # Named, not imposed: OMP owns model choice, and the appliance saying which
+    # model the endpoint serves is not the same as choosing one for the agent.
+    [[ -n "${LLMMAN_MODEL:-}" ]] &&
+      echo "  select ${LLMMAN_MODEL} in OMP; the cloud providers you configured stay available."
   fi
 
   local args=(
@@ -350,6 +524,18 @@ launch_once() {
   [[ "$MEMORY" != none && "$MEMORY" != 0 ]] &&
     args+=(--memory "$MEMORY" --memory-swap "$MEMORY")
   [[ "$CPUS" != none && "$CPUS" != 0 ]] && args+=(--cpus "$CPUS")
+  # One route out, added only for a loopback endpoint. It replaces Podman's
+  # default rootless network mode for this run and nothing else: no published
+  # port, no host network namespace, no listener of our own.
+  if [[ -n "$LLMMAN_NETWORK_ARG" ]]; then
+    args+=(--network "$LLMMAN_NETWORK_ARG")
+  fi
+  # By value, because it is an address and not a secret — and a recorded one is
+  # how an operator proves afterwards which endpoint the worker actually used.
+  # The key beside it still crosses by name, with the rest of the credentials.
+  if local_inference_selected; then
+    args+=(--env "OPENAI_BASE_URL=${LLMMAN_CONTAINER_URL}")
+  fi
   # One GitHub account has one contributor identity per hub, so two relays
   # under the same account would collide on a single task slot. HIVE_SESSION
   # is the relay's own label for telling them apart, and an explicit EMPTY
@@ -478,6 +664,100 @@ run_doctor() {
   fi
   echo ""
 
+  # The whole point of this section: answer reachability, authentication, and
+  # model availability HERE, before a worker starts, rather than letting the
+  # operator discover a dead endpoint as a failed assignment.
+  echo "=== Local inference ==="
+  if ! local_inference_selected; then
+    echo "  - not selected; the worker uses whichever cloud provider you configured"
+    echo "    to donate local inference, set 'llmman: http://127.0.0.1:17434/v1' in ${CONFIG_PATH}"
+  elif ! resolve_llmman_endpoint; then
+    echo "  ✗ ${LLMMAN_FAILURE}"
+    fail_count=$((fail_count + 1))
+  else
+    echo "  ✓ ${LLMMAN} (the container reaches it as ${LLMMAN_CONTAINER_URL})"
+    pass=$((pass + 1))
+    local slirp=""
+    if [[ -z "$LLMMAN_NETWORK_ARG" ]]; then
+      echo "  ✓ transport: ${LLMMAN_TRANSPORT}"
+      pass=$((pass + 1))
+    else
+      # Podman is the authority on whether it can find slirp4netns: it resolves
+      # the helper through its own configuration, not only through PATH. A
+      # query that FAILS is a different answer from one that returns nothing —
+      # the first says this Podman cannot be asked, the second says the helper
+      # is absent — and only the second is a reason to refuse.
+      if slirp="$(podman info --format '{{.Host.Slirp4NetNS.Executable}}' 2>/dev/null)"; then
+        if [[ -n "$slirp" && "$slirp" != "<no value>" ]]; then
+          echo "  ✓ transport: ${LLMMAN_TRANSPORT}"
+          pass=$((pass + 1))
+        else
+          echo "  ✗ ${LLMMAN_TRANSPORT} needs slirp4netns, which Podman does not find"
+          echo "    install slirp4netns, or point 'llmman' at an address this host reaches over the network"
+          fail_count=$((fail_count + 1))
+        fi
+      else
+        echo "  ! Podman could not report slirp4netns; ${LLMMAN_TRANSPORT} is unverified"
+      fi
+    fi
+
+    local token_mode=""
+    if ! resolve_llmman_token; then
+      echo "  ✗ ${LLMMAN_FAILURE}"
+      fail_count=$((fail_count + 1))
+    elif [[ -n "$LLMMAN_TOKEN_VALUE" ]]; then
+      echo "  ✓ key read from ${LLMMAN_TOKEN} (value not shown)"
+      pass=$((pass + 1))
+      token_mode="$(stat -c '%a' "$LLMMAN_TOKEN" 2>/dev/null || true)"
+      [[ -n "$token_mode" && "${token_mode: -2}" != "00" ]] &&
+        echo "    ! ${LLMMAN_TOKEN} is mode ${token_mode}; 'chmod 600' keeps it to this account"
+    else
+      echo "  - no llmman_token configured; the endpoint is contacted unauthenticated"
+    fi
+
+    local response="" status="" body="" models=""
+    if ! command -v curl &>/dev/null; then
+      echo "  ✗ curl is required to verify the endpoint before a worker starts"
+      fail_count=$((fail_count + 1))
+    elif ! response="$(llmman_probe)"; then
+      echo "  ✗ ${LLMMAN%/}/models did not answer"
+      echo "    start your llmman service, then run this command again"
+      fail_count=$((fail_count + 1))
+    else
+      status="${response%%$'\n'*}"
+      # A status with nothing after it is a body-less answer, not a body that
+      # happens to equal the status.
+      [[ "$response" == *$'\n'* ]] && body="${response#*$'\n'}"
+      case "$status" in
+      200)
+        echo "  ✓ the endpoint answered and accepted this identity"
+        pass=$((pass + 1))
+        models="$(printf '%s' "$body" | llmman_served_models)"
+        if [[ -z "${LLMMAN_MODEL:-}" ]]; then
+          echo "  - no llmman_model configured; it serves: ${models//$'\n'/, }"
+        elif grep -qxF "$LLMMAN_MODEL" <<<"$models"; then
+          echo "  ✓ ${LLMMAN_MODEL} is loaded there"
+          pass=$((pass + 1))
+        else
+          echo "  ✗ ${LLMMAN_MODEL} is not loaded; it serves: ${models//$'\n'/, }"
+          fail_count=$((fail_count + 1))
+        fi
+        ;;
+      401 | 403)
+        echo "  ✗ the endpoint refused this identity (HTTP ${status})"
+        echo "    point 'llmman_token' at the key your daemon expects"
+        fail_count=$((fail_count + 1))
+        ;;
+      *)
+        echo "  ✗ the endpoint answered HTTP ${status:-<none>}, which is not an OpenAI-compatible model list"
+        fail_count=$((fail_count + 1))
+        ;;
+      esac
+    fi
+    unset LLMMAN_TOKEN_VALUE
+  fi
+  echo ""
+
   echo "${pass} checks passed, ${fail_count} failed."
   [[ "$fail_count" -eq 0 ]] || exit 1
 }
@@ -491,6 +771,9 @@ run_config() {
   echo "backend:      ${BACKEND}"
   echo "memory:       ${MEMORY}"
   echo "cpus:         ${CPUS}"
+  echo "llmman:       ${LLMMAN:-<unset: cloud providers only>}"
+  echo "llmman_token: ${LLMMAN_TOKEN:-<unset>}"
+  echo "llmman_model: ${LLMMAN_MODEL:-<unset>}"
   echo "hive ref:     ${HIVE_REF} (tracked, never pinned)"
 }
 

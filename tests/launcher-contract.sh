@@ -39,7 +39,9 @@ fake_bin="$scratch/bin"
 fake_home="$scratch/home"
 fake_kvm="$scratch/dev/kvm"
 podman_log="$scratch/podman.log"
+podman_env_log="$scratch/podman-env.log"
 curl_log="$scratch/curl.log"
+curl_stdin_log="$scratch/curl-stdin.log"
 gh_log="$scratch/gh.log"
 mkdir -p "$fake_bin" "$fake_home" "$scratch/dev"
 
@@ -62,7 +64,15 @@ if [[ "\${1:-}" == "--runtime=krun" ]]; then
   [[ "\${FAKE_PODMAN_NO_KRUN:-0}" == 1 ]] && exit 125
   shift
 fi
-[[ "\${1:-}" == info ]] && { [[ "\${FAKE_PODMAN_INFO_FAIL:-0}" == 1 ]] && exit 1 || exit 0; }
+if [[ "\${1:-}" == info ]]; then
+  [[ "\${FAKE_PODMAN_INFO_FAIL:-0}" != 1 ]] || exit 1
+  # Whether this host can carry the loopback transport at all. Unset FAKE
+  # variable = slirp4netns present; set-but-empty = Podman reports none.
+  if [[ "\${2:-}" == --format && "\${3:-}" == *Slirp4NetNS* ]]; then
+    printf '%s\n' "\${FAKE_PODMAN_SLIRP-/usr/bin/slirp4netns}"
+  fi
+  exit 0
+fi
 if [[ "\${1:-} \${2:-} \${3:-}" == "system connection list" ]]; then
   [[ "\${FAKE_PODMAN_REMOTE:-0}" != 1 ]] || printf 'remote\tssh://engine.example.test/run/podman.sock\tidentity\ttrue\n'
   exit 0
@@ -93,6 +103,11 @@ case "\${1:-} \${2:-}" in
     ;;
   "run "*)
     printf 'run %s\n' "\${*:2}" >>"$podman_log"
+    # \`--env NAME\` resolves from THIS process's environment, so what Podman
+    # sees here is exactly what the container would receive. Recording it is
+    # the only way to prove a by-name forward carried the right value.
+    printf 'OPENAI_API_KEY=%s\n' "\${OPENAI_API_KEY-<unset>}" >>"$podman_env_log"
+    printf 'OPENAI_BASE_URL=%s\n' "\${OPENAI_BASE_URL-<unset>}" >>"$podman_env_log"
     exit "\${FAKE_PODMAN_RUN_STATUS:-0}"
     ;;
 esac
@@ -125,10 +140,26 @@ chmod +x "$fake_bin/gh"
 # hub. This stub exists only so the `curl` prerequisite check in setup finds a
 # binary, and it records its argv so a future caller cannot start passing
 # credentials on a command line unnoticed.
+#
+# It doubles as the llmman endpoint `doctor` probes. That probe hands its
+# Authorization header to curl on STDIN (`--config -`), so stdin is recorded
+# separately: a header passed on argv would land in the log above instead,
+# which is the failure this separation exists to catch.
 cat >"$fake_bin/curl" <<EOF
 #!/usr/bin/env bash
 set -eu
 printf 'curl %s\n' "\$*" >>"$curl_log"
+case " \$* " in
+  *" --config - "*) cat >>"$curl_stdin_log" ;;
+esac
+if [[ "\${FAKE_LLMMAN_UNREACHABLE:-0}" == 1 ]]; then
+  echo "curl: (7) Failed to connect to 127.0.0.1 port 17434" >&2
+  exit 7
+fi
+if [[ -n "\${FAKE_LLMMAN_STATUS:-}" ]]; then
+  printf '%s' "\${FAKE_LLMMAN_BODY:-}"
+  printf '\n%s' "\${FAKE_LLMMAN_STATUS}"
+fi
 exit 0
 EOF
 chmod +x "$fake_bin/curl"
@@ -147,6 +178,8 @@ clean_env() {
   unset FAKE_PODMAN_INFO_FAIL FAKE_PODMAN_REMOTE FAKE_PODMAN_PULL_FAIL FAKE_PODMAN_IMAGE_EXISTS FAKE_PODMAN_NO_KRUN
   unset FAKE_PODMAN_RUN_STATUS
   unset FAKE_GH_AUTH_STATUS_FAIL FAKE_GH_TOKEN_FAIL FAKE_GH_TOKEN_VALUE
+  unset FAKE_PODMAN_SLIRP FAKE_LLMMAN_UNREACHABLE FAKE_LLMMAN_STATUS FAKE_LLMMAN_BODY
+  unset OPENAI_API_KEY OPENAI_BASE_URL
   rm -rf "${fake_home:?}"
   mkdir -p "$fake_home"
   cat >"$fake_bin/krun" <<'EOF'
@@ -155,7 +188,9 @@ exit 0
 EOF
   chmod +x "$fake_bin/krun"
   : >"$podman_log"
+  : >"$podman_env_log"
   : >"$curl_log"
+  : >"$curl_stdin_log"
   : >"$gh_log"
 }
 
@@ -594,6 +629,214 @@ EOF
   rm -f "$fake_bin/just" "$fake_bin/git" "$fake_bin/node"
 }
 
+# -----------------------------------------------------------------------------
+# Scenarios 8-10: an explicitly selected local llmman endpoint.
+#
+# Bluefin's Agent Mode binds llmman to the host loopback, which an isolated
+# container cannot reach. The appliance may offer to donate that inference only
+# when the operator names the endpoint themselves, and only without loosening
+# anything else: no host home mount, no wider credential allowlist, no key on a
+# command line, and no listener of our own.
+# -----------------------------------------------------------------------------
+
+# A registered, configured machine. `extra` is appended to the config file, so
+# each scenario below states only the llmman keys it is about.
+seed_configured_machine() {
+  local extra="${1:-}"
+  local config_file="$fake_home/.config/hive-contribute.yml"
+  mkdir -p "$fake_home/.config/hive"
+  cat >"$config_file" <<EOF
+hub: wss://hub.example.com/contribute
+registration: $fake_home/.config/hive/contributor.env
+image: ghcr.io/projectbluefin/contribute:stable
+backend: omp
+${extra}
+EOF
+  chmod 600 "$config_file"
+  printf 'HIVE_HUB=wss://hub.example.com/contribute\nHIVE_REGISTRATION_TOKEN=t\nCONTRIBUTOR_ID=c\n' \
+    >"$fake_home/.config/hive/contributor.env"
+  chmod 600 "$fake_home/.config/hive/contributor.env"
+  export FAKE_GH_TOKEN_VALUE="fake-doctor-gh-token"
+}
+
+# The default. Nothing about the cloud-provider path may change until someone
+# writes an endpoint into the config file.
+test_local_inference_off_by_default() {
+  clean_env
+  seed_configured_machine
+  export OPENAI_API_KEY="not-a-real-cloud-openai-key"
+
+  local output
+  output="$("$launcher" run)"
+  local run_cmd
+  run_cmd="$(grep '^run ' "$podman_log")"
+
+  assert_not_contains "$run_cmd" "OPENAI_BASE_URL" "no base URL without an explicit selection"
+  assert_not_contains "$run_cmd" "--network" "no network mode is chosen without an explicit selection"
+  assert_contains "$run_cmd" "--env OPENAI_API_KEY" "the configured cloud key is still forwarded by name"
+  assert_contains "$(cat "$podman_env_log")" "OPENAI_API_KEY=not-a-real-cloud-openai-key" \
+    "the cloud key reaches the container unchanged"
+  assert_not_contains "$output" "local inference" "no local-inference banner without a selection"
+
+  local doctor_out
+  doctor_out="$("$launcher" doctor)"
+  assert_contains "$doctor_out" "not selected" "doctor names local inference as unselected"
+  assert_contains "$doctor_out" "checks passed, 0 failed" "an unselected endpoint is not a failure"
+  assert_eq "$(cat "$curl_log")" "" "doctor must not probe an endpoint nobody selected"
+}
+
+# The opt-in, against the loopback daemon Agent Mode actually provisions.
+test_local_inference_loopback_opt_in() {
+  clean_env
+  local token_file="$fake_home/.config/llmman.token"
+  seed_configured_machine "llmman: http://127.0.0.1:17434/v1
+llmman_token: $token_file
+llmman_model: qwen3-coder-30b"
+  printf 'not-a-real-llmman-key\n' >"$token_file"
+  chmod 600 "$token_file"
+  # A cloud key the operator also has: it must not be what reaches their own
+  # daemon, and it must not be what the agent authenticates with here.
+  export OPENAI_API_KEY="not-a-real-cloud-openai-key"
+
+  local output
+  output="$("$launcher" run)"
+  local run_cmd
+  run_cmd="$(grep '^run ' "$podman_log")"
+
+  assert_contains "$run_cmd" "--network slirp4netns:allow_host_loopback=true" "documented loopback transport"
+  assert_contains "$run_cmd" "--env OPENAI_BASE_URL=http://10.0.2.2:17434/v1" "host loopback rewritten for the container"
+  assert_contains "$run_cmd" "--env OPENAI_API_KEY" "llmman key forwarded by name"
+  assert_contains "$output" "local inference: http://10.0.2.2:17434/v1" "launch names the endpoint in use"
+  assert_contains "$output" "select qwen3-coder-30b in OMP" "launch names the model without choosing it"
+
+  # End to end: what Podman would hand the container is the llmman key, not the
+  # operator's cloud key and not a value from anyone's argv.
+  assert_contains "$(cat "$podman_env_log")" "OPENAI_API_KEY=not-a-real-llmman-key" \
+    "the llmman key is what the container receives"
+  assert_not_contains "$run_cmd" "not-a-real-llmman-key" "llmman key value in argv"
+  assert_not_contains "$run_cmd" "not-a-real-cloud-openai-key" "cloud key value in argv"
+
+  # The isolation boundary is exactly what it was.
+  assert_contains "$run_cmd" "--userns keep-id:uid=65532,gid=65532" "userns unchanged"
+  assert_contains "$run_cmd" "--volume $fake_home/.config/hive/contributor.env:/home/hive/.config/hive/contributor.env:ro,z" \
+    "registration still mounted read-only"
+  assert_not_contains "$run_cmd" "--volume $fake_home:" "the host home must never be mounted"
+  assert_not_contains "$run_cmd" "--network=host" "the host network namespace must never be shared"
+  assert_not_contains "$run_cmd" "--privileged" "no privileged container"
+  assert_not_contains "$run_cmd" "--publish" "the appliance publishes no port of its own"
+  assert_eq "$(cat "$curl_log")" "" "run must not probe the endpoint; that is doctor's job"
+
+  # Unauthenticated is supported, and the operator's cloud key still must not
+  # be what talks to a local daemon.
+  : >"$podman_log"
+  : >"$podman_env_log"
+  sed -i "\|^llmman_token: |d" "$fake_home/.config/hive-contribute.yml"
+  output="$("$launcher" run)"
+  assert_contains "$output" "unauthenticated: no llmman_token is configured" "unauthenticated state is stated"
+  assert_contains "$(cat "$podman_env_log")" "OPENAI_API_KEY=llmman-local" \
+    "an unauthenticated endpoint receives the appliance placeholder, not the cloud key"
+}
+
+# An endpoint reached over the network needs no transport of ours, and a
+# malformed one must stop before a container exists.
+test_local_inference_network_endpoint_and_bad_url() {
+  clean_env
+  seed_configured_machine "llmman: https://ai.lan.example:17434/v1"
+
+  "$launcher" run >/dev/null
+  local run_cmd
+  run_cmd="$(grep '^run ' "$podman_log")"
+  assert_not_contains "$run_cmd" "--network" "a routable endpoint needs no special network mode"
+  assert_contains "$run_cmd" "--env OPENAI_BASE_URL=https://ai.lan.example:17434/v1" "URL passed through verbatim"
+
+  clean_env
+  seed_configured_machine "llmman: 127.0.0.1:17434"
+  local output status=0
+  output="$("$launcher" run 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "a malformed llmman endpoint must not start a worker"
+  assert_contains "$output" "is not an http:// or https:// base URL" "malformed endpoint named"
+  assert_eq "$(grep -c '^run ' "$podman_log" || true)" "0" "no container started for a malformed endpoint"
+}
+
+# doctor answers reachability, authentication, and model availability before a
+# worker exists, because the alternative is discovering a dead endpoint as a
+# failed assignment.
+test_doctor_verifies_local_endpoint() {
+  local models_body='{"object":"list","data":[{"id":"qwen3-coder-30b","object":"model"},{"id":"gemma3-12b","object":"model"}]}'
+  local token_file
+
+  # Healthy: reachable, authenticated, serving the configured model.
+  clean_env
+  token_file="$fake_home/.config/llmman.token"
+  seed_configured_machine "llmman: http://127.0.0.1:17434/v1
+llmman_token: $token_file
+llmman_model: qwen3-coder-30b"
+  printf 'not-a-real-llmman-key\n' >"$token_file"
+  chmod 600 "$token_file"
+  export FAKE_LLMMAN_STATUS=200
+  export FAKE_LLMMAN_BODY="$models_body"
+
+  local output status=0
+  output="$("$launcher" doctor 2>&1)" || status=$?
+  assert_eq "$status" "0" "doctor passes against a healthy llmman endpoint"
+  assert_contains "$output" "http://127.0.0.1:17434/v1 (the container reaches it as http://10.0.2.2:17434/v1)" \
+    "doctor reports both sides of the transport"
+  assert_contains "$output" "transport: slirp4netns host loopback" "doctor names the transport"
+  assert_contains "$output" "key read from ${token_file}" "doctor reports the key source"
+  assert_contains "$output" "answered and accepted this identity" "doctor reports reachability and auth"
+  assert_contains "$output" "qwen3-coder-30b is loaded there" "doctor reports model availability"
+  assert_not_contains "$output" "not-a-real-llmman-key" "doctor must never print the key"
+  assert_eq "$(cat "$podman_log")" "" "doctor must never run podman"
+  # The key travelled to curl on stdin, never on a command line.
+  grep -qF 'Authorization: Bearer not-a-real-llmman-key' "$curl_stdin_log" ||
+    fail "doctor did not authenticate its probe"
+  assert_not_contains "$(cat "$curl_log")" "not-a-real-llmman-key" "probe key in curl argv"
+
+  # Rejected key.
+  export FAKE_LLMMAN_STATUS=401
+  export FAKE_LLMMAN_BODY=""
+  status=0
+  output="$("$launcher" doctor 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "doctor must fail when the endpoint rejects the key"
+  assert_contains "$output" "refused this identity (HTTP 401)" "doctor reports an authentication failure"
+
+  # Unreachable daemon.
+  unset FAKE_LLMMAN_STATUS FAKE_LLMMAN_BODY
+  export FAKE_LLMMAN_UNREACHABLE=1
+  status=0
+  output="$("$launcher" doctor 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "doctor must fail when the endpoint does not answer"
+  assert_contains "$output" "did not answer" "doctor reports unreachability"
+  unset FAKE_LLMMAN_UNREACHABLE
+
+  # Reachable, but not serving the model the operator asked for.
+  export FAKE_LLMMAN_STATUS=200
+  export FAKE_LLMMAN_BODY='{"data":[{"id":"gemma3-12b"}]}'
+  status=0
+  output="$("$launcher" doctor 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "doctor must fail when the configured model is absent"
+  assert_contains "$output" "qwen3-coder-30b is not loaded; it serves: gemma3-12b" "doctor names what is served"
+
+  # A key file the operator pointed at but never created.
+  export FAKE_LLMMAN_BODY="$models_body"
+  rm -f "$token_file"
+  status=0
+  output="$("$launcher" doctor 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "doctor must fail on a missing key file"
+  assert_contains "$output" "does not exist" "doctor names the missing key file"
+
+  # The transport itself missing: slirp4netns is what carries the loopback
+  # route, and Podman is the one that knows whether it is there.
+  printf 'not-a-real-llmman-key\n' >"$token_file"
+  chmod 600 "$token_file"
+  export FAKE_PODMAN_SLIRP=""
+  status=0
+  output="$("$launcher" doctor 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "doctor must fail when the loopback transport is unavailable"
+  assert_contains "$output" "needs slirp4netns" "doctor names the missing transport"
+  unset FAKE_PODMAN_SLIRP
+}
+
 # --- Run all scenarios -------------------------------------------------------
 
 echo "1. Testing config creation and hub seeding..."
@@ -617,5 +860,17 @@ echo "4. Testing doctor preflight..."
 test_doctor_failures_and_success || exit 1
 echo "5. Testing setup against upstream's host-CLI preflight..."
 test_setup_satisfies_host_cli_probe || exit 1
+
+echo "6. Testing that local inference stays off until it is selected..."
+test_local_inference_off_by_default || exit 1
+
+echo "7. Testing the explicit loopback llmman opt-in..."
+test_local_inference_loopback_opt_in || exit 1
+
+echo "8. Testing a routable llmman endpoint and a malformed one..."
+test_local_inference_network_endpoint_and_bad_url || exit 1
+
+echo "9. Testing doctor's llmman reachability, authentication, and model checks..."
+test_doctor_verifies_local_endpoint || exit 1
 
 echo "launcher-contract: all tests passed."
