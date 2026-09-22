@@ -1,7 +1,7 @@
 ---
 name: launcher
 version: "5.5"
-last_updated: "2026-09-19"
+last_updated: "2026-09-22"
 id: launcher
 one_line_purpose: Change the hive-contribute launcher without breaking its runtime contracts.
 entry_point: docs/skills/launcher.md
@@ -43,6 +43,18 @@ The launcher creates the file on first run, seeding `hub` from an existing
 `~/.config/hive/contributor.env` if present. Setting `HIVE_CONTRIBUTE_CONFIG` points to an
 alternate configuration file.
 
+Under WSL2, keep `registration:` on the Linux filesystem (such as `~/.config/hive/contributor.env`), never on a Windows drive mount (`/mnt/c/...`). Windows DrvFs mounts do not preserve Linux file modes (`0600`) without explicit metadata configuration, silently exposing the contributor registration credential.
+
+## Supported platforms
+
+`hive-contribute` requires a Linux host environment. Both isolation tiers (KVM microVMs via `krun` and standard Podman rootless containers) depend on Linux kernel facilities (`/dev/kvm` and unprivileged user namespaces).
+
+- **Linux**: Supported natively (Podman with `/dev/kvm` and `krun` for hardware isolation, or standard rootless Podman containers).
+- **macOS**: Requires a Linux VM. Provision with Lima (`limactl start`). Run the launcher inside the guest VM.
+- **Windows**: Requires a Linux VM via WSL2. Provision with `wsl --install`. Run the launcher inside the WSL2 Linux distribution.
+
+When launched on a non-Linux host, `hive-contribute doctor` and `run` fail with a diagnostic naming the platform requirement ("this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2") instead of container errors.
+
 ## Authority boundary
 
 The contributor image contains Hive's worker runtime and OMP. Hive chooses the
@@ -70,7 +82,7 @@ if registry connectivity fails.
 - Pass secrets only through inherited environment names or documented private
   mounts. Never put values in arguments, logs, image layers, socket paths, SSH
   targets, or committed files.
-- Preserve `--userns keep-id:uid=65532,gid=65532` for the `0600` contributor registration.
+- Preserve `--userns keep-id:uid=65532,gid=65532` for the `0600` contributor registration. Under WSL2, keep this file on the Linux filesystem to ensure the `0600` mode is preserved.
 - The forwarded provider-credential allowlist names GitHub, Copilot, Anthropic,
   OpenAI, OpenRouter, Gemini, Google, and terminal variables, plus the Amazon Bedrock
   credentials `AWS_BEARER_TOKEN_BEDROCK`, `AWS_REGION`, and `AWS_DEFAULT_REGION`.

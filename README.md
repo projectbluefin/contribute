@@ -16,6 +16,18 @@ hive-contribute
 just contribute
 ```
 
+## Supported Platforms
+
+`hive-contribute` requires a **Linux** host environment. Both isolation tiers (KVM microVMs via `krun` and standard Podman containers) rely on Linux kernel facilities (`/dev/kvm` and unprivileged user namespaces). macOS and Windows hosts are supported by running inside a Linux virtual machine.
+
+| Host | Support | Provisioning Command |
+|---|---|---|
+| **Linux** | Native | Direct execution (requires Podman; `/dev/kvm` recommended for `krun` hardware isolation) |
+| **macOS** | Linux VM via Lima | `limactl start` (or install via `brew install lima && limactl start`), then run inside the VM |
+| **Windows** | Linux VM via WSL2 | `wsl --install` (e.g., Ubuntu distro), then run inside the WSL2 distro |
+
+On macOS and Windows, provision the Linux VM, install Podman and the required prerequisites inside the guest, and run `hive-contribute` from within that environment. Native execution directly on macOS or Windows command prompts is not supported.
+
 ## Installation
 
 Install `hive-contribute` onto your `PATH` or run directly from a checkout.
@@ -77,12 +89,16 @@ cpus: 2
 | `cpus` | CPU ceiling; `none` removes it | `2` (upstream's contributor envelope) |
 
 `memory` and `cpus` are enforced on Podman runs, where they size the microVM.
+
+> [!WARNING]
+> **WSL2 credential-mode hazard**: When running under WSL2, keep `registration:` on the Linux filesystem (e.g., `~/.config/hive/contributor.env`), never on a Windows drive mount (such as `/mnt/c/...`). Windows DrvFs mounts do not preserve Linux file modes (`0600`) without explicit metadata configuration, silently exposing the contributor registration credential.
+
 ## Isolation Model
 
 Every worker invocation runs inside an isolated container:
 
 - **libkrun microVM preferred**: When Podman, `krun`, and `/dev/kvm` are available, the launcher starts a hardware-isolated KVM microVM (`podman run --runtime=krun`). When KVM is unavailable, it runs standard Podman containers.
-- **Read-only credential mount**: Hive's `0600` registration file is mounted read-only at `/home/hive/.config/hive/contributor.env:ro`.
+- **Read-only credential mount**: Hive's `0600` registration file is mounted read-only at `/home/hive/.config/hive/contributor.env:ro`. In WSL2 environments, keep this credential on the Linux filesystem rather than a `/mnt/c` mount to preserve the `0600` permission mode.
 - **No host home mount**: The user's host `$HOME` is never mounted. The container runs as unprivileged user `hive` (uid/gid 65532) with its own isolated home volume.
 - **Foreground attach**: The container remains attached to the terminal in the foreground. Detached runs are unsupported; Ctrl-C stops the invocation cleanly.
 
