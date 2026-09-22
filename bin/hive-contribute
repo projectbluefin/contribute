@@ -300,6 +300,62 @@ ensure_image() {
   note "using the locally cached ${IMAGE}; the registry copy could not be checked."
 }
 
+# ── Provenance ───────────────────────────────────────────────────────────────
+# publish-contribute.yml pushes a Sigstore build-provenance attestation for
+# every published digest (actions/attest), and this launcher is the consumer
+# where it matters: it hands the image the operator's GitHub token and every
+# provider key it can find. Verify the provenance of what is about to run.
+#
+# Scope: only ghcr.io/projectbluefin/* refs. A localhost build, a *.sif file,
+# and an operator's explicit off-registry image are that operator's own trust
+# decision and are skipped. The check targets the DIGEST actually pulled, so a
+# tag moved between pull and launch cannot swap the bits under a green check.
+#
+# A host without gh warns and runs unverified, so minimal and offline hosts
+# keep working; a host with gh fails closed — an isolation appliance that
+# shrugs off a failed provenance check has no boundary left to offer.
+# HIVE_CONTRIBUTE_NO_VERIFY=1 is the operational escape hatch for a Sigstore
+# or GitHub API outage, and it says out loud that it is one.
+verify_image_provenance() {
+  local ref="$1"
+  [[ "$ref" == ghcr.io/projectbluefin/* ]] || return 0
+  if [[ "${HIVE_CONTRIBUTE_NO_VERIFY:-0}" == 1 ]]; then
+    note "HIVE_CONTRIBUTE_NO_VERIFY=1: launching ${ref} WITHOUT provenance verification."
+    return 0
+  fi
+  if ! command -v gh &>/dev/null; then
+    note "gh is unavailable; launching ${ref} WITHOUT provenance verification."
+    return 0
+  fi
+  # The attesting repository is the image path itself: ghcr.io/<owner>/<name>
+  # is published by github.com/<owner>/<name> for every image this guard
+  # covers.
+  local repo signer output
+  repo="${ref%%@*}"
+  repo="${repo%:*}"
+  signer="${repo#ghcr.io/}"
+  if ! output="$(gh attestation verify "oci://${ref}" --repo "$signer" 2>&1)"; then
+    note "$output"
+    fail "build-provenance verification failed for ${ref}; refusing to launch. If Sigstore or the GitHub API is down and you accept the risk yourself, relaunch with HIVE_CONTRIBUTE_NO_VERIFY=1."
+  fi
+  note "build provenance verified: ${ref}"
+}
+
+pulled_digest_ref() {
+  # The digest Podman actually stored for $IMAGE, as <repo>@sha256:<hex>, or
+  # nothing when Podman cannot say — the caller then verifies the tag ref
+  # rather than failing a launch over introspection.
+  local digest repo
+  digest="$(podman image inspect --format '{{.Digest}}' "$IMAGE" 2>/dev/null || true)"
+  case "$digest" in
+  sha256:[0-9a-f]*)
+    repo="${IMAGE%%@*}"
+    repo="${repo%:*}"
+    printf '%s@%s\n' "$repo" "$digest"
+    ;;
+  esac
+}
+
 # ── Launch ───────────────────────────────────────────────────────────────────
 
 # Named, never valued, on the Podman path: the runtime resolves `--env NAME`
@@ -320,6 +376,9 @@ launch_once() {
 
   podman_ready || fail "${PODMAN_FAILURE}."
   ensure_image
+  local verify_ref
+  verify_ref="$(pulled_digest_ref)"
+  verify_image_provenance "${verify_ref:-$IMAGE}"
   local name
   name="hive-contribute-${slug}-$(date +%s)-$$"
 
