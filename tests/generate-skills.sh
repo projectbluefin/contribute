@@ -11,6 +11,13 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # layer that produced it rather than as a confusing generator failure.
 bash "$repo_root/tests/check-skill-frontmatter-contract.sh"
 
+# The generator's helpers decide, one string at a time, whether a manifest
+# entry or a link in a fetched body may become a path. Those refusals are
+# invisible at this script's CLI boundary — a refused input and an input that
+# was never present produce the same projection — so run the unit contract that
+# reaches them before driving the generator end to end.
+python3 "$repo_root/tests/generate-skills-units.py"
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
