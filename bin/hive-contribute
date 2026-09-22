@@ -549,7 +549,7 @@ run_doctor() {
   if image_is_local_path; then
     echo "  ✓ ${IMAGE} (local)"
     pass=$((pass + 1))
-  elif command -v podman &>/dev/null && podman image exists "$IMAGE" &>/dev/null; then
+  elif host_is_linux && command -v podman &>/dev/null && podman image exists "$IMAGE" &>/dev/null; then
     echo "  ✓ ${IMAGE} is present locally"
     pass=$((pass + 1))
   else

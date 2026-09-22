@@ -74,6 +74,7 @@ case "\${1:-} \${2:-}" in
     exit 0
     ;;
   "image exists")
+    printf 'image exists %s\n' "\${*:3}" >>"$podman_log"
     [[ "\${FAKE_PODMAN_IMAGE_EXISTS:-1}" == 1 ]] && exit 0 || exit 1
     ;;
   "image inspect")
@@ -542,8 +543,11 @@ EOF
   assert_contains "$output_healthy" "a GitHub token is available for the agent" "doctor reports token ready"
   assert_contains "$output_healthy" "checks passed, 0 failed" "doctor summary passes"
 
-  # Never mounts credential / no container run recorded
-  assert_eq "$(cat "$podman_log")" "" "doctor must never run podman"
+  # Never mounts credential / no container run recorded. The image probe is the
+  # only podman call doctor may make, and it must be recorded so the non-Linux
+  # scenario below can prove doctor skips podman entirely.
+  assert_eq "$(grep -cE '^(run|pull|save) ' "$podman_log" || true)" "0" "doctor must never run podman"
+  assert_contains "$(cat "$podman_log")" "image exists" "doctor probes the local image cache on a Linux host"
 }
 # -----------------------------------------------------------------------------
 # Scenario 7: `setup` survives upstream's HOST-CLI preflight.
