@@ -137,8 +137,18 @@ test("post-upgrade pin synchronizers are handed a GitHub token", async () => {
 		names.some((name) => /^(GH_TOKEN|GITHUB_TOKEN|RENOVATE_TOKEN)$/.test(name)),
 		`customEnvVariables hands over ${names.join(", ")}, none of which the synchronizers read`,
 	);
+	// The token is read where the GitHub release lookup happens: either in the
+	// synchronizer itself or in the shared module it delegates that lookup to.
+	// Follow one hop rather than requiring every synchronizer to keep its own
+	// copy of the env-var chain.
 	for (const script of ["scripts/update-omp-pins.mjs", "scripts/update-gh-pins.mjs", "scripts/update-tmux-pins.mjs"]) {
-		const source = await readRepoFile(script);
-		assert.match(source, /process\.env\.(RENOVATE_TOKEN|GH_TOKEN|GITHUB_TOKEN)/, `${script} reads no token`);
+		const sources = [await readRepoFile(script)];
+		for (const [, relative] of sources[0].matchAll(/from "(\.[^"]+\.mjs)"/g)) {
+			sources.push(await readRepoFile(join(dirname(script), relative)));
+		}
+		assert.ok(
+			sources.some((source) => /process\.env\.(RENOVATE_TOKEN|GH_TOKEN|GITHUB_TOKEN)/.test(source)),
+			`${script} reads no token, and neither does any module it imports`,
+		);
 	}
 });

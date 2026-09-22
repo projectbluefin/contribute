@@ -114,6 +114,9 @@ Derived checksum automation for GitHub CLI, Node.js, tmux, and `requirements-ci.
 runs in their respective Renovate branches via `node scripts/update-gh-pins.mjs`,
 `node scripts/update-node-pins.mjs`, `node scripts/update-tmux-pins.mjs`, and
 `scripts/update-requirements-ci-hashes.mjs`.
+The OMP, GitHub CLI, Node.js, and tmux synchronizers are configuration over one
+shared implementation in `scripts/lib/release-pins.mjs`: change the pin-rewriting
+or release-lookup behaviour there, not in four places.
 
 ## Verification
 
