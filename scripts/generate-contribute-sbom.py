@@ -6,9 +6,7 @@ keeps name, version and externalRefs when it merges an embedded document, and
 drops the rest. A package therefore has to carry a purl locator to survive the
 merge with its identity intact, and the verified digest has to ride inside that
 locator as the purl spec's checksum qualifier rather than only in the SPDX
-``checksums`` block the merge discards. scripts/generate-appliance-sbom.py emits
-the same shape for the same reason; the two generators stay separate files
-because each is COPY-ed alone into its build stage.
+``checksums`` block the merge discards.
 """
 from __future__ import annotations
 
