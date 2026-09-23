@@ -71,6 +71,14 @@ COPY --chmod=0755 scripts/generate-contribute-sbom.py /usr/local/libexec/contrib
 # with seven ways to fail; and `bin/lib/` has to arrive as a directory anyway,
 # because upstream's image does `COPY bin/lib/` and naming one file inside it
 # would silently drop a module upstream added.
+# Each downloaded binary is verified against its pinned digest by
+# verify_digest, which NAMES the dependency, the pinned version and both
+# digests when they disagree. `sha256sum -c --status` was silent by
+# construction: a mismatch failed the build with no line of output, so a
+# version bumped without its digests — the exact failure this repository's pin
+# synchronizers exist to prevent — surfaced only as a 5KB "error building at
+# STEP RUN" with nothing in it saying which dependency, or that a digest was
+# involved at all.
 RUN set -eu; \
     hive_commit="${HIVE_COMMIT}"; \
     case "$hive_commit" in \
@@ -85,16 +93,23 @@ RUN set -eu; \
       *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
     esac; \
     workdir="$(mktemp -d)"; trap 'rm -rf "$workdir"' EXIT; \
+    verify_digest() { \
+      _want="$2"; _got="$(sha256sum "$3" | cut -d' ' -f1)"; \
+      [ "$_got" = "$_want" ] && return 0; \
+      echo "$1 $4 digest mismatch: pinned $_want, downloaded $_got" >&2; \
+      echo "the pinned digest does not belong to the pinned version — version and both architecture digests must be refreshed together (scripts/update-*-pins.mjs)" >&2; \
+      exit 1; \
+    }; \
     mkdir -p /out/usr/bin /out/usr/local/bin/lib /out/usr/local/etc/hive /out/usr/lib/hive /out/usr/share/hive/contribute /out/opt/hive/bin /out/etc/hive/restrictions; \
     curl --fail --location --show-error --silent "https://github.com/can1357/oh-my-pi/releases/download/v${OMP_VERSION}/${omp_asset}" -o "$workdir/omp"; \
-    printf '%s  %s\n' "$omp_sha" "$workdir/omp" | sha256sum -c --status; install -m 0755 "$workdir/omp" /out/usr/bin/omp; \
+    verify_digest OMP "$omp_sha" "$workdir/omp" "$OMP_VERSION"; install -m 0755 "$workdir/omp" /out/usr/bin/omp; \
     curl --fail --location --show-error --silent "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" -o "$workdir/node.tar.xz"; \
-    printf '%s  %s\n' "$node_sha" "$workdir/node.tar.xz" | sha256sum -c --status; tar --no-same-owner -xf "$workdir/node.tar.xz" -C "$workdir"; \
+    verify_digest Node "$node_sha" "$workdir/node.tar.xz" "$NODE_VERSION"; tar --no-same-owner -xf "$workdir/node.tar.xz" -C "$workdir"; \
     node_root="$workdir/node-v${NODE_VERSION}-linux-${node_arch}"; \
     curl --fail --location --show-error --silent "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gh_arch}.tar.gz" -o "$workdir/gh.tar.gz"; \
-    printf '%s  %s\n' "$gh_sha" "$workdir/gh.tar.gz" | sha256sum -c --status; tar -xzOf "$workdir/gh.tar.gz" --wildcards --occurrence=1 '*/bin/gh' > "$workdir/gh"; chmod 0755 "$workdir/gh"; \
+    verify_digest "GitHub CLI" "$gh_sha" "$workdir/gh.tar.gz" "$GH_VERSION"; tar -xzOf "$workdir/gh.tar.gz" --wildcards --occurrence=1 '*/bin/gh' > "$workdir/gh"; chmod 0755 "$workdir/gh"; \
     curl --fail --location --show-error --silent "https://github.com/tmux/tmux-builds/releases/download/v${TMUX_VERSION}/tmux-${TMUX_VERSION}-linux-${tmux_arch}.tar.gz" -o "$workdir/tmux.tar.gz"; \
-    printf '%s  %s\n' "$tmux_sha" "$workdir/tmux.tar.gz" | sha256sum -c --status; tar -xzOf "$workdir/tmux.tar.gz" --occurrence=1 tmux > "$workdir/tmux"; chmod 0755 "$workdir/tmux"; \
+    verify_digest tmux "$tmux_sha" "$workdir/tmux.tar.gz" "$TMUX_VERSION"; tar -xzOf "$workdir/tmux.tar.gz" --occurrence=1 tmux > "$workdir/tmux"; chmod 0755 "$workdir/tmux"; \
     PATH="$node_root/bin:$PATH" npm --prefix /src ci --omit=dev --ignore-scripts; \
     cp -a /src/node_modules /out/usr/lib/hive/node_modules; \
     /usr/local/libexec/stage-runtime /out "$node_root/bin/node" "$workdir/gh" "$workdir/tmux" /usr/bin/cmp; \
