@@ -48,7 +48,7 @@ All site configuration lives in **one file**:
 
 The launcher creates it on first run, seeding `hub` from an existing `~/.config/hive/contributor.env` if present. You can point `HIVE_CONTRIBUTE_CONFIG` at another path to run a second configuration.
 
-The configuration has six flat keys:
+The configuration has nine flat keys:
 
 ```yaml
 # hive-contribute — the whole appliance configuration.
@@ -59,12 +59,18 @@ The configuration has six flat keys:
 # backend      agent CLI Hive drives inside the container
 # memory       RAM ceiling for the worker (also the microVM's size); none = no limit
 # cpus         CPU ceiling for the worker (also the microVM's vCPUs); none = no limit
+# llmman       OpenAI-compatible base URL of YOUR llmman daemon; empty = cloud only
+# llmman_token file holding that daemon's API key (0600); empty = unauthenticated
+# llmman_model model the daemon must serve; 'doctor' checks it is loaded there
 hub: wss://hive.example.org/contribute
 registration: ~/.config/hive/contributor.env
 image: ghcr.io/projectbluefin/contribute:stable
 backend: omp
 memory: 4g
 cpus: 2
+llmman:
+llmman_token:
+llmman_model:
 ```
 
 | Key | Meaning | Default |
@@ -75,6 +81,9 @@ cpus: 2
 | `backend` | Agent CLI Hive drives inside the container | `omp` |
 | `memory` | RAM ceiling, swap pinned to it; `none` removes it | `4g` (upstream's contributor envelope) |
 | `cpus` | CPU ceiling; `none` removes it | `2` (upstream's contributor envelope) |
+| `llmman` | OpenAI-compatible base URL of your own llmman daemon | empty — the worker uses cloud providers only |
+| `llmman_token` | File holding that daemon's API key | empty — the endpoint is contacted unauthenticated |
+| `llmman_model` | Model the daemon must serve, verified by `doctor` | empty — `doctor` lists what is served instead |
 
 `memory` and `cpus` are enforced on Podman runs, where they size the microVM.
 ## Isolation Model
@@ -92,6 +101,42 @@ Every worker invocation runs inside an isolated container:
 - **`gh` is Hive's, not raw**: Inside the container, `gh` is upstream's `gh-wrapper.sh` with the real binary at `/opt/hive/bin/gh-real`, and contributor mode is a root-owned marker file the agent cannot forge. An assigned task cannot run `gh auth`, cannot issue a mutating `gh api`, and cannot reach any subcommand outside Hive's allowlist; read-only lookups stay available, and created issues and PRs are labelled `contributor/<login>` and `cli/omp`.
 - **Provider keys**: Only allowlisted provider environment variables (`COPILOT_GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`, etc.) are forwarded.
 - **Credential validity is Hive's**: The hub issues and rotates registration tokens, and its relay is what authenticates one. This launcher mounts the credential and nothing more — it does not validate, reissue, or relaunch on a rejected token. Repair a rejected registration with upstream's `contribute-move`.
+
+## Local Inference (Bluefin Agent Mode / llmman)
+
+Bluefin's Agent Mode runs [`llmman`](https://github.com/llmmanorg/llmman) as a rootless user service bound to the host's loopback address, which an isolated container cannot reach by default. The appliance can run its assigned work against that daemon — but only when you explicitly select it.
+
+**Local inference is off until you select it.** With `llmman` empty, the launch is byte-for-byte what it was: whatever cloud provider keys you have configured, and nothing else. Writing an endpoint into the config file is the selection:
+
+```yaml
+llmman: http://127.0.0.1:17434/v1
+llmman_token: ~/.config/llmman/api.key   # optional; 0600
+llmman_model: qwen3-coder-30b            # optional; verified by doctor and selected in OMP
+```
+
+Then check it before you run a worker:
+
+```bash
+hive-contribute doctor
+```
+
+`doctor` reports the endpoint and the transport, reads the key, and makes one read-only `GET` of the OpenAI-compatible model list — so reachability, authentication, and whether `llmman_model` is actually loaded are all answered before an assignment arrives, not after one fails.
+
+What crosses the isolation boundary when local inference is selected:
+
+- **The transport**: For a loopback endpoint, the run adds `--network slirp4netns:allow_host_loopback=true`, which makes the host loopback reachable from the container at `10.0.2.2`. **Important:** `allow_host_loopback=true` exposes the entire host loopback interface (`127.0.0.1`) to the worker at `10.0.2.2`, not just the `llmman` port. Operators should consider what other services are listening on `127.0.0.1`. A routable network endpoint is passed through unchanged with no custom network mode. Either way, the appliance publishes no ports of its own and starts no listeners.
+- **`OPENAI_BASE_URL`**, by value — it is an address, not a secret, and a recorded one is how you prove afterwards which endpoint the worker used.
+- **`OPENAI_API_KEY`**, by name, holding the contents of `llmman_token`. It is never written into the image, never placed on a command line, and never read from a mounted host home. With no `llmman_token`, the appliance sends its own placeholder rather than your cloud OpenAI key — an endpoint of your own does not get a credential minted for someone else.
+- **Model selection**: When `llmman_model` is configured, it is passed into the appliance and configured as OMP's default model selection (`openai/<model>` and `llmman/<model>`). The OpenAI provider slot is repurposed for the local endpoint, while other configured cloud providers (Anthropic, Gemini, Copilot, Bedrock, OpenRouter) remain available.
+
+### Donating worker capacity is not llmman peer aggregation
+
+Two different things share the word "local", and this appliance does exactly one of them:
+
+- **Donating worker capacity** (this repository): you run the contributor appliance, Hive assigns it work, and with `llmman` set that work is inferred on your own machine instead of a cloud provider. The appliance is a client of the endpoint you named.
+- **llmman peer aggregation** (llmman's own feature): one machine consumes another machine's llmman daemon over the network. That is configured in llmman with `llmman config set`, it is not something this launcher does, and nothing here advertises your daemon as a peer or opens it to the LAN.
+
+If you want your workstation's GPU to serve your laptop, that is llmman's aggregation, configured in llmman. If you want Hive's assigned work to run on hardware you own, that is the `llmman` key above.
 
 ## Upstream Tracking (Never Pinned)
 

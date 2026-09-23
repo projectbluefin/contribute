@@ -16,6 +16,38 @@ export COPILOT_INTEGRATION_ID="${COPILOT_INTEGRATION_ID:-copilot-developer-cli}"
 export COPILOT_GITHUB_TOKEN="${COPILOT_GITHUB_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
 export GITHUB_COPILOT_TOKEN="${GITHUB_COPILOT_TOKEN:-${COPILOT_GITHUB_TOKEN:-}}"
 
+# When local inference is configured with a model, provide OMP with the
+# provider and model configuration and select it as the default model role.
+if [[ -n "${LLMMAN_MODEL:-}" ]]; then
+  omp_agent_dir="${HOME}/.omp/agent"
+  mkdir -p "$omp_agent_dir"
+  cat >"${omp_agent_dir}/models.yml" <<EOF
+providers:
+  llmman:
+    baseUrl: "${OPENAI_BASE_URL:-http://10.0.2.2:17434/v1}"
+    api: openai-completions
+    apiKey: "${OPENAI_API_KEY:-llmman-local}"
+    models:
+      - id: "${LLMMAN_MODEL}"
+        name: "${LLMMAN_MODEL}"
+  openai:
+    baseUrl: "${OPENAI_BASE_URL:-http://10.0.2.2:17434/v1}"
+    api: openai-completions
+    apiKey: "${OPENAI_API_KEY:-llmman-local}"
+    models:
+      - id: "${LLMMAN_MODEL}"
+        name: "${LLMMAN_MODEL}"
+EOF
+  chmod 600 "${omp_agent_dir}/models.yml"
+  local_omp_config="${omp_agent_dir}/contribute-local.yml"
+  cat >"$local_omp_config" <<EOF
+modelRoles:
+  default: "openai/${LLMMAN_MODEL}"
+EOF
+  chmod 600 "$local_omp_config"
+  export PI_CONFIG_FILES="${PI_CONFIG_FILES:-/usr/share/hive/contribute/omp-config.yml}:${local_omp_config}"
+fi
+
 # The attach client must describe the terminal that actually renders tmux.
 # The base ships the full terminfo database, so the caller's TERM normally
 # resolves; the fallback covers terminals newer than the base's ncurses

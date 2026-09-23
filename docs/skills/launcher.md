@@ -1,7 +1,7 @@
 ---
 name: launcher
-version: "5.5"
-last_updated: "2026-09-19"
+version: "5.6"
+last_updated: "2026-09-23"
 id: launcher
 one_line_purpose: Change the hive-contribute launcher without breaking its runtime contracts.
 entry_point: docs/skills/launcher.md
@@ -36,9 +36,10 @@ recipes are thin wrappers around `bin/hive-contribute`.
 ## Configuration: One File
 
 All configuration lives in `${XDG_CONFIG_HOME:-~/.config}/hive-contribute.yml`.
-The file has six flat keys: `hub`, `registration`, `image`, `backend`, `memory`, and `cpus`.
+The file has nine flat keys: `hub`, `registration`, `image`, `backend`, `memory`, `cpus`, `llmman`, `llmman_token`, and `llmman_model`.
 `memory` and `cpus` carry upstream's contributor workload envelope (4 GiB, 2 CPUs), with
 swap pinned to the memory ceiling; `none` or `0` removes a ceiling.
+The three `llmman` keys default to empty, which is what keeps local inference off.
 The launcher creates the file on first run, seeding `hub` from an existing
 `~/.config/hive/contributor.env` if present. Setting `HIVE_CONTRIBUTE_CONFIG` points to an
 alternate configuration file.
@@ -91,6 +92,30 @@ if registry connectivity fails.
   anything here. Do not add a downstream validator, reissue call, or relaunch
   loop — that is Hive's protocol, and a second implementation of it drifts the
   moment upstream changes a message.
+
+## Local inference (llmman)
+
+Selecting a local endpoint is the operator's act, never a default and never
+inferred: with `llmman` empty the launch argv is what it has always been.
+When it is set:
+
+- A loopback endpoint gets `--network slirp4netns:allow_host_loopback=true`
+  and is rewritten to `10.0.2.2` for the container; a routable one is passed
+  through unchanged and gets no network mode of its own. Note that
+  `allow_host_loopback=true` exposes the host's entire loopback interface
+  (`127.0.0.1`) to the worker at `10.0.2.2`, not only the llmman port. Do not
+  publish a port, share the host network namespace, or start a listener.
+  Peer aggregation is llmman's own feature, configured in llmman.
+- `OPENAI_BASE_URL` crosses by value (an address, and an auditable one);
+  `OPENAI_API_KEY` crosses by name, holding the contents of `llmman_token`.
+  With no `llmman_token` the appliance sends its own placeholder rather than
+  the operator's cloud OpenAI key. The cloud OpenAI slot is repurposed for the
+  local endpoint while other configured cloud providers remain available.
+- `doctor` owns verification — endpoint, transport, key, one read-only `GET`
+  of the OpenAI-compatible model list, and whether `llmman_model` is loaded.
+  `run` never probes the hub or the endpoint.
+- When `llmman_model` is configured, it is passed into the appliance and
+  configured as OMP's default model selection.
 
 ## Verification
 
