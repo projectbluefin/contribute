@@ -135,6 +135,18 @@ instance_slug() {
 KVM_FAILURE=""
 PODMAN_FAILURE=""
 
+host_is_linux() {
+  if [[ -n "${HIVE_CONTRIBUTE_TEST_OS:-}" ]]; then
+    [[ "$HIVE_CONTRIBUTE_TEST_OS" == "Linux" ]]
+    return
+  fi
+  if command -v uname &>/dev/null; then
+    [[ "$(uname -s)" == "Linux" ]]
+    return
+  fi
+  [[ "${OSTYPE:-}" == linux* ]]
+}
+
 podman_is_local() {
   # A remote Podman engine would resolve bind mounts on the far side, where
   # this machine's credential file does not exist.
@@ -151,6 +163,10 @@ podman_is_local() {
 }
 
 podman_ready() {
+  host_is_linux || {
+    PODMAN_FAILURE="this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2"
+    return 1
+  }
   command -v podman &>/dev/null || { PODMAN_FAILURE="Podman is unavailable"; return 1; }
   podman info &>/dev/null || { PODMAN_FAILURE="Podman is not reachable"; return 1; }
   podman_is_local || { PODMAN_FAILURE="Podman targets a remote engine"; return 1; }
@@ -425,6 +441,7 @@ launch_once() {
 }
 
 run_worker() {
+  host_is_linux || fail "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2."
   load_config
   # Registration comes first, and the hub check follows it. A fresh machine has
   # neither, and demanding the hub up front turned the one command this
@@ -467,7 +484,10 @@ run_doctor() {
 
   echo "=== Isolation runtime ==="
   KVM_FAILURE=""
-  if kvm_runtime_ready; then
+  if ! host_is_linux; then
+    echo "  ✗ this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2"
+    fail_count=$((fail_count + 1))
+  elif kvm_runtime_ready; then
     echo "  ✓ Podman krun KVM runtime ready"
     pass=$((pass + 1))
   elif podman_ready; then
@@ -529,7 +549,7 @@ run_doctor() {
   if image_is_local_path; then
     echo "  ✓ ${IMAGE} (local)"
     pass=$((pass + 1))
-  elif command -v podman &>/dev/null && podman image exists "$IMAGE" &>/dev/null; then
+  elif host_is_linux && command -v podman &>/dev/null && podman image exists "$IMAGE" &>/dev/null; then
     echo "  ✓ ${IMAGE} is present locally"
     pass=$((pass + 1))
   else
@@ -557,6 +577,7 @@ case "${1:-run}" in
 run) run_worker ;;
 doctor) run_doctor ;;
 setup)
+  host_is_linux || fail "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2."
   load_config
   run_setup
   ;;

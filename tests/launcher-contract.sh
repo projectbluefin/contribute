@@ -74,6 +74,7 @@ case "\${1:-} \${2:-}" in
     exit 0
     ;;
   "image exists")
+    printf 'image exists %s\n' "\${*:3}" >>"$podman_log"
     [[ "\${FAKE_PODMAN_IMAGE_EXISTS:-1}" == 1 ]] && exit 0 || exit 1
     ;;
   "image inspect")
@@ -151,6 +152,7 @@ clean_env() {
   export HIVE_CONTRIBUTE_TEST_KVM_DEVICE="$fake_kvm"
   unset HIVE_CONTRIBUTE_CONFIG
   unset HIVE_CONTRIBUTE_TEST_HOST_ROOT
+  unset HIVE_CONTRIBUTE_TEST_OS
   unset HUB REGISTRATION IMAGE BACKEND
   unset GH_TOKEN GITHUB_TOKEN
   unset FAKE_PODMAN_INFO_FAIL FAKE_PODMAN_REMOTE FAKE_PODMAN_PULL_FAIL FAKE_PODMAN_IMAGE_EXISTS FAKE_PODMAN_NO_KRUN
@@ -541,8 +543,11 @@ EOF
   assert_contains "$output_healthy" "a GitHub token is available for the agent" "doctor reports token ready"
   assert_contains "$output_healthy" "checks passed, 0 failed" "doctor summary passes"
 
-  # Never mounts credential / no container run recorded
-  assert_eq "$(cat "$podman_log")" "" "doctor must never run podman"
+  # Never mounts credential / no container run recorded. The image probe is the
+  # only podman call doctor may make, and it must be recorded so the non-Linux
+  # scenario below can prove doctor skips podman entirely.
+  assert_eq "$(grep -cE '^(run|pull|save) ' "$podman_log" || true)" "0" "doctor must never run podman"
+  assert_contains "$(cat "$podman_log")" "image exists" "doctor probes the local image cache on a Linux host"
 }
 # -----------------------------------------------------------------------------
 # Scenario 7: `setup` survives upstream's HOST-CLI preflight.
@@ -649,6 +654,69 @@ EOF
   rm -f "$fake_bin/just" "$fake_bin/git" "$fake_bin/node"
 }
 
+# -----------------------------------------------------------------------------
+# Scenario 6: non-Linux host contract (#646). When run on macOS or Windows,
+#             doctor and run must name the platform requirement and Lima/WSL2
+#             remediation rather than failing on remote or missing container engines.
+# -----------------------------------------------------------------------------
+test_non_linux_host_rejection() {
+  clean_env
+  export HIVE_CONTRIBUTE_TEST_OS="Darwin"
+
+  local config_file="$fake_home/.config/hive-contribute.yml"
+  mkdir -p "$fake_home/.config/hive"
+  cat >"$config_file" <<EOF
+hub: wss://hub.example.com/contribute
+registration: $fake_home/.config/hive/contributor.env
+image: ghcr.io/projectbluefin/contribute:stable
+backend: omp
+EOF
+  chmod 600 "$config_file"
+  printf 'HIVE_HUB=wss://hub.example.com/contribute\nHIVE_REGISTRATION_TOKEN=t\nCONTRIBUTOR_ID=c\n' \
+    >"$fake_home/.config/hive/contributor.env"
+  chmod 600 "$fake_home/.config/hive/contributor.env"
+
+  # 1. `run` fails with platform requirement message
+  set +e
+  local run_output run_status
+  run_output="$("$launcher" run 2>&1)"
+  run_status=$?
+  set -e
+  [[ "$run_status" -ne 0 ]] || fail "run must fail on non-Linux host"
+  assert_contains "$run_output" "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2" "run names platform requirement"
+  assert_eq "$(cat "$podman_log")" "" "no podman run recorded on non-Linux host"
+
+  # 2. `doctor` fails with platform requirement message
+  export FAKE_GH_TOKEN_VALUE="fake-doctor-gh-token"
+  set +e
+  local doc_output doc_status
+  doc_output="$("$launcher" doctor 2>&1)"
+  doc_status=$?
+  set -e
+  [[ "$doc_status" -ne 0 ]] || fail "doctor must fail on non-Linux host"
+  assert_contains "$doc_output" "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2" "doctor names platform requirement"
+  assert_eq "$(cat "$podman_log")" "" "doctor must never run podman on non-Linux host"
+
+  # 3. Windows (MINGW) host behaves identically
+  export HIVE_CONTRIBUTE_TEST_OS="MINGW64_NT-10.0"
+  set +e
+  local win_output win_status
+  win_output="$("$launcher" run 2>&1)"
+  win_status=$?
+  set -e
+  [[ "$win_status" -ne 0 ]] || fail "run must fail on Windows host"
+  assert_contains "$win_output" "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2" "Windows run names platform requirement"
+
+  # 4. `setup` fails with platform requirement message
+  set +e
+  local setup_output setup_status
+  setup_output="$("$launcher" setup 2>&1)"
+  setup_status=$?
+  set -e
+  [[ "$setup_status" -ne 0 ]] || fail "setup must fail on non-Linux host"
+  assert_contains "$setup_output" "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2" "setup names platform requirement"
+}
+
 # --- Run all scenarios -------------------------------------------------------
 
 echo "1. Testing config creation and hub seeding..."
@@ -674,5 +742,7 @@ echo "4. Testing doctor preflight..."
 test_doctor_failures_and_success || exit 1
 echo "5. Testing setup against upstream's host-CLI preflight..."
 test_setup_satisfies_host_cli_probe || exit 1
+echo "6. Testing non-Linux host rejection..."
+test_non_linux_host_rejection || exit 1
 
 echo "launcher-contract: all tests passed."
