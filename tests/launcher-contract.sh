@@ -997,5 +997,4 @@ test_local_inference_network_endpoint_and_bad_url || exit 1
 echo "10. Testing doctor's llmman reachability, authentication, and model checks..."
 test_doctor_verifies_local_endpoint || exit 1
 
-
 echo "launcher-contract: all tests passed."
