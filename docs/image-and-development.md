@@ -7,7 +7,8 @@ The repository ships one OMP-owned image:
 
 The image does not select a provider, model, or thinking effort. OMP resolves those
 inside the appliance. Local launchers prefer Podman's `krun` runtime and KVM,
-and run standard Podman containers when KVM is unavailable.
+and run standard Podman containers when KVM is unavailable. The appliance requires
+a Linux host environment (or a Linux VM on macOS via Lima or Windows via WSL2).
 The image uses FSDK base images (`ghcr.io/projectbluefin/base:26.08`, used as a build input location)
 pinned by tag and digest, and pins fetched binary release assets by
 architecture-specific SHA-256. The contributor image installs the root

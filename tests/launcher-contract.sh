@@ -84,6 +84,7 @@ case "\${1:-} \${2:-}" in
     exit 0
     ;;
   "image exists")
+    printf 'image exists %s\n' "\${*:3}" >>"$podman_log"
     [[ "\${FAKE_PODMAN_IMAGE_EXISTS:-1}" == 1 ]] && exit 0 || exit 1
     ;;
   "image inspect")
@@ -150,11 +151,6 @@ chmod +x "$fake_bin/gh"
 # hub. This stub exists only so the `curl` prerequisite check in setup finds a
 # binary, and it records its argv so a future caller cannot start passing
 # credentials on a command line unnoticed.
-#
-# It doubles as the llmman endpoint `doctor` probes. That probe hands its
-# Authorization header to curl on STDIN (`--config -`), so stdin is recorded
-# separately: a header passed on argv would land in the log above instead,
-# which is the failure this separation exists to catch.
 cat >"$fake_bin/curl" <<EOF
 #!/usr/bin/env bash
 set -eu
@@ -183,6 +179,7 @@ clean_env() {
   export HIVE_CONTRIBUTE_TEST_KVM_DEVICE="$fake_kvm"
   unset HIVE_CONTRIBUTE_CONFIG
   unset HIVE_CONTRIBUTE_TEST_HOST_ROOT
+  unset HIVE_CONTRIBUTE_TEST_OS
   unset HUB REGISTRATION IMAGE BACKEND
   unset GH_TOKEN GITHUB_TOKEN
   unset FAKE_PODMAN_INFO_FAIL FAKE_PODMAN_REMOTE FAKE_PODMAN_PULL_FAIL FAKE_PODMAN_IMAGE_EXISTS FAKE_PODMAN_NO_KRUN
@@ -577,8 +574,11 @@ EOF
   assert_contains "$output_healthy" "a GitHub token is available for the agent" "doctor reports token ready"
   assert_contains "$output_healthy" "checks passed, 0 failed" "doctor summary passes"
 
-  # Never mounts credential / no container run recorded
-  assert_eq "$(cat "$podman_log")" "" "doctor must never run podman"
+  # Never mounts credential / no container run recorded. The image probe is the
+  # only podman call doctor may make, and it must be recorded so the non-Linux
+  # scenario below can prove doctor skips podman entirely.
+  assert_eq "$(grep -cE '^(run|pull|save) ' "$podman_log" || true)" "0" "doctor must never run podman"
+  assert_contains "$(cat "$podman_log")" "image exists" "doctor probes the local image cache on a Linux host"
 }
 # -----------------------------------------------------------------------------
 # Scenario 7: `setup` survives upstream's HOST-CLI preflight.
@@ -685,6 +685,69 @@ EOF
   rm -f "$fake_bin/just" "$fake_bin/git" "$fake_bin/node"
 }
 
+# -----------------------------------------------------------------------------
+# Scenario 6: non-Linux host contract (#646). When run on macOS or Windows,
+#             doctor and run must name the platform requirement and Lima/WSL2
+#             remediation rather than failing on remote or missing container engines.
+# -----------------------------------------------------------------------------
+test_non_linux_host_rejection() {
+  clean_env
+  export HIVE_CONTRIBUTE_TEST_OS="Darwin"
+
+  local config_file="$fake_home/.config/hive-contribute.yml"
+  mkdir -p "$fake_home/.config/hive"
+  cat >"$config_file" <<EOF
+hub: wss://hub.example.com/contribute
+registration: $fake_home/.config/hive/contributor.env
+image: ghcr.io/projectbluefin/contribute:stable
+backend: omp
+EOF
+  chmod 600 "$config_file"
+  printf 'HIVE_HUB=wss://hub.example.com/contribute\nHIVE_REGISTRATION_TOKEN=t\nCONTRIBUTOR_ID=c\n' \
+    >"$fake_home/.config/hive/contributor.env"
+  chmod 600 "$fake_home/.config/hive/contributor.env"
+
+  # 1. `run` fails with platform requirement message
+  set +e
+  local run_output run_status
+  run_output="$("$launcher" run 2>&1)"
+  run_status=$?
+  set -e
+  [[ "$run_status" -ne 0 ]] || fail "run must fail on non-Linux host"
+  assert_contains "$run_output" "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2" "run names platform requirement"
+  assert_eq "$(cat "$podman_log")" "" "no podman run recorded on non-Linux host"
+
+  # 2. `doctor` fails with platform requirement message
+  export FAKE_GH_TOKEN_VALUE="fake-doctor-gh-token"
+  set +e
+  local doc_output doc_status
+  doc_output="$("$launcher" doctor 2>&1)"
+  doc_status=$?
+  set -e
+  [[ "$doc_status" -ne 0 ]] || fail "doctor must fail on non-Linux host"
+  assert_contains "$doc_output" "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2" "doctor names platform requirement"
+  assert_eq "$(cat "$podman_log")" "" "doctor must never run podman on non-Linux host"
+
+  # 3. Windows (MINGW) host behaves identically
+  export HIVE_CONTRIBUTE_TEST_OS="MINGW64_NT-10.0"
+  set +e
+  local win_output win_status
+  win_output="$("$launcher" run 2>&1)"
+  win_status=$?
+  set -e
+  [[ "$win_status" -ne 0 ]] || fail "run must fail on Windows host"
+  assert_contains "$win_output" "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2" "Windows run names platform requirement"
+
+  # 4. `setup` fails with platform requirement message
+  set +e
+  local setup_output setup_status
+  setup_output="$("$launcher" setup 2>&1)"
+  setup_status=$?
+  set -e
+  [[ "$setup_status" -ne 0 ]] || fail "setup must fail on non-Linux host"
+  assert_contains "$setup_output" "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2" "setup names platform requirement"
+}
+
 # A registered, configured machine. `extra` is appended to the config file, so
 # each scenario below states only the llmman keys it is about.
 seed_configured_machine() {
@@ -705,7 +768,7 @@ EOF
   export FAKE_GH_TOKEN_VALUE="fake-doctor-gh-token"
 }
 
-# 6. Local inference stays off until explicitly configured: cloud provider
+# 7. Local inference stays off until explicitly configured: cloud provider
 # keys are forwarded untouched, no loopback transport or URL override is
 # applied, and doctor does not require a local daemon.
 test_local_inference_off_by_default() {
@@ -728,7 +791,7 @@ test_local_inference_off_by_default() {
     "doctor reports local inference not selected"
 }
 
-# 7. Local inference opt-in: loopback endpoint gets slirp4netns host loopback,
+# 8. Local inference opt-in: loopback endpoint gets slirp4netns host loopback,
 # rewrites to 10.0.2.2, forwards OPENAI_BASE_URL, passes LLMMAN_MODEL, and
 # replaces OPENAI_API_KEY with the token file's value. Cloud key is NOT forwarded.
 test_local_inference_loopback_opt_in() {
@@ -844,7 +907,7 @@ llmman_model: qwen3-coder-30b"
   assert_contains "$output" "answered and accepted this identity" "doctor reports reachability and auth"
   assert_contains "$output" "qwen3-coder-30b is loaded there" "doctor reports model availability"
   assert_not_contains "$output" "not-a-real-llmman-key" "doctor must never print the key"
-  assert_eq "$(cat "$podman_log")" "" "doctor must never run podman"
+  assert_eq "$(grep -cE '^(run|pull|save) ' "$podman_log" || true)" "0" "doctor must never run podman"
   # The key travelled to curl on stdin, never on a command line.
   grep -qF 'Authorization: Bearer not-a-real-llmman-key' "$curl_stdin_log" ||
     fail "doctor did not authenticate its probe"
@@ -920,17 +983,19 @@ echo "4. Testing doctor preflight..."
 test_doctor_failures_and_success || exit 1
 echo "5. Testing setup against upstream's host-CLI preflight..."
 test_setup_satisfies_host_cli_probe || exit 1
-
-echo "6. Testing that local inference stays off until it is selected..."
+echo "6. Testing non-Linux host rejection..."
+test_non_linux_host_rejection || exit 1
+echo "7. Testing that local inference stays off until it is selected..."
 test_local_inference_off_by_default || exit 1
 
-echo "7. Testing the explicit loopback llmman opt-in..."
+echo "8. Testing the explicit loopback llmman opt-in..."
 test_local_inference_loopback_opt_in || exit 1
 
-echo "8. Testing a routable llmman endpoint and a malformed one..."
+echo "9. Testing a routable llmman endpoint and a malformed one..."
 test_local_inference_network_endpoint_and_bad_url || exit 1
 
-echo "9. Testing doctor's llmman reachability, authentication, and model checks..."
+echo "10. Testing doctor's llmman reachability, authentication, and model checks..."
 test_doctor_verifies_local_endpoint || exit 1
+
 
 echo "launcher-contract: all tests passed."

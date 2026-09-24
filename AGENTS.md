@@ -81,6 +81,15 @@ write a section explaining it. See [`docs/skills/upstream-hive.md`](docs/skills/
 
 Local repository contracts take precedence. Treat the rules in this file as binding.
 
+## PR rules
+
+- PR titles follow Conventional Commits (`feat:`, `fix:`, `chore:`, `docs:`,
+  `style:`, `refactor:`, `perf:`, `test:`, `ci:`, `build:`, `revert:`), enforced
+  by the required `conventional-title` check. The type must be the first token
+  in the title — any prefix before it fails the check. The description is
+  free-form, so trailing annotations are fine. This repository squash-merges, so
+  the PR title becomes the permanent commit subject.
+
 ## Context sources
 
 - Upstream Hive repository: `https://github.com/hivecommons/hive`
