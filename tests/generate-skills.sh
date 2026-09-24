@@ -18,6 +18,12 @@ bash "$repo_root/tests/check-skill-frontmatter-contract.sh"
 # reaches them before driving the generator end to end.
 python3 "$repo_root/tests/generate-skills-units.py"
 
+# The helpers only advise; project_direct_source and project_manifest decide.
+# A refusal there is equally invisible here — a refused manifest entry and an
+# entry that was never present produce the identical projection — so assert the
+# skip reasons directly before driving the generator end to end.
+python3 "$repo_root/tests/generate-skills-projection-units.py"
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
