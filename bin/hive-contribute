@@ -101,11 +101,12 @@ EOF
 
 load_config() {
   if [[ ! -f "$CONFIG_PATH" ]]; then
-    # Seed from an existing Hive registration when there is one: the hub is the
-    # single value this launcher cannot invent, and Hive already wrote it.
+    # Seed from an existing Hive registration first; fall back to explicit default:
     local seeded=""
-    [[ -f "$DEFAULT_REGISTRATION" ]] &&
+    if [[ -f "$DEFAULT_REGISTRATION" ]]; then
       seeded="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?HIVE_HUB[[:space:]]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\2/p' "$DEFAULT_REGISTRATION" | head -1)"
+    fi
+    seeded="${seeded:-${HIVE_CONTRIBUTE_DEFAULT_HUB:-}}"
     write_default_config "$seeded"
     note "wrote ${CONFIG_PATH}"
   fi
@@ -548,6 +549,8 @@ launch_once() {
     echo "✓ starting isolated KVM worker ${name}. Choose model and effort in OMP."
   else
     note "${KVM_FAILURE}; running container worker without KVM boundary."
+    note "warning: neither KVM/krun nor gVisor (runsc) container isolation is active."
+    note "distro maintainers: see projectbluefin/dakota#1576, dakota#1667, and bluefin#1139 to enable container isolation by default."
     echo "✓ starting container worker ${name}. Choose model and effort in OMP."
   fi
   if local_inference_selected; then
@@ -582,6 +585,8 @@ launch_once() {
   [[ "$MEMORY" != none && "$MEMORY" != 0 ]] &&
     args+=(--memory "$MEMORY" --memory-swap "$MEMORY")
   [[ "$CPUS" != none && "$CPUS" != 0 ]] && args+=(--cpus "$CPUS")
+  # Scheduler niceness: lower CPU weight so background agent yields to desktop tasks.
+  args+=(--cpu-shares 512)
   # Opting into a loopback endpoint uses slirp4netns:allow_host_loopback=true,
   # which exposes the host loopback interface (127.0.0.1) to the worker at
   # 10.0.2.2. A routable network endpoint needs no custom network mode.

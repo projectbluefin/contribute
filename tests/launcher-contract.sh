@@ -238,6 +238,18 @@ EOF
   file_content="$(<"$config_file")"
   assert_contains "$file_content" "hub: wss://existing-hub.example.com/contribute" "saved hub in yaml"
   assert_contains "$file_content" "backend: omp" "saved backend in yaml"
+  # Seeding via HIVE_CONTRIBUTE_DEFAULT_HUB environment variable
+  clean_env
+  local explicit_hub_cfg="$fake_home/.config/hive-contribute.yml"
+  HIVE_CONTRIBUTE_DEFAULT_HUB="wss://default-hive.example.com/contribute" "$launcher" config >/dev/null
+  assert_contains "$(<"$explicit_hub_cfg")" "hub: wss://default-hive.example.com/contribute" "hub seeded from HIVE_CONTRIBUTE_DEFAULT_HUB"
+  # Registration hub beats HIVE_CONTRIBUTE_DEFAULT_HUB
+  clean_env
+  mkdir -p "$fake_home/.config/hive"
+  printf 'HIVE_HUB=wss://registration-hub.example.com/contribute\n' >"$fake_home/.config/hive/contributor.env"
+  local winner_cfg="$fake_home/.config/hive-contribute.yml"
+  HIVE_CONTRIBUTE_DEFAULT_HUB="wss://default-hive.example.com/contribute" "$launcher" config >/dev/null
+  assert_contains "$(<"$winner_cfg")" "hub: wss://registration-hub.example.com/contribute" "registration hub beats HIVE_CONTRIBUTE_DEFAULT_HUB"
 }
 
 # -----------------------------------------------------------------------------
@@ -357,6 +369,8 @@ EOF
   assert_contains "$run_cmd" "--memory 4g" "memory ceiling"
   assert_contains "$run_cmd" "--memory-swap 4g" "swap pinned to memory ceiling"
   assert_contains "$run_cmd" "--cpus 2" "cpu ceiling"
+  assert_contains "$run_cmd" "--cpu-shares 512" "cpu-shares set to 512"
+  assert_contains "$run_cmd" "--volume hive-contribute-hive-52128202:/home/hive:rw" "home/workspace volume mounted rw"
   assert_contains "$run_cmd" "ghcr.io/projectbluefin/contribute:stable" "image name"
 
   # Provenance is verified against the digest Podman actually pulled, not the
@@ -451,6 +465,8 @@ EOF
   output="$("$launcher" run 2>&1)"
   assert_contains "$output" "running container worker without KVM boundary" "warns about missing KVM"
   assert_contains "$output" "starting container worker" "starts container worker"
+  assert_contains "$output" "neither KVM/krun nor gVisor (runsc) container isolation is active" "warns about missing krun and gvisor"
+  assert_contains "$output" "projectbluefin/dakota#1576" "links to isolation issues"
   assert_eq "$(grep -c '^run ' "$podman_log" || true)" "1" "exactly one podman run"
   assert_not_contains "$(grep '^run ' "$podman_log")" "--runtime=krun" "standard podman must not request krun"
 }
