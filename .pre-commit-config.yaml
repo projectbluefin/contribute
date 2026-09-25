@@ -93,7 +93,7 @@ repos:
         name: skill generator rejects unsafe manifest paths
         language: system
         entry: bash tests/generate-skills.sh
-        files: ^(scripts/generate-skills\.py|tests/generate-skills(-units\.py|\.sh))$
+        files: ^(scripts/generate-skills\.py|tests/generate-skills(-units\.py|-projection-units\.py|\.sh))$
         pass_filenames: false
       - id: contribute-contract
         name: contribute image and SBOM contract
