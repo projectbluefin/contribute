@@ -119,10 +119,11 @@ them, and the organisation runner and the hosted app that also push these
 branches do not. For `requirements-ci.lock` the pull request itself is the
 backstop: `.github/workflows/renovate-hashes.yml` regenerates the hashes on
 any pull request that Renovate (`renovate[bot]` or `mergeraptor[bot]`) opens
-from a `renovate/*` branch of this repository and that touches the lockfile,
-pushes the result onto the branch, and dispatches `validate` on the refreshed
-commit. It runs the base branch's copy of the script against the head's
-lockfile; nothing from the pull request head is executed.
+and pushes from a `renovate/*` branch of this repository and that touches the
+lockfile, pushes the result onto the branch, and dispatches `validate` on the
+refreshed commit. It is a `pull_request_target` workflow: the workflow file and
+the script both come from `main`, the head contributes only its lockfile, and
+nothing from the pull request head is executed.
 The OMP, GitHub CLI, Node.js, and tmux synchronizers are configuration over one
 shared implementation in `scripts/lib/release-pins.mjs`: change the pin-rewriting
 or release-lookup behaviour there, not in four places.

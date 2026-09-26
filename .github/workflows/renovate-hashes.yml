@@ -21,16 +21,31 @@ name: renovate-hashes
 # require a pull request, so that token must never reach code that arrived on
 # the pull request:
 #
+#   - The trigger is pull_request_target, so this workflow definition and the
+#     default checkout are read from main, never from the pull request head.
+#     With plain pull_request both come from the head, and anyone able to
+#     push to a Renovate branch could edit this file there, weaken the gate
+#     below, and keep the write token. Someone pushing to a Renovate branch
+#     cannot alter this job any more; only a change merged to main can.
 #   - Nothing from the pull request head is executed. The script comes from
-#     a checkout of the base commit; the head is checked out into a separate
-#     directory and only its requirements-ci.lock is read from it.
+#     the default checkout of main; the head contributes exactly one data
+#     file, requirements-ci.lock, which is checked out into a separate
+#     directory by the event's head SHA and only read.
 #   - Neither checkout persists credentials. The token is handed to exactly
 #     one command, the `git push` that lands the refresh on Renovate's branch.
 #   - The job only runs for pull requests opened by one of the Renovate
 #     identities (`renovate[bot]`, the Mend-hosted app; `mergeraptor[bot]`,
 #     the organisation runner and this repository's own renovate.yml) from a
-#     branch in this repository. A branch prefix alone is not an identity:
-#     anyone with write access can push `renovate/anything`.
+#     branch in this repository, and only when the event was raised by one of
+#     those identities too: on `synchronize` github.actor is whoever pushed,
+#     not who opened the pull request, so a person pushing onto a Renovate
+#     branch does not get this job run on their commit. A branch prefix alone
+#     is not an identity: anyone with write access can push
+#     `renovate/anything`.
+#
+# pull_request_target hands the run secrets and a write-capable token by
+# default, which is why `permissions: {}` at the top level revokes everything
+# and the one job grants back only what its push and dispatch need.
 #
 # The push uses GITHUB_TOKEN, and a push made with GITHUB_TOKEN raises no push
 # or pull_request event, so the refreshed commit would otherwise carry no
@@ -46,7 +61,7 @@ name: renovate-hashes
 # and the comment on #693.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened]
     branches: [main]
     paths:
@@ -63,15 +78,21 @@ jobs:
   refresh:
     # Renovate's own pull requests only. `branches:` above filters the base
     # branch, not the head, and the head prefix is only a convention, so the
-    # gate is the pull request author: the two GitHub App identities that open
-    # Renovate pull requests here (see the trust model above). A fork gets a
-    # read-only token and must never be pushed to anyway.
+    # gate is the pull request author plus the actor that raised this event:
+    # the two GitHub App identities that open and push Renovate pull requests
+    # here (see the trust model above). On `synchronize` the actor is the
+    # pusher, so a person's push onto a Renovate branch does not run this. A
+    # fork must never be pushed to anyway.
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.head_ref, 'renovate/') &&
       (
         github.event.pull_request.user.login == 'renovate[bot]' ||
         github.event.pull_request.user.login == 'mergeraptor[bot]'
+      ) &&
+      (
+        github.actor == 'renovate[bot]' ||
+        github.actor == 'mergeraptor[bot]'
       )
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -79,12 +100,12 @@ jobs:
       contents: write # the one `git push` that lands the refresh on the Renovate branch
       actions: write # `gh workflow run validate.yml` on the refreshed commit
     steps:
-      - name: Check out the base commit (the code that runs)
+      - name: Check out main (the code that runs)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # The base of the pull request, not the merge ref and not the head:
-          # this is the only checkout anything is executed from.
-          ref: ${{ github.event.pull_request.base.sha }}
+          # pull_request_target's default ref is the base branch tip, the same
+          # commit this workflow file was read from. Not the merge ref and not
+          # the head: this is the only checkout anything is executed from.
           path: base
           persist-credentials: false
 
