@@ -1,5 +1,5 @@
 # Hive Contribute: an isolated interactive Hive + OMP worker.
-ARG FSDK_BASE_IMAGE=ghcr.io/projectbluefin/base:26.08@sha256:303e95bbf2e08e164e7147fbfa5602a67acc7016f63b72a3e482648bf347d623
+ARG FSDK_BASE_IMAGE=ghcr.io/projectbluefin/base:26.08@sha256:ec37df46272f099dad56af35ef2838494d3f33836438788335f472b3b06ac869
 ARG FSDK_BUILDER_IMAGE=ghcr.io/projectbluefin/lab-runner:26.08@sha256:8adaee237abc17f31f7838c8ab5375f9ab073052bf0ba8d65f221def4caffb5e
 # Hive's contributor runtime is never pinned in this repository: the appliance
 # IS upstream Hive's runtime, and a stored copy is a fork with extra steps.
