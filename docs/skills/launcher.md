@@ -39,7 +39,7 @@ All configuration lives in `${XDG_CONFIG_HOME:-~/.config}/hive-contribute.yml`.
 The file has nine flat keys: `hub`, `registration`, `image`, `backend`, `memory`, `cpus`, `llmman`, `llmman_token`, and `llmman_model`.
 `memory` and `cpus` carry upstream's contributor workload envelope (4 GiB, 2 CPUs), with
 swap pinned to the memory ceiling; `none` or `0` removes a ceiling. Every worker invocation
-passes `--cpu-shares 512` so background agent execution yields CPU priority to desktop applications.
+passes `--cpu-shares 512` (when CPU ceiling is active) so background agent execution yields CPU priority to desktop applications.
 The three `llmman` keys default to empty, which is what keeps local inference off.
 The launcher creates the file on first run, seeding `hub` from an existing
 `~/.config/hive/contributor.env` if present, falling back to `HIVE_CONTRIBUTE_DEFAULT_HUB`

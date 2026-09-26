@@ -584,9 +584,12 @@ launch_once() {
   # pair sizes the microVM itself rather than a cgroup.
   [[ "$MEMORY" != none && "$MEMORY" != 0 ]] &&
     args+=(--memory "$MEMORY" --memory-swap "$MEMORY")
-  [[ "$CPUS" != none && "$CPUS" != 0 ]] && args+=(--cpus "$CPUS")
-  # Scheduler niceness: lower CPU weight so background agent yields to desktop tasks.
-  args+=(--cpu-shares 512)
+  if [[ "$CPUS" != none && "$CPUS" != 0 ]]; then
+    args+=(--cpus "$CPUS")
+    # Scheduler niceness: lower CPU weight so background agent yields to desktop tasks.
+    # Omitted when cpus is none/0 to preserve escape hatch for un-delegated cgroup controllers.
+    args+=(--cpu-shares 512)
+  fi
   # Opting into a loopback endpoint uses slirp4netns:allow_host_loopback=true,
   # which exposes the host loopback interface (127.0.0.1) to the worker at
   # 10.0.2.2. A routable network endpoint needs no custom network mode.

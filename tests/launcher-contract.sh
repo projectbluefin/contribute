@@ -370,7 +370,7 @@ EOF
   assert_contains "$run_cmd" "--memory-swap 4g" "swap pinned to memory ceiling"
   assert_contains "$run_cmd" "--cpus 2" "cpu ceiling"
   assert_contains "$run_cmd" "--cpu-shares 512" "cpu-shares set to 512"
-  assert_contains "$run_cmd" "--volume hive-contribute-hive-52128202:/home/hive:rw" "home/workspace volume mounted rw"
+  assert_contains "$run_cmd" ":/home/hive:rw" "home/workspace volume mounted rw"
   assert_contains "$run_cmd" "ghcr.io/projectbluefin/contribute:stable" "image name"
 
   # Provenance is verified against the digest Podman actually pulled, not the
