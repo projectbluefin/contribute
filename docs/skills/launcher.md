@@ -1,7 +1,7 @@
 ---
 name: launcher
-version: "5.6"
-last_updated: "2026-09-24"
+version: "5.7"
+last_updated: "2026-09-25"
 id: launcher
 one_line_purpose: Change the hive-contribute launcher without breaking its runtime contracts.
 entry_point: docs/skills/launcher.md
@@ -38,11 +38,12 @@ recipes are thin wrappers around `bin/hive-contribute`.
 All configuration lives in `${XDG_CONFIG_HOME:-~/.config}/hive-contribute.yml`.
 The file has nine flat keys: `hub`, `registration`, `image`, `backend`, `memory`, `cpus`, `llmman`, `llmman_token`, and `llmman_model`.
 `memory` and `cpus` carry upstream's contributor workload envelope (4 GiB, 2 CPUs), with
-swap pinned to the memory ceiling; `none` or `0` removes a ceiling.
+swap pinned to the memory ceiling; `none` or `0` removes a ceiling. Every worker invocation
+passes `--cpu-shares 512` (when CPU ceiling is active) so background agent execution yields CPU priority to desktop applications.
 The three `llmman` keys default to empty, which is what keeps local inference off.
 The launcher creates the file on first run, seeding `hub` from an existing
-`~/.config/hive/contributor.env` if present. Setting `HIVE_CONTRIBUTE_CONFIG` points to an
-alternate configuration file.
+`~/.config/hive/contributor.env` if present, falling back to `HIVE_CONTRIBUTE_DEFAULT_HUB`
+if set. Setting `HIVE_CONTRIBUTE_CONFIG` points to an alternate configuration file.
 
 Under WSL2, keep `registration:` on the Linux filesystem (such as `~/.config/hive/contributor.env`), never on a Windows drive mount (`/mnt/c/...`). Windows DrvFs mounts do not preserve Linux file modes (`0600`) without explicit metadata configuration, silently exposing the contributor registration credential.
 
@@ -69,7 +70,8 @@ OMP owns agent execution, model choice, thinking effort, and tool boundaries.
 
 Every worker invocation prefers `podman run --runtime=krun` when
 Podman, `krun`, and `/dev/kvm` are available. When KVM is unavailable, it
-warns and runs standard Podman containers.
+warns that neither KVM/krun nor gVisor (runsc) container isolation is active
+and runs standard Podman containers.
 Container names include an instance slug derived from the hub URL and a per-process suffix.
 Persistent OMP homes are target-specific based on the hub hash.
 
