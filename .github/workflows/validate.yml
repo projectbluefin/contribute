@@ -8,6 +8,11 @@ name: validate
 on:
   push:
   pull_request:
+  # Dispatched by renovate-hashes.yml after it pushes a hash refresh onto a
+  # Renovate branch. That push is made with GITHUB_TOKEN, which raises no
+  # push or pull_request event, so a dispatch is the only way the refreshed
+  # head commit gets this check.
+  workflow_dispatch:
 
 permissions:
   attestations: read

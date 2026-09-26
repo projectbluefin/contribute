@@ -96,7 +96,7 @@ test("runtime pins are exempt from the PR queue that starved them", async () => 
 	}
 });
 
-test("both Renovate identities ignore each other's git author", async () => {
+test("every identity that commits to a Renovate branch is an ignored git author", async () => {
 	// Two GitHub App installations evaluate this one renovate.json: the
 	// `mergeraptor` token the workflow authenticates with, and a separately
 	// installed `bluefin-ghost-arc` app that files the Dependency Dashboard.
@@ -116,6 +116,17 @@ test("both Renovate identities ignore each other's git author", async () => {
 			`gitIgnoredAuthors is missing ${email}: Renovate will treat that identity's commits as a manual edit and stop repairing the branch.`,
 		);
 	}
+	// The third committer is renovate-hashes.yml, which pushes regenerated
+	// requirements-ci.lock hashes onto Renovate's branch. Its author is read
+	// from the workflow rather than repeated here, so changing one without
+	// the other fails instead of quietly freezing every PyPI branch.
+	const repair = await readRepoFile(".github/workflows/renovate-hashes.yml");
+	const author = /git config user\.email '(?<email>[^']+)'/.exec(repair)?.groups?.email;
+	assert.ok(author, "renovate-hashes.yml sets no git author email for its push");
+	assert.ok(
+		ignored.includes(author),
+		`gitIgnoredAuthors is missing ${author}: Renovate will treat the hash refresh as a manual edit and stop updating the branch.`,
+	);
 	assert.ok(
 		config.extends?.includes("local>projectbluefin/renovate-config"),
 		"renovate.json no longer extends local>projectbluefin/renovate-config: config:recommended and the org preset would silently drop out.",
