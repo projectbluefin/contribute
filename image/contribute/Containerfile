@@ -19,7 +19,7 @@ ARG FSDK_BUILDER_IMAGE=ghcr.io/projectbluefin/lab-runner:26.08@sha256:b2d11c72a9
 # fast beats shipping an image that cannot say what is inside it.
 ARG HIVE_COMMIT=
 # renovate: datasource=github-releases depName=can1357/oh-my-pi
-ARG OMP_VERSION=18.3.1
+ARG OMP_VERSION=18.3.2
 ARG OMP_X86_64_SHA256=0806df602bf2bb9b202d152204b1bef6450eb6bcbfbf31d66e3767d1bbb3b3a7
 ARG OMP_AARCH64_SHA256=95b9e3dc3c2096885be2c9c923bd45bb3bf81d172367db7e7090936729261e2c
 # renovate: datasource=node-version depName=node
