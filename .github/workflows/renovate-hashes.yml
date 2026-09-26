@@ -16,13 +16,29 @@ name: renovate-hashes
 # pushed it: regenerate the hashes from PyPI metadata and push the result back
 # onto the Renovate branch.
 #
+# Trust model. This job holds a token that can push to any branch of the
+# repository, and main's ruleset blocks deletion and force-pushes but does not
+# require a pull request, so that token must never reach code that arrived on
+# the pull request:
+#
+#   - Nothing from the pull request head is executed. The script comes from
+#     a checkout of the base commit; the head is checked out into a separate
+#     directory and only its requirements-ci.lock is read from it.
+#   - Neither checkout persists credentials. The token is handed to exactly
+#     one command, the `git push` that lands the refresh on Renovate's branch.
+#   - The job only runs for pull requests opened by one of the Renovate
+#     identities (`renovate[bot]`, the Mend-hosted app; `mergeraptor[bot]`,
+#     the organisation runner and this repository's own renovate.yml) from a
+#     branch in this repository. A branch prefix alone is not an identity:
+#     anyone with write access can push `renovate/anything`.
+#
 # The push uses GITHUB_TOKEN, and a push made with GITHUB_TOKEN raises no push
 # or pull_request event, so the refreshed commit would otherwise carry no
 # checks and Renovate's automerge would wait on it forever. workflow_dispatch
 # is the documented exception to that rule, so the last step dispatches
-# validate.yml on the branch and its check lands on the new head commit. The
-# same rule is what keeps this from looping: the push cannot re-trigger this
-# workflow.
+# validate.yml on the branch and its check lands on the new head commit. That
+# dispatch is why the job holds `actions: write`. The same rule is what keeps
+# this from looping: the push cannot re-trigger this workflow.
 #
 # The commit author is listed in renovate.json's gitIgnoredAuthors. Without
 # that Renovate reads the refresh as a manual edit ("does not recognize the
@@ -45,24 +61,42 @@ concurrency:
 
 jobs:
   refresh:
-    # Renovate branches from this repository only. `branches:` above filters
-    # the base branch, not the head, so the head is matched here. A fork gets
-    # a read-only token and must never be pushed to anyway.
+    # Renovate's own pull requests only. `branches:` above filters the base
+    # branch, not the head, and the head prefix is only a convention, so the
+    # gate is the pull request author: the two GitHub App identities that open
+    # Renovate pull requests here (see the trust model above). A fork gets a
+    # read-only token and must never be pushed to anyway.
     if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.head_ref, 'renovate/') &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      (
+        github.event.pull_request.user.login == 'renovate[bot]' ||
+        github.event.pull_request.user.login == 'mergeraptor[bot]'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write # push the hash refresh onto the Renovate branch
-      actions: write # dispatch validate.yml on the refreshed commit
+      contents: write # the one `git push` that lands the refresh on the Renovate branch
+      actions: write # `gh workflow run validate.yml` on the refreshed commit
     steps:
-      - name: Checkout the Renovate branch
+      - name: Check out the base commit (the code that runs)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # The branch itself, not the pull request merge ref: the refresh is
-          # pushed back onto it. Credentials stay persisted for that push.
-          ref: ${{ github.head_ref }}
+          # The base of the pull request, not the merge ref and not the head:
+          # this is the only checkout anything is executed from.
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out the Renovate head (the lockfile that is repaired)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The exact commit the event describes, so the refresh is a child of
+          # it and a branch that moved meanwhile rejects the push as a
+          # non-fast-forward. Nothing in this tree is executed.
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: head
+          persist-credentials: false
 
       - name: Set up Node.js 24
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -71,9 +105,13 @@ jobs:
 
       - name: Regenerate requirements-ci.lock hashes from PyPI
         id: refresh
+        # The script resolves the lockfile from its working directory, so the
+        # base's script runs with the head checkout as its working directory.
+        # It has no dependencies beyond the Node.js standard library.
+        working-directory: head
         run: |
           set -euo pipefail
-          node scripts/update-requirements-ci-hashes.mjs
+          node "${GITHUB_WORKSPACE}/base/scripts/update-requirements-ci-hashes.mjs"
           if git diff --quiet -- requirements-ci.lock; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "requirements-ci.lock already carries the hashes for its pinned versions."
@@ -84,8 +122,10 @@ jobs:
 
       - name: Push the refresh onto the Renovate branch
         if: steps.refresh.outputs.changed == 'true'
+        working-directory: head
         env:
           BRANCH: ${{ github.head_ref }}
+          GITHUB_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -98,10 +138,12 @@ jobs:
           new release. Regenerated from PyPI release metadata by
           scripts/update-requirements-ci-hashes.mjs in ${RUN_URL}." \
             -- requirements-ci.lock
-          # A rejected push means Renovate moved the branch while this ran;
-          # that push has its own run of this workflow, so failing here is
-          # correct and loses nothing.
-          git push origin "HEAD:refs/heads/${BRANCH}"
+          # The token appears here and nowhere else. A rejected push means
+          # Renovate moved the branch while this ran; that push has its own
+          # run of this workflow, so failing here is correct and loses nothing.
+          git push \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}" \
+            "HEAD:refs/heads/${BRANCH}"
 
       - name: Run validate on the refreshed commit
         if: steps.refresh.outputs.changed == 'true'

@@ -118,8 +118,11 @@ Those post-upgrade tasks only run under a self-hosted Renovate that allowlists
 them, and the organisation runner and the hosted app that also push these
 branches do not. For `requirements-ci.lock` the pull request itself is the
 backstop: `.github/workflows/renovate-hashes.yml` regenerates the hashes on
-any `renovate/*` pull request that touches the lockfile, pushes the result
-onto the branch, and dispatches `validate` on the refreshed commit.
+any pull request that Renovate (`renovate[bot]` or `mergeraptor[bot]`) opens
+from a `renovate/*` branch of this repository and that touches the lockfile,
+pushes the result onto the branch, and dispatches `validate` on the refreshed
+commit. It runs the base branch's copy of the script against the head's
+lockfile; nothing from the pull request head is executed.
 The OMP, GitHub CLI, Node.js, and tmux synchronizers are configuration over one
 shared implementation in `scripts/lib/release-pins.mjs`: change the pin-rewriting
 or release-lookup behaviour there, not in four places.
