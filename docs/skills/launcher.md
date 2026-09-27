@@ -79,8 +79,8 @@ OMP owns agent execution, model choice, thinking effort, and tool boundaries.
 
 Every worker invocation prefers `podman run --runtime=krun` when
 Podman, `krun`, and `/dev/kvm` are available. When KVM is unavailable, it
-warns that neither KVM/krun nor gVisor (runsc) container isolation is active
-and runs standard Podman containers.
+warns that KVM/krun isolation is not active, links the issues tracking native
+sandboxing, and runs standard Podman containers.
 Container names include an instance slug derived from the hub URL and a per-process suffix.
 Persistent OMP homes are target-specific based on the hub hash.
 

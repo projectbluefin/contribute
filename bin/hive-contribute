@@ -1118,8 +1118,8 @@ launch_once() {
     echo "✓ starting isolated KVM worker ${name}. Choose model and effort in OMP."
   else
     note "${KVM_FAILURE}; running container worker without KVM boundary."
-    note "warning: neither KVM/krun nor gVisor (runsc) container isolation is active."
-    note "distro maintainers: see projectbluefin/dakota#1576, dakota#1667, and bluefin#1139 to enable container isolation by default."
+    note "warning: KVM/krun isolation is not active; this worker has only standard container isolation."
+    note "native sandboxing by default is tracked in projectbluefin/dakota#1576, dakota#1667, and bluefin#1139."
     echo "✓ starting container worker ${name}. Choose model and effort in OMP."
   fi
   if local_inference_selected; then

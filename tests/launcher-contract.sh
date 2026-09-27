@@ -511,7 +511,7 @@ EOF
   output="$("$launcher" run 2>&1)"
   assert_contains "$output" "running container worker without KVM boundary" "warns about missing KVM"
   assert_contains "$output" "starting container worker" "starts container worker"
-  assert_contains "$output" "neither KVM/krun nor gVisor (runsc) container isolation is active" "warns about missing krun and gvisor"
+  assert_contains "$output" "KVM/krun isolation is not active" "warns that krun isolation is not active"
   assert_contains "$output" "projectbluefin/dakota#1576" "links to isolation issues"
   assert_eq "$(grep -c '^run ' "$podman_log" || true)" "1" "exactly one podman run"
   assert_not_contains "$(grep '^run ' "$podman_log")" "--runtime=krun" "standard podman must not request krun"
