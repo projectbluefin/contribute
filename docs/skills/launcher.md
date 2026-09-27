@@ -26,12 +26,21 @@ The primary launcher executable is `bin/hive-contribute`:
 | Command | Purpose |
 | --- | --- |
 | `hive-contribute` / `hive-contribute run` | Runs the Hive-authorized OMP worker in the foreground. |
-| `hive-contribute setup` | Performs attended Hive registration through upstream Hive's setup. |
+| `hive-contribute hives [args]` | Interactive hive picker in front of upstream `hivectl hives` (add, drop, order, routing strategy); with arguments it passes straight through to `hivectl hives`. Applies to running workers. |
+| `hive-contribute switch [name]` | Makes a followed hive the one the worker asks first, through `hivectl hives use`. Applies to running workers. |
+| `hive-contribute setup` | Performs attended Hive registration through upstream Hive's setup, handing it the existing registration so it appends. Once `profiles.yml` exists it runs `hives` instead. |
 | `hive-contribute doctor` | Read-only preflight diagnostics; starts no agent and exports no credential. |
 | `hive-contribute config` | Prints the resolved appliance configuration from the single config file. |
 
-The `just contribute`, `just doctor`, `just setup`, `just config`, and `just contribute-build`
-recipes are thin wrappers around `bin/hive-contribute`.
+The `just contribute`, `just hives`, `just switch`, `just doctor`, `just setup`, `just config`,
+and `just contribute-build` recipes are thin wrappers around `bin/hive-contribute`.
+
+`hives` and `switch` never edit Hive's positional lists themselves: every change is an
+upstream `hivectl hives` call, bootstrapped from a checkout of Hive's newest v5 release tag
+by upstream's own `bin/hivectl-bootstrap.sh` (at a release tag its skew guard can prove the
+binary matches the source; at the branch tip the `stable` image lags). `hivectl` keeps hives in
+`$HOME/.config/hive`, so these commands refuse a config whose `registration` points elsewhere.
+The `hub` key stays as written: it names the worker's state volume, not the active hive.
 
 ## Configuration: One File
 
@@ -95,8 +104,16 @@ if registry connectivity fails.
 - `HIVE_SESSION` is forwarded whenever it is SET, including when it is empty:
   an explicit empty value is the relay's documented opt-out of session labeling,
   while leaving it unset lets the relay default the label to the backend name.
-- The contributor worker receives exactly one selected Hive registration mounted read-only
-  at `/home/hive/.config/hive/contributor.env:ro`.
+- The contributor worker receives exactly one selected Hive registration: a private copy in
+  `$XDG_RUNTIME_DIR/hive-contribute/<container>/config/`, mounted read-only at
+  `/home/hive/.config/hive`. The sibling `meta/` directory records which registration the copy
+  came from and is never mounted, so nothing the worker writes is read back as a path or name.
+  The relay's pid and hubs-seen files go to the state volume (`HIVE_RELAY_PID_FILE`,
+  `HIVE_HUBS_SEEN_FILE`). `hives`/`switch` replace the copy for every running worker of the
+  same registration and send it `USR1`, which the image's PID 1 forwards to Hive's relay (its
+  live profile reload). The copy is removed when the worker exits.
+- `podman run --pull=never`: the image that runs is the one `ensure_image` pulled and whose
+  digest passed provenance verification, even under a host `pull_policy = "always"`.
 - A registration token is rotated by the hub, and only the hub can say whether a
   stored one is still accepted. This launcher does not ask: it mounts the
   credential and lets Hive's relay authenticate. A rejected token surfaces as

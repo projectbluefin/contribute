@@ -23,6 +23,8 @@ The root `package.json` only pins the contributor relay's `ws` dependency; this 
 | User goal | Command | Authority and lifecycle |
 | --- | --- | --- |
 | Run the Hive contributor worker | `hive-contribute` or `just contribute` | Foreground OMP worker; prefers a libkrun microVM with standard Podman fallback. Hive selects and assigns tasks. |
+| Choose which hives to contribute to | `hive-contribute hives` or `just hives` | Attended picker over upstream `hivectl hives`; applies to running workers via staged registration + `USR1`. The contributor picks hives; Hive still picks tasks. |
+| Change which followed hive is asked first | `hive-contribute switch [name]` or `just switch` | `hivectl hives use`; applies to running workers. |
 | Perform attended Hive registration | `hive-contribute setup` or `just setup` | Attended Hive registration through upstream setup. |
 | Diagnose launch readiness | `hive-contribute doctor` or `just doctor` | Read-only preflight; starts no agent. |
 | Print appliance configuration | `hive-contribute config` or `just config` | Reads the single config file `${XDG_CONFIG_HOME:-~/.config}/hive-contribute.yml`. |

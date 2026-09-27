@@ -13,6 +13,14 @@
 contribute:
     @bin/hive-contribute run
 
+[doc("Pick which hives to contribute to; applies to a running worker live.")]
+hives *ARGS:
+    @bin/hive-contribute hives {{ARGS}}
+
+[doc("Pick which followed hive the worker asks first; applies live.")]
+switch *ARGS:
+    @bin/hive-contribute switch {{ARGS}}
+
 [doc("Preflight diagnostics for this machine. Starts no agent.")]
 doctor:
     @bin/hive-contribute doctor

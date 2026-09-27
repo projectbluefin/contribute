@@ -47,11 +47,19 @@ The launcher is `bin/hive-contribute`:
 | Command | Description |
 |---|---|
 | `hive-contribute` / `hive-contribute run` | Launch the worker in the foreground (Ctrl-C stops it) |
+| `hive-contribute hives` | Pick which hives to contribute to (interactive; applies to a running worker immediately) |
+| `hive-contribute switch [name]` | Pick which followed hive the worker asks first (applies immediately) |
 | `hive-contribute doctor` | Read-only preflight diagnostics; starts no agent |
 | `hive-contribute setup` | Register this machine with a hive through upstream's own setup |
 | `hive-contribute config` | Print the resolved appliance configuration |
 
-From a checkout, `just` provides thin wrappers: `just contribute`, `just doctor`, `just setup`, `just config`, and `just contribute-build`.
+From a checkout, `just` provides thin wrappers: `just contribute`, `just hives`, `just switch`, `just doctor`, `just setup`, `just config`, and `just contribute-build`.
+
+### Contributing to several hives
+
+Run `hive-contribute hives`. It lists the hives Hive knows your GitHub account by, next to the ones this machine already follows. Tick the ones you want and it registers new ones and drops the ones you untick; a dropped hive's token cannot be recovered, so it asks first. With more than one hive it also asks which one the worker asks first and how it chooses between them (`ranked`, `spread`, or `neediest`). `hive-contribute switch` changes only the first hive.
+
+Nothing needs editing by hand, and a running worker picks every change up without a restart. Every change goes through upstream's `hivectl hives`: the profiles live in `~/.config/hive/profiles.yml`, and `contributor.env` is generated from them. The launcher fetches `hivectl` from Hive's newest v5 release image through upstream's own bootstrap the first time you use it. `hive-contribute hives <args>` passes any other `hivectl hives` subcommand straight through, for example `hive-contribute hives rename`. The pickers use [gum](https://github.com/charmbracelet/gum) when it is installed and plain numbered prompts otherwise.
 
 ## Configuration
 
@@ -107,7 +115,7 @@ llmman_model:
 Every worker invocation runs inside an isolated container:
 
 - **libkrun microVM preferred**: When Podman, `krun`, and `/dev/kvm` are available, the launcher starts a hardware-isolated KVM microVM (`podman run --runtime=krun`). When KVM is unavailable, it runs standard Podman containers.
-- **Read-only credential mount**: Hive's `0600` registration file is mounted read-only at `/home/hive/.config/hive/contributor.env:ro`. In WSL2 environments, keep this credential on the Linux filesystem rather than a `/mnt/c` mount to preserve the `0600` permission mode.
+- **Read-only credential mount**: Each worker gets a private copy of Hive's `0600` registration in a launcher-owned directory under `$XDG_RUNTIME_DIR`, mounted read-only at `/home/hive/.config/hive`. `hive-contribute hives` and `switch` replace that copy and signal the worker, whose relay reloads its hive list; the copy is removed when the worker stops. In WSL2 environments, keep the registration on the Linux filesystem rather than a `/mnt/c` mount to preserve the `0600` permission mode.
 - **No host home mount**: The user's host `$HOME` is never mounted. The container runs as unprivileged user `hive` (uid/gid 65532) with its own isolated home volume.
 - **Foreground attach**: The container remains attached to the terminal in the foreground. Detached runs are unsupported; Ctrl-C stops the invocation cleanly.
 
@@ -185,8 +193,9 @@ in to GitHub first, since upstream's setup reads that identity:
 gh auth login --web --hostname github.com --scopes repo,read:org
 ```
 
-Once a registration exists, the setup-only tools (`just`, `git`, `curl`, `jq`,
-`node`) are no longer needed. Every run still needs a container runtime —
+Once a registration exists, the setup tools (`just`, `git`, `curl`, `jq`,
+`node`) are needed only to register again; `hive-contribute hives` uses `gh`,
+`git`, `curl`, and `jq`. Every run still needs a container runtime —
 Podman with `krun` — and a GitHub token, either from `gh` or exported as `GH_TOKEN`.
 
 ### If something is wrong
@@ -217,6 +226,8 @@ podman run --rm -it \
   -e GH_TOKEN \
   ghcr.io/projectbluefin/contribute:stable
 ```
+
+A direct run reads the registration once: after `hive-contribute hives` or `switch`, restart it. Only launcher-started workers get the staged copy that changes live.
 
 ### Running with Docker
 

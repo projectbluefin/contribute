@@ -84,8 +84,8 @@ guest_home="$(sed -nE 's/^.*--volume "hive-contribute-\$\{slug\}:([^:]+):rw".*$/
 [[ "$guest_home" == /* ]] || fail "the launcher mounts no persistent guest home"
 grep -qF "WORKDIR ${guest_home}/workspace" "$containerfile" || fail "wrong workdir"
 # shellcheck disable=SC2016 # launcher source is matched literally, not expanded
-grep -qF -- "--volume \"\${REGISTRATION}:${guest_home}/.config/hive/contributor.env:ro,z\"" "$launcher" ||
-  fail "the Podman registration mount is not inside ${guest_home}"
+grep -qF -- "--volume \"\${STAGE_DIR}/config:${guest_home}/.config/hive:ro,z\"" "$launcher" ||
+  fail "the Podman registration mount is not a read-only directory inside ${guest_home}"
 grep -qF 'USER 65532:65532' "$containerfile" || fail "wrong user"
 grep -qF 'NODE_PATH=/usr/lib/hive/node_modules' "$containerfile" || fail "missing NODE_PATH"
 grep -qF 'io.hivecommons.contribute="true"' "$containerfile" || fail "missing contribute label"
@@ -275,6 +275,41 @@ grep -qF 'the contributor session ended' "${ended_agent}.log" ||
   fail "the entrypoint did not stop when the contributor session ended"
 [[ "$ended_status" -eq 1 ]] || fail "a contributor whose session ended exited ${ended_status}, not 1"
 rm -f "$ended_agent" "${ended_agent}.log"
+
+# `hive-contribute hives`/`switch` swap the staged registration and send USR1
+# to PID 1, which must pass it to Hive's relay (its live hive reload). A USR1
+# that arrives before the relay exists must be ignored, not kill the worker.
+# Stand in for Hive's agent with a relay that records its pid where Hive's does
+# and reports a reload.
+reload_agent="$(mktemp)"
+cat >"$reload_agent" <<'AGENT'
+#!/usr/bin/env bash
+tmux new-session -d -s contributor 'sleep 60'
+bash -c 'trap "echo relay-reloaded; exit 0" USR1
+  sleep 4
+  printf "{\"pid\": %s}\n" "$$" >"$HIVE_RELAY_PID_FILE"
+  while :; do sleep 0.2; done' &
+wait
+AGENT
+chmod 0755 "$reload_agent"
+reload_cid=""
+# Detached and never self-terminating (the stand-in relay loops), so remove it
+# whatever happens below.
+trap '[[ -z "$reload_cid" ]] || "$engine" rm -f "$reload_cid" >/dev/null 2>&1; rm -f "$reload_agent"' EXIT
+reload_cid="$("$engine" run -d --pull=never --tty --env HIVE_RELAY_PID_FILE=/tmp/relay.pid \
+  --volume "${reload_agent}:/usr/local/bin/contributor-agent.sh:ro,z" "$image")"
+sleep 2
+"$engine" kill --signal USR1 "$reload_cid" >/dev/null 2>&1 || true # before any relay pid exists
+sleep 5
+"$engine" kill --signal USR1 "$reload_cid" >/dev/null 2>&1 || true # the relay is recorded now
+reload_status="$(timeout 60 "$engine" wait "$reload_cid" || echo timeout)"
+reload_log="$("$engine" logs "$reload_cid" 2>&1 || true)"
+"$engine" rm -f "$reload_cid" >/dev/null
+reload_cid=""
+rm -f "$reload_agent"
+trap - EXIT
+grep -qF 'relay-reloaded' <<<"$reload_log" || fail "PID 1 did not forward USR1 to the relay"
+[[ "$reload_status" == 0 ]] || fail "the worker exited ${reload_status} after USR1, not 0"
 
 size="$($engine history --format json "$image" | python3 -c 'import json,sys; print(sum(int(x.get("size") or 0) for x in json.load(sys.stdin)))')"
 [[ "$size" =~ ^[0-9]+$ ]] || fail "could not measure image size"

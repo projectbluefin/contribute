@@ -106,8 +106,28 @@ case "\${1:-} \${2:-}" in
     printf 'oci-archive\n' >"\$archive"
     exit 0
     ;;
+  "container inspect")
+    # Running only for names listed in FAKE_PODMAN_RUNNING (space-separated).
+    name="\${*: -1}"
+    [[ " \${FAKE_PODMAN_RUNNING:-} " == *" \$name "* ]] && echo true || echo false
+    exit 0
+    ;;
+  "container exists")
+    [[ " \${FAKE_PODMAN_RUNNING:-} " == *" \${3:-} "* ]] && exit 0 || exit 1
+    ;;
+  "kill --signal")
+    printf 'kill %s\n' "\${*:2}" >>"$podman_log"
+    exit 0
+    ;;
   "run "*)
     printf 'run %s\n' "\${*:2}" >>"$podman_log"
+    # What the worker would find at ~/.config/hive: the staged copy, captured
+    # while the launcher still holds it.
+    for arg in "\$@"; do
+      case "\$arg" in
+        *:/home/hive/.config/hive:*) cp "\${arg%%:*}/contributor.env" "$scratch/staged.env" 2>/dev/null || true ;;
+      esac
+    done
     # \`--env NAME\` resolves from THIS process's environment, so what Podman
     # sees here is exactly what the container would receive. Recording it is
     # the only way to prove a by-name forward carried the right value.
@@ -179,7 +199,10 @@ clean_env() {
   export HIVE_CONTRIBUTE_TEST_KVM_DEVICE="$fake_kvm"
   unset HIVE_CONTRIBUTE_CONFIG
   unset HIVE_CONTRIBUTE_TEST_HOST_ROOT
-  unset HIVE_CONTRIBUTE_TEST_OS
+  unset HIVE_CONTRIBUTE_TEST_OS FAKE_PODMAN_RUNNING
+  export XDG_RUNTIME_DIR="$scratch/run"
+  rm -rf "$XDG_RUNTIME_DIR" "$scratch/staged.env"
+  mkdir -m 700 "$XDG_RUNTIME_DIR"
   unset HUB REGISTRATION IMAGE BACKEND
   unset GH_TOKEN GITHUB_TOKEN
   unset FAKE_PODMAN_INFO_FAIL FAKE_PODMAN_REMOTE FAKE_PODMAN_PULL_FAIL FAKE_PODMAN_IMAGE_EXISTS FAKE_PODMAN_NO_KRUN
@@ -347,7 +370,15 @@ EOF
   assert_contains "$run_cmd" "--interactive" "interactive flag"
   assert_contains "$run_cmd" "--tty" "tty flag"
   assert_contains "$run_cmd" "--userns keep-id:uid=65532,gid=65532" "userns keep-id"
-  assert_contains "$run_cmd" "--volume $fake_home/.config/hive/contributor.env:/home/hive/.config/hive/contributor.env:ro,z" "registration mount ro,z"
+  assert_contains "$run_cmd" "--pull=never" "run uses the image ensure_image verified, never a re-pull"
+  assert_contains "$run_cmd" "--volume $XDG_RUNTIME_DIR/hive-contribute/hive-contribute-" "registration staged under the runtime dir"
+  assert_contains "$run_cmd" "/config:/home/hive/.config/hive:ro,z" "staged registration directory mounted read-only"
+  assert_not_contains "$run_cmd" "--volume $fake_home/.config/hive" "the host Hive directory is never mounted"
+  assert_contains "$run_cmd" "--env HIVE_RELAY_PID_FILE=/home/hive/.local/state/hive/contributor-relay.pid" "relay bookkeeping kept out of the credential directory"
+  cmp -s "$scratch/staged.env" "$fake_home/.config/hive/contributor.env" ||
+    fail "the worker was not handed an exact copy of the registration"
+  [[ -z "$(ls -A "$XDG_RUNTIME_DIR/hive-contribute")" ]] ||
+    fail "the staged registration copy outlived the worker"
   assert_contains "$run_cmd" "--env AGENT_BACKEND=omp" "backend env"
   assert_contains "$run_cmd" "--env GH_TOKEN" "GH_TOKEN env passed by name"
   assert_contains "$run_cmd" "--env ANTHROPIC_API_KEY" "provider key env passed by name"
@@ -686,6 +717,144 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
+# Scenario 7b: registering a second hive keeps the first hive's credential.
+#
+# Upstream's contribute-setup appends to the contributor.env it finds and writes
+# a single-hive file only when there is none. Handing it an empty directory
+# replaced every token this machine held — tokens no hub can reprint.
+# -----------------------------------------------------------------------------
+test_setup_preserves_existing_hives() {
+  clean_env
+  local reg="$fake_home/.config/hive/contributor.env"
+  mkdir -p "$fake_home/.config/hive"
+  cat >"$fake_home/.config/hive-contribute.yml" <<EOF
+hub: wss://hub-a.example.com/contribute
+registration: $reg
+image: ghcr.io/projectbluefin/contribute:stable
+backend: omp
+EOF
+  chmod 600 "$fake_home/.config/hive-contribute.yml"
+  printf 'HIVE_REGISTRATION_TOKEN=token-a\nHIVE_HUB=wss://hub-a.example.com/contribute\nCONTRIBUTOR_ID=c-a\n' >"$reg"
+  chmod 600 "$reg"
+
+  # Upstream's MULTI-HUB PRESERVATION, reduced to what it does to the file.
+  cat >"$fake_bin/just" <<'EOF'
+#!/usr/bin/env bash
+printf 'hive-hub=%s\n' "${HIVE_HUB:-<unset>}" >>"${JUST_LOG:?}"
+config_dir=""
+for arg in "$@"; do
+  case "$arg" in config_dir=*) config_dir="${arg#config_dir=}" ;; esac
+done
+hubs="$HIVE_HUB" tokens="token-new" ids="c-new"
+if [[ -f "$config_dir/contributor.env" ]]; then
+  hubs="$(sed -n 's/^HIVE_HUB=//p' "$config_dir/contributor.env"),${hubs}"
+  tokens="$(sed -n 's/^HIVE_REGISTRATION_TOKEN=//p' "$config_dir/contributor.env"),${tokens}"
+  ids="$(sed -n 's/^CONTRIBUTOR_ID=//p' "$config_dir/contributor.env"),${ids}"
+fi
+printf 'HIVE_REGISTRATION_TOKEN=%s\nHIVE_HUB=%s\nCONTRIBUTOR_ID=%s\n' "$tokens" "$hubs" "$ids" >"$config_dir/contributor.env"
+EOF
+  chmod +x "$fake_bin/just"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bin/git"
+  local tool
+  for tool in git node jq; do
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bin/$tool"
+    chmod +x "$fake_bin/$tool"
+  done
+  local just_log="$scratch/just.log"
+  : >"$just_log"
+
+  env -i HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" XDG_STATE_HOME="$fake_home/.local/state" \
+    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" JUST_LOG="$just_log" PATH="$fake_bin:/usr/bin:/bin" \
+    HIVE_HUB=wss://hub-b.example.com/contribute "$launcher" setup >/dev/null 2>&1 ||
+    fail "setup for a second hive failed"
+  grep -qx 'HIVE_REGISTRATION_TOKEN=token-a,token-new' "$reg" ||
+    fail "registering a second hive lost the first hive's token: $(grep -c . "$reg") line(s) left"
+  grep -qx 'HIVE_HUB=wss://hub-a.example.com/contribute,wss://hub-b.example.com/contribute' "$reg" ||
+    fail "registering a second hive did not keep both hubs in order"
+  grep -qx 'hive-hub=wss://hub-b.example.com/contribute' "$just_log" ||
+    fail "the requested hive was not handed to upstream"
+  grep -qx '^hub: wss://hub-a.example.com/contribute' "$fake_home/.config/hive-contribute.yml" ||
+    fail "a later hive moved the hub that names the worker's state volume"
+
+  # With hives already followed and no hive requested, upstream's own picker
+  # decides; re-sending the anchor hub would only re-register the first hive.
+  : >"$just_log"
+  env -i HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" XDG_STATE_HOME="$fake_home/.local/state" \
+    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" JUST_LOG="$just_log" PATH="$fake_bin:/usr/bin:/bin" \
+    "$launcher" setup >/dev/null 2>&1 || true
+  grep -qx 'hive-hub=<unset>' "$just_log" ||
+    fail "setup on a registered machine pinned upstream to the anchor hub instead of its picker"
+  rm -f "$fake_bin/just" "$fake_bin/git" "$fake_bin/node" "$fake_bin/jq"
+}
+
+# -----------------------------------------------------------------------------
+# Scenario 7c: `hives` changes reach running workers of THIS registration only.
+#
+# Every change goes through upstream hivectl, which rewrites the registration;
+# the launcher then replaces each matching worker's staged copy and sends it
+# USR1. A worker launched from another identity's registration must never be
+# handed this one.
+# -----------------------------------------------------------------------------
+test_hives_reload_reaches_matching_workers() {
+  clean_env
+  local reg="$fake_home/.config/hive/contributor.env"
+  mkdir -p "$fake_home/.config/hive"
+  cat >"$fake_home/.config/hive-contribute.yml" <<EOF
+hub: wss://hub-a.example.com/contribute
+registration: $reg
+image: ghcr.io/projectbluefin/contribute:stable
+backend: omp
+EOF
+  printf 'HIVE_REGISTRATION_TOKEN=token-a,token-b\nHIVE_HUB=wss://hub-a.example.com/contribute,wss://hub-b.example.com/contribute\nCONTRIBUTOR_ID=c-a,c-b\n' >"$reg"
+  chmod 600 "$reg" "$fake_home/.config/hive-contribute.yml"
+
+  local root="$XDG_RUNTIME_DIR/hive-contribute" mine=hive-contribute-hive-aaaa-1-1 theirs=hive-contribute-hive-bbbb-2-2 w
+  for w in "$mine" "$theirs"; do (umask 077 && mkdir -p "$root/$w/meta" "$root/$w/config"); done
+  chmod 700 "$root"
+  printf '%s\n' "$reg" >"$root/$mine/meta/source"
+  cp "$reg" "$root/$mine/config/contributor.env"
+  printf '%s\n' "$scratch/other-identity/contributor.env" >"$root/$theirs/meta/source"
+  printf 'HIVE_HUB=wss://other.example.com/contribute\n' >"$root/$theirs/config/contributor.env"
+  export FAKE_PODMAN_RUNNING="$mine $theirs"
+
+  # Upstream's bootstrap, reduced to `hives use hub-b` rewriting the projection.
+  cat >"$fake_bin/git" <<'EOF'
+#!/usr/bin/env bash
+dir=""
+[[ "${1:-}" == -C ]] && { dir="$2"; shift 2; }
+case "${1:-}" in
+  ls-remote) printf '0000000000000000000000000000000000000000\trefs/tags/v5.1.0\n' ;;
+  init) mkdir -p "${@: -1}/.git" ;;
+  checkout)
+    mkdir -p "$dir/bin"
+    cat >"$dir/bin/hivectl-bootstrap.sh" <<'BOOT'
+#!/usr/bin/env bash
+if [[ "$1 $2" == "hives use" ]]; then
+  printf 'HIVE_REGISTRATION_TOKEN=token-b,token-a\nHIVE_HUB=wss://hub-b.example.com/contribute,wss://hub-a.example.com/contribute\nCONTRIBUTOR_ID=c-b,c-a\n' >"$HOME/.config/hive/contributor.env"
+fi
+exit 0
+BOOT
+    chmod +x "$dir/bin/hivectl-bootstrap.sh"
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "$fake_bin/git"
+
+  local output
+  output="$("$launcher" hives use hub-b 2>&1)" || fail "hives use failed: $output"
+  cmp -s "$reg" "$root/$mine/config/contributor.env" ||
+    fail "the running worker of this registration was not handed the new hive list"
+  grep -qx 'kill --signal USR1 '"$mine" "$podman_log" ||
+    fail "the running worker of this registration was not told to reload"
+  grep -qx 'HIVE_HUB=wss://other.example.com/contribute' "$root/$theirs/config/contributor.env" ||
+    fail "another identity's worker was handed this registration"
+  ! grep -q "kill --signal USR1 $theirs" "$podman_log" ||
+    fail "another identity's worker was signalled"
+  rm -f "$fake_bin/git"
+}
+
+# -----------------------------------------------------------------------------
 # Scenario 6: non-Linux host contract (#646). When run on macOS or Windows,
 #             doctor and run must name the platform requirement and Lima/WSL2
 #             remediation rather than failing on remote or missing container engines.
@@ -832,7 +1001,7 @@ llmman_model: qwen3-coder-30b"
 
   # The isolation boundary is exactly what it was.
   assert_contains "$run_cmd" "--userns keep-id:uid=65532,gid=65532" "userns unchanged"
-  assert_contains "$run_cmd" "--volume $fake_home/.config/hive/contributor.env:/home/hive/.config/hive/contributor.env:ro,z" \
+  assert_contains "$run_cmd" "/config:/home/hive/.config/hive:ro,z" \
     "registration still mounted read-only"
   assert_not_contains "$run_cmd" "--volume $fake_home:" "the host home must never be mounted"
   assert_not_contains "$run_cmd" "--network=host" "the host network namespace must never be shared"
@@ -897,7 +1066,8 @@ EOF
   local output
   output="$("$launcher" run)"
   assert_contains "$output" "starting isolated KVM worker" "valid multi-hub runs container"
-  assert_contains "$output" "✓ hive: wss://hub-a.example.com/contribute" "outputs config hub"
+  assert_contains "$output" "✓ hive: wss://hub-a.example.com/contribute" "lists the first followed hive"
+  assert_contains "$output" "✓ hive: wss://hub-b.example.com/contribute" "lists every followed hive"
 
   # Multi-hub in config is rejected (config hub must be single-valued)
   sed -i "s|^hub: .*|hub: wss://hub-a.example.com/contribute,wss://hub-b.example.com/contribute|" "$config_file"
@@ -939,6 +1109,17 @@ EOF
   [[ "$status" -ne 0 ]] || fail "mismatched hub and token list counts must fail"
   assert_contains "$output" "mispaired HIVE_HUB (2 hubs) and HIVE_REGISTRATION_TOKEN (1 tokens)" "explains mispairing"
   assert_eq "$(grep -c '^run ' "$podman_log" || true)" "0" "no container started for mispaired lists"
+
+  # One hub carrying two tokens is as misaligned as two hubs carrying one.
+  : >"$podman_log"
+  printf 'HIVE_HUB=wss://hub-a.example.com/contribute\nHIVE_REGISTRATION_TOKEN=token-a,token-b\nCONTRIBUTOR_ID=c-a\n' \
+    >"$fake_home/.config/hive/contributor.env"
+  chmod 600 "$fake_home/.config/hive/contributor.env"
+  status=0
+  output="$("$launcher" run 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "one hub with two tokens must fail"
+  assert_contains "$output" "mispaired HIVE_HUB (1 hubs) and HIVE_REGISTRATION_TOKEN (2 tokens)" "explains single-hub mispairing"
+  assert_eq "$(grep -c '^run ' "$podman_log" || true)" "0" "no container started for a single hub with extra tokens"
 
   # Mismatched contributor ID and hub counts
   : >"$podman_log"
@@ -1056,6 +1237,10 @@ echo "4. Testing doctor preflight..."
 test_doctor_failures_and_success || exit 1
 echo "5. Testing setup against upstream's host-CLI preflight..."
 test_setup_satisfies_host_cli_probe || exit 1
+echo "5b. Testing that a second hive keeps the first hive's credential..."
+test_setup_preserves_existing_hives || exit 1
+echo "5c. Testing that hive changes reach this registration's running workers only..."
+test_hives_reload_reaches_matching_workers || exit 1
 echo "6. Testing non-Linux host rejection..."
 test_non_linux_host_rejection || exit 1
 echo "7. Testing that local inference stays off until it is selected..."

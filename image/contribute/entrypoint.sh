@@ -114,7 +114,7 @@ cleanup() {
   status=$?
   # A second signal during teardown would re-enter this handler and restart
   # the escalation, stretching a bounded teardown past the runtime's deadline.
-  trap '' HUP INT TERM
+  trap '' HUP INT TERM USR1
   if [ -n "$attach_pid" ] && kill -0 "$attach_pid" 2>/dev/null; then
     kill "$attach_pid" 2>/dev/null || true
     wait_for_exit "$attach_pid" 10
@@ -136,6 +136,25 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
+
+# `hive-contribute hives` and `switch` replace the staged registration on the
+# host and send USR1 to this PID 1. Hive's relay reloads its hive list on USR1
+# (its live profile switch), so pass it on; the relay records its own pid.
+relay_pid_file="${HIVE_RELAY_PID_FILE:-${HOME}/.config/hive/contributor-relay.pid}"
+forward_reload() {
+  # Early (no relay yet) or garbled: ignore. The relay reads the current list
+  # when it starts, and PID 1 must never die of a reload request.
+  [[ -f "$relay_pid_file" ]] || return 0
+  local pid=""
+  pid="$(sed -nE 's/.*"pid"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$relay_pid_file" 2>/dev/null || true)"
+  pid="${pid%%$'\n'*}"
+  [[ -n "$pid" ]] || return 0
+  kill -USR1 "$pid" 2>/dev/null || true
+}
+trap forward_reload USR1
+# The pid file lives in the persistent volume; one left by a previous run names
+# a pid that may now belong to anything. Only this run's relay may write it.
+rm -f "$relay_pid_file" 2>/dev/null || true
 
 # Hive's relay caches each task's short-lived, hub-minted GitHub token under
 # /var/run/hive-metrics, a directory this image ships. Point the relay at a
@@ -203,7 +222,11 @@ if [ -t 0 ] && [ -t 1 ]; then
   exec 3<&0
   tmux attach-session -t contributor <&3 &
   attach_pid=$!
-  wait "$attach_pid" || true
+  # A trapped USR1 (a hive switch) interrupts `wait`; keep waiting while the
+  # attach client is still alive instead of treating that as a detach.
+  while kill -0 "$attach_pid" 2>/dev/null; do
+    wait "$attach_pid" || true
+  done
   attach_pid=
   exec 3<&-
   reset_terminal

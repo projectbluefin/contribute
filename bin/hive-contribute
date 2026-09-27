@@ -9,9 +9,14 @@
 # that cross it, and the one configuration file below.
 #
 #   hive-contribute            launch the worker (foreground; Ctrl-C stops it)
+#   hive-contribute hives      pick which hives to contribute to (interactive)
+#   hive-contribute switch     pick which hive the worker asks first
 #   hive-contribute doctor     read-only preflight; starts no agent
-#   hive-contribute setup      register this machine with a hive
+#   hive-contribute setup      register this machine with a hive (upstream flow)
 #   hive-contribute config     print the resolved configuration
+#
+# `hives` and `switch` apply to a running worker immediately; nobody edits a
+# dotfile to follow a hive.
 #
 # CONFIGURATION — ONE FILE:
 #   ${XDG_CONFIG_HOME:-~/.config}/hive-contribute.yml
@@ -77,7 +82,7 @@ write_default_config() {
   cat >"$CONFIG_PATH" <<EOF
 # hive-contribute — the whole appliance configuration.
 #
-# hub          the hive this machine contributes to (wss://<host>/contribute)
+# hub          the hive this machine first joined; it names the worker's state volume. Change hives with 'hive-contribute hives'
 # registration Hive's own credential file, written by its contribute-setup
 # image        contributor runtime image to run
 # backend      agent CLI Hive drives inside the container
@@ -141,35 +146,462 @@ valid_hub_list() {
 
 require_hub() {
   [[ -n "${HUB:-}" ]] ||
-    fail "no hub in ${CONFIG_PATH}. Run 'hive-contribute setup', or set 'hub: wss://<host>/contribute'."
+    fail "no hub in ${CONFIG_PATH}. Run 'hive-contribute hives' to pick one."
   [[ "$HUB" != *,* && "$HUB" =~ ^wss://[^[:space:]/]+(/[^[:space:]]*)?$ ]] ||
     fail "hub '${HUB}' in ${CONFIG_PATH} is not a single wss:// URL."
-  if [[ -f "$REGISTRATION" ]]; then
-    local reg_hubs reg_tokens reg_ids
-    local -a h_arr=() t_arr=() id_arr=()
-    reg_hubs="$(registration_value HIVE_HUB)"
-    valid_hub_list "$reg_hubs" ||
-      fail "registration ${REGISTRATION} contains an invalid HIVE_HUB URL."
-    IFS=',' read -r -a h_arr <<<"$reg_hubs"
+  [[ ! -f "$REGISTRATION" ]] || validate_registration
+}
 
-    reg_tokens="$(registration_value HIVE_REGISTRATION_TOKEN)"
-    [[ -n "$reg_tokens" && "$reg_tokens" != ,* && "$reg_tokens" != *, && "$reg_tokens" != *,,* ]] ||
-      fail "registration ${REGISTRATION} has empty or malformed HIVE_REGISTRATION_TOKEN."
-    IFS=',' read -r -a t_arr <<<"$reg_tokens"
-    if [[ "${#h_arr[@]}" -gt 1 && "${#t_arr[@]}" -ne "${#h_arr[@]}" ]]; then
-      fail "registration ${REGISTRATION} has mispaired HIVE_HUB (${#h_arr[@]} hubs) and HIVE_REGISTRATION_TOKEN (${#t_arr[@]} tokens)."
+# The relay pairs HIVE_HUB, HIVE_REGISTRATION_TOKEN and CONTRIBUTOR_ID by
+# position, so one missing entry points a live token at the wrong hive. Refuse
+# any file whose lists disagree rather than launch, stage, or rewrite it.
+validate_registration() {
+  local reg_hubs reg_tokens reg_ids
+  local -a h_arr=() t_arr=() id_arr=()
+  reg_hubs="$(registration_value HIVE_HUB)"
+  valid_hub_list "$reg_hubs" ||
+    fail "registration ${REGISTRATION} contains an invalid HIVE_HUB URL."
+  IFS=',' read -r -a h_arr <<<"$reg_hubs"
+
+  reg_tokens="$(registration_value HIVE_REGISTRATION_TOKEN)"
+  [[ -n "$reg_tokens" && "$reg_tokens" != ,* && "$reg_tokens" != *, && "$reg_tokens" != *,,* ]] ||
+    fail "registration ${REGISTRATION} has empty or malformed HIVE_REGISTRATION_TOKEN."
+  IFS=',' read -r -a t_arr <<<"$reg_tokens"
+  if [[ "${#t_arr[@]}" -ne "${#h_arr[@]}" ]]; then
+    fail "registration ${REGISTRATION} has mispaired HIVE_HUB (${#h_arr[@]} hubs) and HIVE_REGISTRATION_TOKEN (${#t_arr[@]} tokens)."
+  fi
+
+  reg_ids="$(registration_value CONTRIBUTOR_ID)"
+  if [[ -n "$reg_ids" ]]; then
+    [[ "$reg_ids" != ,* && "$reg_ids" != *, && "$reg_ids" != *,,* ]] ||
+      fail "registration ${REGISTRATION} has malformed CONTRIBUTOR_ID."
+    IFS=',' read -r -a id_arr <<<"$reg_ids"
+    if [[ "${#id_arr[@]}" -ne "${#h_arr[@]}" ]]; then
+      fail "registration ${REGISTRATION} has mispaired HIVE_HUB (${#h_arr[@]} hubs) and CONTRIBUTOR_ID (${#id_arr[@]} IDs)."
     fi
+  fi
+}
 
-    reg_ids="$(registration_value CONTRIBUTOR_ID)"
-    if [[ -n "$reg_ids" ]]; then
-      [[ "$reg_ids" != ,* && "$reg_ids" != *, && "$reg_ids" != *,,* ]] ||
-        fail "registration ${REGISTRATION} has malformed CONTRIBUTOR_ID."
-      IFS=',' read -r -a id_arr <<<"$reg_ids"
-      if [[ "${#id_arr[@]}" -ne "${#h_arr[@]}" ]]; then
-        fail "registration ${REGISTRATION} has mispaired HIVE_HUB (${#h_arr[@]} hubs) and CONTRIBUTOR_ID (${#id_arr[@]} IDs)."
+# ── Hives: pick, switch, reload ──────────────────────────────────────────────
+# Which hives this machine follows is Hive's own profile store
+# (~/.config/hive/profiles.yml, projected into contributor.env). Every change
+# goes through upstream `hivectl hives`, bootstrapped from the Hive checkout
+# exactly as upstream's `just contribute-hives` does — an alias, not a second
+# implementation of the positional lists. What lives here is the picker in
+# front of it and telling a running worker.
+HIVE_DIRECTORY="https://hive.hivecommons.dev"
+# One directory per running worker: meta/ is host-only bookkeeping, config/ is
+# the only subtree the worker sees. Nothing the worker can write is ever read
+# back as a path or a name.
+STAGE_ROOT="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/hive-contribute-${UID}}/hive-contribute"
+
+# The pickers run inside $(…), so stdout is a pipe; gum draws on the terminal
+# (stderr) and prints only the choice.
+have_gum() { command -v gum &>/dev/null && [[ -t 0 && -t 2 ]]; }
+
+# ui_choose HEADER OPTION... — one option, printed.
+ui_choose() {
+  local header="$1"
+  shift
+  if have_gum; then
+    gum choose --header "$header" "$@"
+    return
+  fi
+  local choice
+  echo "$header" >&2
+  PS3="> "
+  select choice in "$@"; do
+    [[ -n "$choice" ]] && { printf '%s\n' "$choice"; return 0; }
+  done
+  return 1
+}
+
+# ui_choose_many HEADER SELECTED_NEWLINE_LIST OPTION... — zero or more, one per line.
+ui_choose_many() {
+  local header="$1" selected="$2"
+  shift 2
+  if have_gum; then
+    local sel_csv
+    sel_csv="$(paste -sd, <<<"$selected")"
+    gum choose --no-limit --header "$header" ${sel_csv:+--selected="$sel_csv"} "$@"
+    return
+  fi
+  local i=1 opt picks mark
+  echo "$header" >&2
+  for opt in "$@"; do
+    mark=" "
+    grep -qxF -- "$opt" <<<"$selected" && mark="x"
+    printf '  %d) [%s] %s\n' "$i" "$mark" "$opt" >&2
+    i=$((i + 1))
+  done
+  read -r -p "numbers to keep, space-separated (enter = keep [x]): " picks
+  if [[ -z "$picks" ]]; then
+    [[ -n "$selected" ]] && printf '%s\n' "$selected"
+    return 0
+  fi
+  local n
+  for n in $picks; do
+    [[ "$n" =~ ^[0-9]+$ ]] && ((n >= 1 && n <= $#)) && printf '%s\n' "${!n}"
+  done
+}
+
+ui_confirm() {
+  if have_gum; then
+    gum confirm "$1"
+    return
+  fi
+  local answer
+  read -r -p "$1 [y/N] " answer
+  [[ "$answer" == [yY]* ]]
+}
+
+ui_input() {
+  if have_gum; then
+    gum input --header "$1" --placeholder "$2"
+    return
+  fi
+  local answer
+  read -r -p "$1 " answer
+  printf '%s\n' "$answer"
+}
+
+# The hives Hive knows this GitHub account by: name<TAB>hub. The same lookup
+# upstream's contribute-setup picker uses, and the same hub derivation.
+account_hives() {
+  local token
+  token="$(gh auth token --hostname github.com 2>/dev/null || true)"
+  [[ -n "$token" ]] || return 0
+  # The header arrives on stdin (`-H @-`) from a builtin: the token never
+  # appears in any process's argv.
+  printf 'Authorization: Bearer %s\n' "$token" |
+    curl -sf --max-time 10 -H @- "${HIVE_DIRECTORY}/api/saas/my-hives" 2>/dev/null |
+    jq -r '(.hives // empty) | select(type == "array") | .[] | select(type == "object" and (.id | type) == "string")
+      | [(.name // .project_name // .id),
+         (if (.id | startswith("hosted-")) or ((.dashboardUrl // "") == "")
+          then "wss://\(.id).hive.hivecommons.dev/contribute"
+          else ((.dashboardUrl | sub("^https://"; "wss://") | sub("^http://"; "ws://")) + "/contribute") end)]
+      | @tsv' 2>/dev/null || true
+}
+
+hub_host() {
+  local host="${1#*://}"
+  printf '%s\n' "${host%%/*}"
+}
+
+# Upstream hivectl through upstream's own bootstrap, from a checkout of Hive's
+# newest v5 RELEASE tag (resolved live, never stored). At a release tag the
+# bootstrap picks the matching ghcr.io/hivecommons/hive:<tag> image, and its
+# skew guard can prove the binary matches the source — which it cannot at the
+# branch tip, where the `stable` image lags. History deep enough to reach the
+# image's commit is what that proof needs.
+hivectl_checkout() {
+  local dir="${XDG_STATE_HOME:-${HOME}/.local/state}/hive-contribute/hivectl-src" tag
+  tag="$(git ls-remote --tags --refs https://github.com/hivecommons/hive 'refs/tags/v5.*' 2>/dev/null |
+    sed -E 's|.*refs/tags/||' | grep -E '^v5\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+  [[ -n "$tag" ]] || fail "cannot find Hive's latest v5 release (network?)."
+  if [[ ! -d "$dir/.git" ]]; then
+    mkdir -p "$dir"
+    git init --quiet "$dir"
+    git -C "$dir" remote add origin "https://github.com/hivecommons/hive"
+  fi
+  git -C "$dir" fetch --depth 50 origin tag "$tag" >/dev/null 2>&1 ||
+    fail "cannot fetch hivecommons/hive ${tag}."
+  git -C "$dir" checkout --detach -f "refs/tags/${tag}" >/dev/null 2>&1
+  printf '%s\n' "$dir"
+}
+
+# The first call in a command goes through the bootstrap (freshness and skew
+# checks, first-use image fetch); later calls reuse the binary it staged.
+HIVECTL_BIN=""
+hivectl() {
+  if [[ -n "$HIVECTL_BIN" ]]; then
+    "$HIVECTL_BIN" "$@"
+    return
+  fi
+  local src status=0
+  src="$(hivectl_checkout)"
+  [[ -x "$src/bin/hivectl" ]] ||
+    note "fetching Hive's hivectl from its release image (first use only; this can take a few minutes)."
+  "$src/bin/hivectl-bootstrap.sh" "$@" || status=$?
+  [[ -x "$src/bin/hivectl" ]] && HIVECTL_BIN="$src/bin/hivectl"
+  return "$status"
+}
+
+# Resolve hivectl in THIS shell, so the $(…) calls below reuse it instead of
+# bootstrapping once per subshell.
+hivectl_ready() {
+  # hivectl manages $HOME/.config/hive and deliberately ignores XDG; a config
+  # that registers elsewhere would have `hives` edit a file the worker never reads.
+  [[ "$REGISTRATION" == "${HOME}/.config/hive/contributor.env" ]] ||
+    fail "hivectl keeps hives in ${HOME}/.config/hive, but ${CONFIG_PATH} points registration at ${REGISTRATION}."
+  [[ -n "$HIVECTL_BIN" ]] && return 0
+  hivectl hives --help >/dev/null ||
+    fail "could not bootstrap upstream hivectl (it needs git, podman and network)."
+}
+
+# FOLLOWED: name<TAB>hub<TAB>active, in the order the relay uses them.
+load_followed() {
+  FOLLOWED=""
+  [[ -f "$REGISTRATION" || -f "$(dirname "$REGISTRATION")/profiles.yml" ]] || return 0
+  FOLLOWED="$(hivectl hives list -o json | jq -r '.[] | [.name, .hub, (.active | tostring)] | @tsv')" ||
+    fail "hivectl could not read your hives."
+}
+
+# Display label for a hub: the hive's own name when Hive told us one.
+declare -A HIVE_NAME=()
+hive_label() {
+  local hub="$1" fallback="${2:-}" name
+  name="${HIVE_NAME[$hub]:-$fallback}"
+  if [[ -n "$name" ]]; then
+    printf '%s  (%s)\n' "$name" "$(hub_host "$hub")"
+  else
+    hub_host "$hub"
+  fi
+}
+
+# A profile name hivectl accepts (letters, digits, - _ .), unique among ours.
+profile_name_for() {
+  local hub="$1" base candidate n=2
+  base="${HIVE_NAME[$hub]:-$(hub_host "$hub")}"
+  base="${base//\//-}"
+  base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-60)"
+  candidate="$base"
+  while cut -f1 <<<"$FOLLOWED" | grep -qixF -- "$candidate"; do
+    candidate="${base}-${n}"
+    n=$((n + 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+current_strategy() {
+  local s
+  s="$(hivectl hives strategy 2>/dev/null | sed -nE 's/.*[Ss]trategy:[[:space:]]*([a-z]+).*/\1/p' | head -1)"
+  printf '%s\n' "${s:-ranked}"
+}
+
+# First registration on this machine: upstream's attended contribute-setup,
+# which also signs in to GitHub and checks the backend. Every later hive is
+# `hivectl hives add`.
+first_registration() {
+  local hub="$1"
+  HIVE_HUB="$hub" run_setup
+}
+
+run_hives() {
+  if (($# > 0)); then
+    # Everything upstream offers, under the appliance's name.
+    local status=0
+    hivectl_ready
+    hivectl hives "$@" || status=$?
+    reload_running_workers
+    return "$status"
+  fi
+  for cmd in gh curl jq; do
+    command -v "$cmd" &>/dev/null || fail "'${cmd}' is required to look up your hives."
+  done
+  github_auth_ready || fail "gh is not authenticated. Run: gh auth login --web --hostname github.com --scopes repo,read:org"
+
+  local account name hub _active
+  account="$(account_hives)"
+  while IFS=$'\t' read -r name hub; do
+    [[ -n "$hub" ]] && HIVE_NAME["$hub"]="$name"
+  done <<<"$account"
+  hivectl_ready
+  load_followed
+
+  local -a options=() option_hubs=() option_names=() selected=()
+  local other="➕ another hive (paste its wss:// URL)" label
+  while IFS=$'\t' read -r name hub _active; do
+    [[ -n "$hub" ]] || continue
+    label="$(hive_label "$hub" "$name")"
+    options+=("$label") option_hubs+=("$hub") option_names+=("$name") selected+=("$label")
+  done <<<"$FOLLOWED"
+  while IFS=$'\t' read -r name hub; do
+    [[ -n "$hub" ]] || continue
+    cut -f2 <<<"$FOLLOWED" | grep -qxF -- "$hub" && continue
+    options+=("$(hive_label "$hub")") option_hubs+=("$hub") option_names+=("")
+  done <<<"$account"
+  options+=("$other")
+
+  local picks
+  picks="$(ui_choose_many "Contribute to which hives? (space toggles, enter applies)" \
+    "$( ((${#selected[@]} == 0)) || printf '%s\n' "${selected[@]}")" "${options[@]}")" ||
+    { echo "unchanged."; return 0; }
+
+  local -a add=() drop=() drop_hubs=()
+  local i url
+  for i in "${!option_hubs[@]}"; do
+    if grep -qxF -- "${options[$i]}" <<<"$picks"; then
+      [[ -z "${option_names[$i]}" ]] && add+=("${option_hubs[$i]}")
+    elif [[ -n "${option_names[$i]}" ]]; then
+      drop+=("${option_names[$i]}") drop_hubs+=("${option_hubs[$i]}")
+    fi
+  done
+  if grep -qxF -- "$other" <<<"$picks"; then
+    url="$(ui_input "Hive contributor URL:" "wss://<hive>/contribute")"
+    if [[ "$url" =~ ^wss://[^[:space:]/,]+(/[^[:space:]]*)?$ ]]; then
+      cut -f2 <<<"$FOLLOWED" | grep -qxF -- "$url" || add+=("$url")
+    elif [[ -n "$url" ]]; then
+      note "'${url}' is not a wss:// URL; skipped."
+    fi
+  fi
+
+  # Add before dropping: a failed registration must never leave this machine
+  # holding fewer live tokens than it started with.
+  for hub in "${add[@]}"; do
+    if [[ -z "$FOLLOWED" ]]; then
+      first_registration "$hub" || { note "could not register with ${hub}."; continue; }
+    else
+      echo "… registering with $(hive_label "$hub")"
+      hivectl hives add "$(profile_name_for "$hub")" --hub "$hub" ||
+        { note "could not register with ${hub}; nothing else changed."; continue; }
+    fi
+    load_followed
+  done
+
+  if ((${#drop[@]} > 0)); then
+    if ((${#drop[@]} >= $(grep -c . <<<"$FOLLOWED"))); then
+      note "keeping every hive you already follow: dropping them all would leave nothing to contribute to."
+    else
+      for i in "${!drop[@]}"; do echo "  stop contributing to: $(hive_label "${drop_hubs[$i]}" "${drop[$i]}")"; done
+      if ui_confirm "Stop contributing to ${#drop[@]} hive(s)? Their registration tokens cannot be recovered."; then
+        for name in "${drop[@]}"; do
+          hivectl hives remove "$name" --yes
+        done
+        load_followed
+      else
+        echo "kept every hive you already follow."
       fi
     fi
   fi
+
+  if (($(grep -c . <<<"$FOLLOWED") > 1)); then
+    pick_first_hive
+    pick_strategy
+  fi
+  reload_running_workers
+  show_followed
+}
+
+pick_first_hive() {
+  local -a labels=() names=()
+  local name hub _active pick i
+  while IFS=$'\t' read -r name hub _active; do
+    [[ -n "$hub" ]] || continue
+    labels+=("$(hive_label "$hub" "$name")") names+=("$name")
+  done <<<"$FOLLOWED"
+  pick="$(ui_choose "Which hive should the worker ask first?" "${labels[@]}")" || return 0
+  for i in "${!labels[@]}"; do
+    [[ "${labels[$i]}" == "$pick" ]] || continue
+    hivectl hives use "${names[$i]}" >/dev/null
+    load_followed
+    return 0
+  done
+}
+
+pick_strategy() {
+  local pick current
+  current="$(current_strategy)"
+  pick="$(ui_choose "How should the worker choose between hives? (now: ${current})" \
+    "ranked    first hive first; the rest only when it has no work" \
+    "spread    rotate across your hives, weighted by order" \
+    "neediest  whichever hive has the most queued work")" || return 0
+  pick="${pick%% *}"
+  [[ "$pick" == "$current" ]] || hivectl hives strategy "$pick" >/dev/null
+}
+
+show_followed() {
+  local name hub _active n=1
+  echo "Contributing to:"
+  while IFS=$'\t' read -r name hub _active; do
+    [[ -n "$hub" ]] || continue
+    printf '  %d. %s\n' "$n" "$(hive_label "$hub" "$name")"
+    n=$((n + 1))
+  done <<<"$FOLLOWED"
+  ((n <= 2)) || echo "  routing: $(current_strategy)"
+}
+
+run_switch() {
+  hivectl_ready
+  load_followed
+  [[ -n "$FOLLOWED" ]] || fail "no hives yet. Run 'hive-contribute hives' to pick some."
+  if (($(grep -c . <<<"$FOLLOWED") < 2)); then
+    echo "only one hive followed: $(cut -f2 <<<"$FOLLOWED"). Run 'hive-contribute hives' to add more."
+    return 0
+  fi
+  if command -v gh &>/dev/null && command -v jq &>/dev/null; then
+    local name hub
+    while IFS=$'\t' read -r name hub; do
+      [[ -n "$hub" ]] && HIVE_NAME["$hub"]="$name"
+    done <<<"$(account_hives)"
+  fi
+  if [[ -n "${1:-}" ]]; then
+    local want="$1" name hub _active
+    while IFS=$'\t' read -r name hub _active; do
+      if [[ "$(hive_label "$hub" "$name")" == *"$want"* ]]; then
+        hivectl hives use "$name" >/dev/null
+        load_followed
+        reload_running_workers
+        show_followed
+        return 0
+      fi
+    done <<<"$FOLLOWED"
+    fail "no followed hive matches '${want}'."
+  fi
+  pick_first_hive
+  reload_running_workers
+  show_followed
+}
+
+# The stage root holds registration copies, so it must be ours alone: created
+# private, and refused if an existing path is a symlink, someone else's, or
+# under a parent that is. umask only protects what this call creates.
+secure_stage_root() {
+  local parent
+  parent="$(dirname "$STAGE_ROOT")"
+  (umask 077 && mkdir -p "$STAGE_ROOT") || fail "cannot create ${STAGE_ROOT}."
+  [[ -d "$parent" && ! -L "$parent" && -O "$parent" ]] ||
+    fail "refusing ${parent} for registration copies: not a directory owned by you."
+  [[ -d "$STAGE_ROOT" && ! -L "$STAGE_ROOT" && -O "$STAGE_ROOT" ]] ||
+    fail "refusing ${STAGE_ROOT} for registration copies: not a directory owned by you."
+  chmod 700 "$parent" "$STAGE_ROOT"
+}
+
+# Copy the registration into a worker's staged config directory. The rename
+# happens inside the mounted directory, so the worker sees the new file.
+stage_registration() {
+  local config_dir="$1" tmp
+  tmp="$(mktemp "${config_dir}/.contributor.env.XXXXXX")"
+  cat "$REGISTRATION" >"$tmp"
+  mv -f "$tmp" "${config_dir}/contributor.env"
+}
+
+# Every running worker launched from THIS registration gets the new list and
+# a USR1, which the image forwards to Hive's relay (its live profile reload).
+reload_running_workers() {
+  [[ -d "$STAGE_ROOT" && -f "$REGISTRATION" ]] || return 0
+  command -v podman &>/dev/null || return 0
+  ( validate_registration ) || { note "not reloading running workers: the registration is malformed."; return 0; }
+  local stage name source
+  for stage in "$STAGE_ROOT"/hive-contribute-*; do
+    [[ -d "$stage" && ! -L "$stage" && -O "$stage" ]] || continue
+    name="${stage##*/}"
+    [[ "$name" =~ ^hive-contribute-[a-z0-9-]+$ ]] || continue
+    [[ -f "$stage/meta/source" && ! -L "$stage/meta/source" && -O "$stage/meta/source" ]] || continue
+    source="$(<"$stage/meta/source")"
+    [[ "$source" == "$REGISTRATION" ]] || continue
+    if [[ "$(podman container inspect --format '{{.State.Running}}' "$name" 2>/dev/null)" != true ]]; then
+      podman container exists "$name" 2>/dev/null || rm -rf "$stage"
+      continue
+    fi
+    cmp -s "$REGISTRATION" "$stage/config/contributor.env" 2>/dev/null && continue
+    stage_registration "$stage/config"
+    if podman kill --signal USR1 "$name" >/dev/null 2>&1; then
+      echo "✓ running worker ${name} switched to the new hive list"
+    else
+      note "could not signal ${name}; it uses the new list on its next start."
+    fi
+  done
 }
 
 instance_slug() {
@@ -302,8 +734,21 @@ run_setup() {
     command -v "$cmd" &>/dev/null || fail "'${cmd}' is required to register with a hive."
   done
   github_auth_ready || fail "gh is not authenticated. Run: gh auth login --web --hostname github.com --scopes repo,read:org"
+  # Once hivectl owns the profiles, contributor.env is its projection: an
+  # append here would be erased by the next profile change, token and all.
+  [[ ! -f "$(dirname "$REGISTRATION")/profiles.yml" ]] ||
+    fail "your hives are Hive profiles now; add one with 'hive-contribute hives'."
   src="$(hive_checkout)"
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/hive-contribute-setup.XXXXXX")"
+  # Upstream appends a new hive to an EXISTING contributor.env and keeps every
+  # token already in it; from an empty directory it writes a single-hive file,
+  # which would overwrite the hives this machine already follows with tokens
+  # the hubs can never reprint.
+  [[ ! -f "$REGISTRATION" ]] || install -m 600 "$REGISTRATION" "$tmp/contributor.env"
+  # Which hive: the caller's HIVE_HUB, else the configured hub for a first
+  # registration, else upstream's own picker.
+  local setup_hub="${HIVE_HUB:-}"
+  [[ -n "$setup_hub" || -f "$REGISTRATION" ]] || setup_hub="${HUB:-}"
   shim=""
   if ! command -v "$BACKEND" &>/dev/null; then
     # Upstream's registration preflight probes the HOST for the agent CLI and
@@ -322,15 +767,10 @@ EOF
   # is a detached head of the branch it compares against, exactly the case it
   # documents.
   #
-  # HIVE_HUB is how upstream's recipe learns which hive to register with; left
-  # unset it falls back to an interactive hive picker and registers against
-  # whatever gets chosen, which for a configured `hub:` is a silent mismatch
-  # (the config is then rewritten to match the credential below). A run that
-  # has a hub says so; one that does not gets upstream's picker on purpose.
   # Through `env`, because an assignment that comes out of an expansion is an
   # argument, not a prefix — bash decides which words are assignments before
   # it expands anything.
-  PATH="${shim:+${shim}:}${PATH}" env HIVE_SKIP_VERSION_CHECK=true ${HUB:+"HIVE_HUB=${HUB}"} just \
+  PATH="${shim:+${shim}:}${PATH}" env HIVE_SKIP_VERSION_CHECK=true ${setup_hub:+"HIVE_HUB=${setup_hub}"} just \
     --working-directory "$src" --justfile "$src/Justfile" \
     config_dir="$tmp" contribute-setup "$BACKEND" || {
     rm -rf "$tmp" ${shim:+"$shim"}
@@ -344,9 +784,11 @@ EOF
   local hub
   hub="$(registration_value HIVE_HUB)"
   hub="${hub%%,*}"
-  if [[ -n "$hub" && "$hub" != "$HUB" ]]; then
-    # The hub is the one value that must agree between config and credential.
+  if [[ -n "$hub" && -z "${HUB:-}" ]]; then
+    # The first hive joined names the worker's state volume; later hives and
+    # reorderings leave it alone so the worker keeps its home.
     sed -i -E "s|^[[:space:]]*hub[[:space:]]*:.*$|hub: ${hub}|" "$CONFIG_PATH"
+    HUB="$hub"
     note "hub recorded in ${CONFIG_PATH}: ${hub}"
   fi
   echo "✓ registered: ${REGISTRATION} (0600)"
@@ -582,6 +1024,17 @@ launch_once() {
   verify_image_provenance "${verify_ref:-$IMAGE}"
   local name
   name="hive-contribute-${slug}-$(date +%s)-$$"
+  # Hive's agent reads ~/.config/hive/contributor.env, and a file bind-mount
+  # pins the inode it was started with: a rewritten registration never reaches
+  # it. Mount a directory the launcher owns instead, so `hives`/`switch` can
+  # replace the file and signal a reload. meta/ is never mounted; config/
+  # holds only the registration copy and is mounted read-only.
+  STAGE_DIR="${STAGE_ROOT}/${name}"
+  secure_stage_root
+  mkdir -m 700 "$STAGE_DIR" "$STAGE_DIR/meta" "$STAGE_DIR/config"
+  trap 'rm -rf "$STAGE_DIR"' EXIT
+  printf '%s\n' "$REGISTRATION" >"$STAGE_DIR/meta/source"
+  stage_registration "$STAGE_DIR/config"
 
   local runtime_args=()
   if kvm_runtime_ready; then
@@ -606,11 +1059,17 @@ launch_once() {
   fi
 
   local args=(
-    podman run "${runtime_args[@]}" --rm --interactive --tty
+    # ensure_image already pulled and provenance was checked on that digest;
+    # a host pull_policy of "always" must not fetch different bits here.
+    podman run --pull=never "${runtime_args[@]}" --rm --interactive --tty
     --name "$name"
     --userns "keep-id:uid=65532,gid=65532"
     --volume "hive-contribute-${slug}:/home/hive:rw"
-    --volume "${REGISTRATION}:/home/hive/.config/hive/contributor.env:ro,z"
+    --volume "${STAGE_DIR}/config:/home/hive/.config/hive:ro,z"
+    # Read-only, like the credential it carries: the relay's own bookkeeping
+    # goes to the state volume instead of beside the token.
+    --env HIVE_RELAY_PID_FILE=/home/hive/.local/state/hive/contributor-relay.pid
+    --env HIVE_HUBS_SEEN_FILE=/home/hive/.local/state/hive/hubs-seen.json
     --env "AGENT_BACKEND=${BACKEND}"
     --env "HIVE_CONTAINER_NAME=${name}"
     --env HIVE_CONTAINER_RUNTIME=podman
@@ -669,7 +1128,11 @@ run_worker() {
     load_config
   fi
   require_hub
-  echo "✓ hive: ${HUB}"
+  local hub
+  local -a hubs=()
+  IFS=',' read -r -a hubs <<<"$(registration_value HIVE_HUB)"
+  for hub in "${hubs[@]}"; do echo "✓ hive: ${hub}"; done
+  ((${#hubs[@]} < 2)) || echo "  more than one hive: 'hive-contribute switch' changes which is asked first, live"
   resolve_gh_token
   if [[ -n "${GH_TOKEN_VALUE:-}" ]]; then
     export GH_TOKEN="$GH_TOKEN_VALUE"
@@ -739,6 +1202,10 @@ run_doctor() {
     # only the hub can say whether this one still works. Hive's relay reports
     # that when it connects; repairing it is upstream's `contribute-move`.
     echo "    the hub decides whether it is still accepted when the relay connects"
+    local reg_hub
+    local -a reg_hubs=()
+    IFS=',' read -r -a reg_hubs <<<"$(registration_value HIVE_HUB)"
+    for reg_hub in "${reg_hubs[@]}"; do echo "    hive: ${reg_hub}"; done
   else
     echo "  ✗ ${REGISTRATION} is missing; the first run registers through upstream Hive"
     fail_count=$((fail_count + 1))
@@ -871,7 +1338,8 @@ run_doctor() {
 run_config() {
   load_config
   echo "config:       ${CONFIG_PATH}"
-  echo "hub:          ${HUB:-<unset>}"
+  echo "hub:          ${HUB:-<unset>} (names the state volume)"
+  echo "hive list:    $(registration_value HIVE_HUB | sed 's/,/, /g')"
   echo "registration: ${REGISTRATION}"
   echo "image:        ${IMAGE}"
   echo "backend:      ${BACKEND}"
@@ -889,11 +1357,25 @@ doctor) run_doctor ;;
 setup)
   host_is_linux || fail "this appliance requires a Linux host; on macOS use Lima, on Windows use WSL2."
   load_config
-  run_setup
+  if [[ -f "$(dirname "$REGISTRATION")/profiles.yml" ]]; then
+    run_hives
+  else
+    run_setup
+  fi
+  ;;
+hives)
+  shift
+  load_config
+  run_hives "$@"
+  ;;
+switch)
+  shift
+  load_config
+  run_switch "$@"
   ;;
 config) run_config ;;
 -h | --help | help)
-  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
   ;;
-*) fail "unknown command '${1}'. Usage: hive-contribute {run|doctor|setup|config}" ;;
+*) fail "unknown command '${1}'. Usage: hive-contribute {run|hives|switch|doctor|setup|config}" ;;
 esac

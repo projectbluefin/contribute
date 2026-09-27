@@ -31,8 +31,13 @@ and no job that silently outlives the terminal.
 
 Every local contribution launch uses Podman (preferring Podman's `krun` OCI runtime
 when KVM is available). Container invocations get unique container names with
-persistent OMP state keyed by a hash of the hub endpoint, keeping separate hives isolated.
-Hive is the sole authority for selecting and assigning contributor tasks: do
+persistent OMP state keyed by a hash of the configured `hub` (the hive first
+joined); one worker follows every hive in the registration, so switching or
+adding hives never changes that state volume. Each worker gets a private,
+read-only copy of the registration; `hive-contribute hives`/`switch` replace
+it and signal the worker to reload its hive list live.
+The contributor chooses which hives to follow and in what order. Hive is the
+sole authority for selecting and assigning contributor tasks: do
 not skip, reorder, prioritize, or decline a Hive assignment mid-protocol.
 
 ### Upstream Hive Tracking (Never Pinned)
@@ -68,7 +73,7 @@ write a section explaining it. See [`docs/skills/upstream-hive.md`](docs/skills/
 
 ## Repository layout
 
-- `bin/hive-contribute` is THE primary launcher executable (subcommands: `run`, `doctor`, `setup`, `config`).
+- `bin/hive-contribute` is THE primary launcher executable (subcommands: `run`, `hives`, `switch`, `doctor`, `setup`, `config`). `hives`/`switch` front upstream `hivectl hives`; they never edit Hive's positional lists themselves.
 - `justfile` is a thin wrapper calling `bin/hive-contribute`.
 - `image/contribute/` builds the OMP contributor image (`ghcr.io/projectbluefin/contribute`, used as a registry location).
 - `package.json` and `package-lock.json` pin only the contributor relay's `ws`
