@@ -167,10 +167,10 @@ exit 0
 EOF
 chmod +x "$fake_bin/gh"
 
-# The launcher no longer calls curl itself — Hive owns every exchange with the
-# hub. This stub exists only so the `curl` prerequisite check in setup finds a
-# binary, and it records its argv so a future caller cannot start passing
-# credentials on a command line unnoticed.
+# The launcher calls curl for the llmman probe and for the account's hive list
+# (`hives`); Hive owns every exchange with a hub. It records argv so a caller
+# cannot start passing credentials on a command line unnoticed, and records
+# `--config -` stdin, where bearer tokens belong.
 cat >"$fake_bin/curl" <<EOF
 #!/usr/bin/env bash
 set -eu
@@ -178,6 +178,10 @@ printf 'curl %s\n' "\$*" >>"$curl_log"
 case " \$* " in
   *" --config - "*) cat >>"$curl_stdin_log" ;;
 esac
+if [[ " \$* " == *"/api/saas/my-hives "* ]]; then
+  printf '%s\n' "\${FAKE_MY_HIVES:-null}"
+  exit 0
+fi
 if [[ "\${FAKE_LLMMAN_UNREACHABLE:-0}" == 1 ]]; then
   echo "curl: (7) Failed to connect to 127.0.0.1 port 17434" >&2
   exit 7
@@ -788,6 +792,99 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
+# Scenario 7b2: the `hives` picker adds what was ticked, keeps what was already
+# followed, survives one failed registration, and passes the choices of first
+# hive and routing to hivectl. The account lookup's bearer token reaches curl
+# on stdin only. Driven through the plain prompts (no terminal, so no gum).
+# -----------------------------------------------------------------------------
+test_hives_picker_adds_ticked_hives() {
+  clean_env
+  local reg="$fake_home/.config/hive/contributor.env" state="$fake_home/.config/hive/fake-profiles"
+  mkdir -p "$fake_home/.config/hive"
+  cat >"$fake_home/.config/hive-contribute.yml" <<EOF
+hub: wss://hub-a.example.com/contribute
+registration: $reg
+image: ghcr.io/projectbluefin/contribute:stable
+backend: omp
+EOF
+  printf 'HIVE_REGISTRATION_TOKEN=token-a\nHIVE_HUB=wss://hub-a.example.com/contribute\nCONTRIBUTOR_ID=c-a\n' >"$reg"
+  chmod 600 "$reg" "$fake_home/.config/hive-contribute.yml"
+  printf 'hub-a\twss://hub-a.example.com/contribute\n' >"$state"
+  : >"$curl_log"
+  : >"$curl_stdin_log"
+  export FAKE_MY_HIVES='{"hives":[{"id":"hosted-b","name":"acme/b"},{"id":"hosted-c","name":"acme/c"},{"id":"x","name":"acme/a","dashboardUrl":"https://hub-a.example.com"}]}'
+  export FAKE_HIVECTL_FAIL_ADD=acme-c
+
+  # hivectl, reduced to the profile store it owns: one name<TAB>hub per line,
+  # active first, with contributor.env regenerated from it.
+  cat >"$fake_bin/git" <<'EOF'
+#!/usr/bin/env bash
+dir=""
+[[ "${1:-}" == -C ]] && { dir="$2"; shift 2; }
+case "${1:-}" in
+  ls-remote) printf '0000000000000000000000000000000000000000\trefs/tags/v5.1.0\n' ;;
+  init) mkdir -p "${@: -1}/.git" ;;
+  checkout)
+    mkdir -p "$dir/bin"
+    cat >"$dir/bin/hivectl-bootstrap.sh" <<'BOOT'
+#!/usr/bin/env bash
+set -eu
+state="$HOME/.config/hive/fake-profiles"
+project() {
+  local hubs tokens ids
+  hubs="$(cut -f2 "$state" | paste -sd,)"
+  tokens="$(cut -f1 "$state" | sed 's/^/token-/' | paste -sd,)"
+  ids="$(cut -f1 "$state" | sed 's/^/c-/' | paste -sd,)"
+  printf 'HIVE_REGISTRATION_TOKEN=%s\nHIVE_HUB=%s\nCONTRIBUTOR_ID=%s\n' "$tokens" "$hubs" "$ids" >"$HOME/.config/hive/contributor.env"
+  [[ ! -f "$state.strategy" ]] || printf 'HIVE_COMMONS_STRATEGY=%s\n' "$(<"$state.strategy")" >>"$HOME/.config/hive/contributor.env"
+}
+case "$1 ${2:-}" in
+  "hives --help") exit 0 ;;
+  "hives list") jq -Rn '[inputs | split("\t") | {name: .[0], hub: .[1], active: false}] | (.[0].active = true)' <"$state" ;;
+  "hives add")
+    [[ "$3" != "${FAKE_HIVECTL_FAIL_ADD:-}" ]] || { echo "Error: register with $5 returned HTTP 409" >&2; exit 1; }
+    printf '%s\t%s\n' "$3" "$5" >>"$state"
+    echo "ADD $3 $5" >>"$state.log"
+    project ;;
+  "hives use") { grep -P "^$3\t" "$state"; grep -vP "^$3\t" "$state"; } >"$state.new"; mv "$state.new" "$state"; project ;;
+  "hives strategy")
+    if [[ -n "${3:-}" ]]; then printf '%s' "$3" >"$state.strategy"; project; else echo "The Commons strategy: $(cat "$state.strategy" 2>/dev/null || echo ranked)"; fi ;;
+esac
+BOOT
+    chmod +x "$dir/bin/hivectl-bootstrap.sh"
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "$fake_bin/git"
+
+  # Keep 1 (hub-a, followed) and tick 2 (acme/b) and 3 (acme/c); then ask
+  # acme/b first; then route by neediest.
+  local output status=0
+  output="$(printf '1 2 3\n2\n3\n' | "$launcher" hives 2>&1)" || status=$?
+  assert_eq "$status" "0" "hives picker exit status"
+  grep -qxF "ADD acme-b wss://hosted-b.hive.hivecommons.dev/contribute" "$state.log" ||
+    fail "a ticked hive was not registered through hivectl: $(cat "$state.log" 2>/dev/null)"
+  assert_contains "$output" "✓ registered with acme/b" "ticked hive reported registered"
+  assert_contains "$output" "could not register with wss://hosted-c.hive.hivecommons.dev/contribute; the other hives are unaffected" "failed registration named"
+  assert_contains "$output" "HTTP 409" "hivectl's reason shown for a failed registration"
+  assert_contains "$output" "  1. acme/b  (hosted-b.hive.hivecommons.dev)" "chosen first hive listed first"
+  assert_contains "$output" "  2. acme/a  (hub-a.example.com)" "already-followed hive kept"
+  assert_not_contains "$output" ". acme/c  (hosted-c" "a hive whose registration failed is not listed as followed"
+  assert_contains "$output" "routing: neediest" "routing choice applied"
+  grep -qx 'HIVE_HUB=wss://hosted-b.hive.hivecommons.dev/contribute,wss://hub-a.example.com/contribute' "$reg" ||
+    fail "the registration does not list the chosen first hive first"
+  assert_not_contains "$(cat "$curl_log")" "fake-gh-auth-token-12345" "account lookup token in curl argv"
+  assert_contains "$(cat "$curl_stdin_log")" 'header = "Authorization: Bearer fake-gh-auth-token-12345"' "account lookup token on stdin"
+
+  # Submitting the list unchanged says so instead of silently ending.
+  output="$(printf '\n' | "$launcher" hives 2>&1)" || fail "an unchanged submit failed"
+  assert_contains "$output" "No change: nothing new was picked." "unchanged submit explained"
+  unset FAKE_MY_HIVES FAKE_HIVECTL_FAIL_ADD
+  rm -f "$fake_bin/git"
+}
+
+# -----------------------------------------------------------------------------
 # Scenario 7c: `hives` changes reach running workers of THIS registration only.
 #
 # Every change goes through upstream hivectl, which rewrites the registration;
@@ -1239,6 +1336,8 @@ echo "5. Testing setup against upstream's host-CLI preflight..."
 test_setup_satisfies_host_cli_probe || exit 1
 echo "5b. Testing that a second hive keeps the first hive's credential..."
 test_setup_preserves_existing_hives || exit 1
+echo "5b2. Testing that the hives picker adds what was ticked..."
+test_hives_picker_adds_ticked_hives || exit 1
 echo "5c. Testing that hive changes reach this registration's running workers only..."
 test_hives_reload_reaches_matching_workers || exit 1
 echo "6. Testing non-Linux host rejection..."
