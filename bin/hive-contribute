@@ -265,8 +265,18 @@ ui_input() {
   printf '%s\n' "$answer"
 }
 
-# The hives Hive knows this GitHub account by: name<TAB>hub. The same lookup
-# upstream's contribute-setup picker uses, and the same hub derivation.
+# name<TAB>hub for every hive object in a directory response, with upstream
+# contribute-setup's hub derivation (hosted-* ids go through the Commons proxy).
+HIVE_LIST_JQ='(.hives // empty) | select(type == "array") | .[]
+  | select(type == "object" and (.id | type) == "string" and .online != false)
+  | [(.name // .project_name // .id),
+     (if (.id | startswith("hosted-")) or ((.dashboardUrl // "") == "")
+      then "wss://\(.id).hive.hivecommons.dev/contribute"
+      else ((.dashboardUrl | sub("^https://"; "wss://") | sub("^http://"; "ws://")) + "/contribute") end)]
+  | @tsv'
+
+# The hives Hive knows this GitHub account by — the lookup upstream's
+# contribute-setup picker tries first.
 account_hives() {
   local token
   token="$(gh auth token --hostname github.com 2>/dev/null || true)"
@@ -275,17 +285,47 @@ account_hives() {
   # does: a header on the command line is a credential in `ps`.
   printf 'header = "Authorization: Bearer %s"\n' "$token" |
     curl -sf --max-time 10 --config - "${HIVE_DIRECTORY}/api/saas/my-hives" 2>/dev/null |
-    jq -r '(.hives // empty) | select(type == "array") | .[] | select(type == "object" and (.id | type) == "string")
-      | [(.name // .project_name // .id),
-         (if (.id | startswith("hosted-")) or ((.dashboardUrl // "") == "")
-          then "wss://\(.id).hive.hivecommons.dev/contribute"
-          else ((.dashboardUrl | sub("^https://"; "wss://") | sub("^http://"; "ws://")) + "/contribute") end)]
-      | @tsv' 2>/dev/null || true
+    jq -r "$HIVE_LIST_JQ" 2>/dev/null || true
+}
+
+# Every online hive in the Commons' public registry — upstream setup's
+# fallback list. Unauthenticated.
+registry_hives() {
+  curl -sf --max-time 10 "${HIVE_DIRECTORY}/api/registry" 2>/dev/null |
+    jq -r "$HIVE_LIST_JQ" 2>/dev/null || true
 }
 
 hub_host() {
   local host="${1#*://}"
   printf '%s\n' "${host%%/*}"
+}
+
+# A hive's address as a person types it — `reef.example.org`,
+# `https://reef.example.org/`, or a full wss:// URL, with stray whitespace —
+# turned into the contributor URL the relay uses. Prints nothing when it is
+# not an address.
+hub_from_address() {
+  local a="$1" host path
+  a="${a#"${a%%[![:space:]]*}"}"
+  a="${a%"${a##*[![:space:]]}"}"
+  if [[ "$a" =~ ^wss://([A-Za-z0-9.-]+(:[0-9]+)?)(/[^[:space:],]*)?$ ]]; then
+    host="${BASH_REMATCH[1]}" path="${BASH_REMATCH[3]}"
+    [[ -n "$path" && "$path" != / ]] || path=/contribute
+    printf 'wss://%s%s\n' "$host" "$path"
+    return
+  fi
+  a="${a#https://}"
+  a="${a#http://}"
+  a="${a%%/*}"
+  [[ "$a" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+(:[0-9]+)?$ ]] || return 0
+  printf 'wss://%s/contribute\n' "$a"
+}
+
+# Whether a hub answers as a Hive hub, before anything registers with it.
+hub_answers() {
+  local hub="$1" base
+  base="https://$(hub_host "$hub")"
+  curl -sf --max-time 10 "${base}/api/contribute/status" 2>/dev/null | jq -e 'has("hub") or has("api_version")' >/dev/null 2>&1
 }
 
 # Upstream hivectl through upstream's own bootstrap, from a checkout of Hive's
@@ -352,7 +392,7 @@ declare -A HIVE_NAME=()
 hive_label() {
   local hub="$1" fallback="${2:-}" name
   name="${HIVE_NAME[$hub]:-$fallback}"
-  if [[ -n "$name" ]]; then
+  if [[ -n "$name" && "$name" != "$(hub_host "$hub")" ]]; then
     printf '%s  (%s)\n' "$name" "$(hub_host "$hub")"
   else
     hub_host "$hub"
@@ -401,36 +441,43 @@ run_hives() {
   done
   github_auth_ready || fail "gh is not authenticated. Run: gh auth login --web --hostname github.com --scopes repo,read:org"
 
-  local account name hub _active
+  local account registry name hub _active
   account="$(account_hives)"
+  registry="$(registry_hives)"
   while IFS=$'\t' read -r name hub; do
-    [[ -n "$hub" ]] && HIVE_NAME["$hub"]="$name"
-  done <<<"$account"
+    [[ -n "$hub" && -z "${HIVE_NAME[$hub]:-}" ]] && HIVE_NAME["$hub"]="$name"
+  done <<<"$account"$'\n'"$registry"
   hivectl_ready
   load_followed
 
+  # Followed first (ticked), then the account's own hives, then every other
+  # online hive in the Commons registry — choices, not addresses to type.
   local -a options=() option_hubs=() option_names=() selected=()
-  local other="➕ another hive (paste its wss:// URL)" label
+  local other="➕ a hive that is not listed (type its address)" label
+  declare -A listed=()
   while IFS=$'\t' read -r name hub _active; do
     [[ -n "$hub" ]] || continue
     label="$(hive_label "$hub" "$name")"
     options+=("$label") option_hubs+=("$hub") option_names+=("$name") selected+=("$label")
+    listed["$hub"]=1
   done <<<"$FOLLOWED"
   while IFS=$'\t' read -r name hub; do
-    [[ -n "$hub" ]] || continue
-    cut -f2 <<<"$FOLLOWED" | grep -qxF -- "$hub" && continue
+    [[ -n "$hub" && -z "${listed[$hub]:-}" ]] || continue
     options+=("$(hive_label "$hub")") option_hubs+=("$hub") option_names+=("")
-  done <<<"$account"
+    listed["$hub"]=1
+  done <<<"$account"$'\n'"$registry"
   options+=("$other")
 
-  local picks
-  # No key names here: gum prints its own (x toggles in gum 2; space does not).
-  picks="$(ui_choose_many "Contribute to which hives? Tick the ones you want, then press enter." \
+  local header="Contribute to which hives?" picks
+  # gum 2 ticks with x or tab; space does nothing there. The plain prompt
+  # explains its own input.
+  have_gum && header="Contribute to which hives?  x or tab ticks · enter applies"
+  picks="$(ui_choose_many "$header" \
     "$( ((${#selected[@]} == 0)) || printf '%s\n' "${selected[@]}")" "${options[@]}")" ||
     { echo "unchanged."; return 0; }
 
   local -a add=() drop=() drop_hubs=()
-  local i url
+  local i address failures=0
   for i in "${!option_hubs[@]}"; do
     if grep -qxF -- "${options[$i]}" <<<"$picks"; then
       [[ -z "${option_names[$i]}" ]] && add+=("${option_hubs[$i]}")
@@ -439,14 +486,20 @@ run_hives() {
     fi
   done
   if grep -qxF -- "$other" <<<"$picks"; then
-    url="$(ui_input "Hive contributor URL:" "wss://<hive>/contribute")"
-    if [[ "$url" =~ ^wss://[^[:space:]/,]+(/[^[:space:]]*)?$ ]]; then
-      cut -f2 <<<"$FOLLOWED" | grep -qxF -- "$url" || add+=("$url")
-    elif [[ -n "$url" ]]; then
-      note "'${url}' is not a wss:// URL; skipped."
+    address="$(ui_input "Address of the hive (for example reef.tunaos.org):" "hive.example.org")"
+    hub="$(hub_from_address "$address")"
+    if [[ -z "$hub" ]]; then
+      [[ -z "${address//[[:space:]]/}" ]] || { note "'${address}' is not a hive address; skipped."; failures=$((failures + 1)); }
+    elif [[ -n "${listed[$hub]:-}" ]]; then
+      grep -qxF -- "$(hive_label "$hub")" <<<"$picks" || cut -f2 <<<"$FOLLOWED" | grep -qxF -- "$hub" || add+=("$hub")
+    elif hub_answers "$hub"; then
+      add+=("$hub")
+    else
+      note "$(hub_host "$hub") does not answer as a Hive hub (no /api/contribute/status); skipped."
+      failures=$((failures + 1))
     fi
   fi
-  if ((${#add[@]} == 0 && ${#drop[@]} == 0)); then
+  if ((${#add[@]} == 0 && ${#drop[@]} == 0 && failures == 0)); then
     if have_gum; then
       echo "No change: nothing new was ticked. In the list, press x (or tab) on a hive to tick it, then enter."
     else
@@ -459,7 +512,7 @@ run_hives() {
   local add_log
   for hub in "${add[@]}"; do
     if [[ -z "$FOLLOWED" ]]; then
-      first_registration "$hub" || note "could not register with ${hub}."
+      first_registration "$hub" || { note "could not register with ${hub}."; failures=$((failures + 1)); }
     else
       echo "… registering with $(hive_label "$hub")"
       # Upstream's own success text tells a native relay user to restart it;
@@ -470,6 +523,7 @@ run_hives() {
       else
         printf '%s\n' "$add_log" >&2
         note "could not register with ${hub}; the other hives are unaffected."
+        failures=$((failures + 1))
       fi
     fi
     # Refresh after every attempt, failed or not: later names must not collide
@@ -479,7 +533,7 @@ run_hives() {
 
   if ((${#drop[@]} > 0)); then
     if ((${#drop[@]} >= $(grep -c . <<<"$FOLLOWED"))); then
-      note "keeping every hive you already follow: dropping them all would leave nothing to contribute to."
+      note "you unticked every hive you follow; keeping them, since a worker needs at least one. Untick only the ones to leave."
     else
       for i in "${!drop[@]}"; do echo "  stop contributing to: $(hive_label "${drop_hubs[$i]}" "${drop[$i]}")"; done
       if ui_confirm "Stop contributing to ${#drop[@]} hive(s)? Their registration tokens cannot be recovered."; then
@@ -499,6 +553,10 @@ run_hives() {
   fi
   reload_running_workers
   show_followed
+  if ((failures > 0)); then
+    note "${failures} of your choices did not take effect; see above."
+    return 1
+  fi
 }
 
 pick_first_hive() {

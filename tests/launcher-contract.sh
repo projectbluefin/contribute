@@ -182,6 +182,17 @@ if [[ " \$* " == *"/api/saas/my-hives "* ]]; then
   printf '%s\n' "\${FAKE_MY_HIVES:-null}"
   exit 0
 fi
+if [[ " \$* " == *"/api/registry "* ]]; then
+  printf '%s\n' "\${FAKE_REGISTRY:-null}"
+  exit 0
+fi
+if [[ " \$* " == *"/api/contribute/status "* ]]; then
+  # Hubs listed in FAKE_HUBS_ONLINE answer as Hive hubs; anything else fails.
+  for host in \${FAKE_HUBS_ONLINE:-}; do
+    [[ " \$* " == *"https://\${host}/api/contribute/status "* ]] && { echo '{"hub":"online","api_version":"1.4"}'; exit 0; }
+  done
+  exit 22
+fi
 if [[ "\${FAKE_LLMMAN_UNREACHABLE:-0}" == 1 ]]; then
   echo "curl: (7) Failed to connect to 127.0.0.1 port 17434" >&2
   exit 7
@@ -813,6 +824,9 @@ EOF
   : >"$curl_log"
   : >"$curl_stdin_log"
   export FAKE_MY_HIVES='{"hives":[{"id":"hosted-b","name":"acme/b"},{"id":"hosted-c","name":"acme/c"},{"id":"x","name":"acme/a","dashboardUrl":"https://hub-a.example.com"}]}'
+  # The Commons registry repeats one of the account's hives and adds one more.
+  export FAKE_REGISTRY='{"hives":[{"id":"hosted-b","name":"acme/b","online":true},{"id":"hosted-d","name":"public/d","online":true},{"id":"hosted-e","name":"public/e","online":false}]}'
+  export FAKE_HUBS_ONLINE="reef.example.org"
   export FAKE_HIVECTL_FAIL_ADD=acme-c
 
   # hivectl, reduced to the profile store it owns: one name<TAB>hub per line,
@@ -858,13 +872,22 @@ exit 0
 EOF
   chmod +x "$fake_bin/git"
 
-  # Keep 1 (hub-a, followed) and tick 2 (acme/b) and 3 (acme/c); then ask
-  # acme/b first; then route by neediest.
+  # Menu: 1 acme/a (followed), 2 acme/b, 3 acme/c, 4 public/d, 5 unlisted.
+  # Keep 1, tick 2-4, and type an unlisted hive's bare host with stray spaces;
+  # then ask acme/b first; then route by neediest.
   local output status=0
-  output="$(printf '1 2 3\n2\n3\n' | "$launcher" hives 2>&1)" || status=$?
-  assert_eq "$status" "0" "hives picker exit status"
+  output="$(printf '1 2 3 4 5\n  reef.example.org \n2\n3\n' | "$launcher" hives 2>&1)" || status=$?
+  assert_eq "$status" "1" "a selection with one failed registration exits non-zero"
+  assert_contains "$output" "1 of your choices did not take effect" "failed choice counted"
+  assert_eq "$(grep -c ') \[ \] acme/b' <<<"$output")" "1" "a hive in both the account list and the registry is offered once"
+  assert_contains "$output" ") [ ] public/d  (hosted-d.hive.hivecommons.dev)" "a Commons registry hive is offered as a choice"
+  assert_not_contains "$output" "public/e" "an offline registry hive is not offered"
   grep -qxF "ADD acme-b wss://hosted-b.hive.hivecommons.dev/contribute" "$state.log" ||
-    fail "a ticked hive was not registered through hivectl: $(cat "$state.log" 2>/dev/null)"
+    fail "a ticked account hive was not registered through hivectl: $(cat "$state.log" 2>/dev/null)"
+  grep -qxF "ADD public-d wss://hosted-d.hive.hivecommons.dev/contribute" "$state.log" ||
+    fail "a ticked registry hive was not registered through hivectl: $(cat "$state.log" 2>/dev/null)"
+  grep -qxF "ADD reef.example.org wss://reef.example.org/contribute" "$state.log" ||
+    fail "a typed bare host was not turned into its contributor URL: $(cat "$state.log" 2>/dev/null)"
   assert_contains "$output" "✓ registered with acme/b" "ticked hive reported registered"
   assert_contains "$output" "could not register with wss://hosted-c.hive.hivecommons.dev/contribute; the other hives are unaffected" "failed registration named"
   assert_contains "$output" "HTTP 409" "hivectl's reason shown for a failed registration"
@@ -872,15 +895,23 @@ EOF
   assert_contains "$output" "  2. acme/a  (hub-a.example.com)" "already-followed hive kept"
   assert_not_contains "$output" ". acme/c  (hosted-c" "a hive whose registration failed is not listed as followed"
   assert_contains "$output" "routing: neediest" "routing choice applied"
-  grep -qx 'HIVE_HUB=wss://hosted-b.hive.hivecommons.dev/contribute,wss://hub-a.example.com/contribute' "$reg" ||
-    fail "the registration does not list the chosen first hive first"
+  grep -qx 'HIVE_HUB=wss://hosted-b.hive.hivecommons.dev/contribute,wss://hub-a.example.com/contribute,wss://hosted-d.hive.hivecommons.dev/contribute,wss://reef.example.org/contribute' "$reg" ||
+    fail "the registration does not list the chosen hives with the chosen first: $(grep '^HIVE_HUB=' "$reg")"
   assert_not_contains "$(cat "$curl_log")" "fake-gh-auth-token-12345" "account lookup token in curl argv"
   assert_contains "$(cat "$curl_stdin_log")" 'header = "Authorization: Bearer fake-gh-auth-token-12345"' "account lookup token on stdin"
+
+  # An address that does not answer as a Hive hub is refused, not registered.
+  status=0
+  # Now followed: 1-4; 5 is acme/c again; 6 is unlisted.
+  output="$(printf '1 2 3 4 6\nnot-a-hive.example.org\n1\n1\n' | "$launcher" hives 2>&1)" || status=$?
+  assert_eq "$status" "1" "an unreachable typed hive exits non-zero"
+  assert_contains "$output" "not-a-hive.example.org does not answer as a Hive hub" "unreachable hive named"
+  ! grep -q 'not-a-hive' "$state.log" || fail "an address that is not a hub was registered"
 
   # Submitting the list unchanged says so instead of silently ending.
   output="$(printf '\n' | "$launcher" hives 2>&1)" || fail "an unchanged submit failed"
   assert_contains "$output" "No change: nothing new was picked." "unchanged submit explained"
-  unset FAKE_MY_HIVES FAKE_HIVECTL_FAIL_ADD
+  unset FAKE_MY_HIVES FAKE_REGISTRY FAKE_HUBS_ONLINE FAKE_HIVECTL_FAIL_ADD
   rm -f "$fake_bin/git"
 }
 
