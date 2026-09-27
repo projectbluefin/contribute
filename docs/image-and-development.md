@@ -18,7 +18,7 @@ assignment, lease, prompt, credential, and completion authority.
 Hive's contributor runtime components (`contributor-agent.sh`, `contributor-relay.js`,
 `pi-backend.js`, `lib/pane-classifier.js`, `backends.conf`, `gh-wrapper.sh`, and
 `restrictions/contributor-default.json`)
-are fetched from upstream Hive's `v4` tracking branch and resolved to a commit SHA
+are fetched from upstream Hive's `v5` tracking branch and resolved to a commit SHA
 at build time. The resolved SHA is stamped into `/usr/share/hive/contribute/HIVE_COMMIT`,
 labeled on the image (`io.hivecommons.contribute.hive.ref`), and recorded in the SBOM.
 Hive runtime code is never pinned to a static commit.

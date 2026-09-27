@@ -39,7 +39,7 @@ credential handling ([`launcher.md`](launcher.md)).
 |---|---|
 | "A local shim will unblock this now." | It outlives the gap it was written for and shadows the real tool once upstream lands the fix. Report it and wait. |
 | "Upstream is slow; we can patch our copy." | The appliance carries upstream's files directly; do not fork or patch them. |
-| "We should pin Hive to a known commit." | The runtime is tracked from upstream's `v4` branch, not pinned to a static commit. Setup and runtime follow one release line; they are not the same commit, since setup reads `v4` live while the image carries the SHA resolved at its last build. |
+| "We should pin Hive to a known commit." | The runtime is tracked from upstream's `v5` branch, not pinned to a static commit. Setup and runtime follow one release line; they are not the same commit, since setup reads `v5` live while the image carries the SHA resolved at its last build. |
 
 ## Core Process
 

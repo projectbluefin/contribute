@@ -6,7 +6,7 @@ ARG FSDK_BUILDER_IMAGE=ghcr.io/projectbluefin/lab-runner:26.08@sha256:454e7f79e3
 #
 # HIVE_COMMIT is resolved by the CALLER — `just contribute-build`, the publish
 # workflow, and the validate workflow each read Hive's tracking branch
-# (refs/heads/v4) and pass the SHA in. That is what makes "always the latest
+# (refs/heads/v5) and pass the SHA in. That is what makes "always the latest
 # Hive" true: the value is part of the layer's cache key, so the moment
 # upstream moves, this RUN re-executes. Resolving it inside the layer instead
 # would leave a constant cache key and a build that silently reuses whatever it

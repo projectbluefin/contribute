@@ -41,12 +41,12 @@ Hive's contributor runtime components (`contributor-agent.sh`, `contributor-rela
 `pi-backend.js`, `lib/pane-classifier.js`, `backends.conf`, `gh-wrapper.sh`, and
 `restrictions/contributor-default.json`)
 are **never pinned** to a static commit. The image build fetches them from upstream's
-tracking branch (`v4`), resolves the branch commit SHA at build time, and stamps that SHA into:
+tracking branch (`v5`), resolves the branch commit SHA at build time, and stamps that SHA into:
 - `/usr/share/hive/contribute/HIVE_COMMIT`
 - Image label `io.hivecommons.contribute.hive.ref`
 - The build SBOM at `/usr/share/hive/contribute/sbom.spdx.json`
 
-The launcher's `setup` subcommand clones that same tracking branch, so registration and runtime follow one release line. They are not the same commit — `setup` reads `v4` live, the image carries the SHA resolved at its last build — so the gap is bounded by the daily rebuild, not zero.
+The launcher's `setup` subcommand clones that same tracking branch, so registration and runtime follow one release line. They are not the same commit — `setup` reads `v5` live, the image carries the SHA resolved at its last build — so the gap is bounded by the daily rebuild, not zero.
 Third-party release binaries (OMP, Node.js, GitHub CLI, tmux) remain digest-pinned and
 updated automatically by Renovate.
 

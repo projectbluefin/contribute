@@ -4,7 +4,7 @@ Upstream Hive's contributor runtime packaged as an isolated, distroless containe
 
 This appliance packages Hive's contributor runtime (`contributor-agent.sh` + `contributor-relay.js`) with OMP as the agent CLI, so a contributor needs no agent toolchain of their own. Hive owns task selection, assignment, prompts, leases, and output capture; OMP owns agent execution, model choice, thinking effort, and tool boundaries. This repository owns the isolation boundary, the credentials that cross it, and the single configuration file.
 
-The Hive runtime inside is tracked directly from upstream's `v4` branch and is **never pinned** to a static commit in this repository. Every image build resolves the branch to a commit, stamps it into `/usr/share/hive/contribute/HIVE_COMMIT`, records it in the image labels (`io.hivecommons.contribute.hive.ref`) and SBOM, and registration clones that same branch, so setup and runtime follow one release line. They are not pinned to the same commit: `setup` reads `v4` live while the image carries the SHA resolved at its last build, so they can differ. The daily rebuild is what bounds that gap; a failed or skipped publish widens it.
+The Hive runtime inside is tracked directly from upstream's `v5` branch and is **never pinned** to a static commit in this repository. Every image build resolves the branch to a commit, stamps it into `/usr/share/hive/contribute/HIVE_COMMIT`, records it in the image labels (`io.hivecommons.contribute.hive.ref`) and SBOM, and registration clones that same branch, so setup and runtime follow one release line. They are not pinned to the same commit: `setup` reads `v5` live while the image carries the SHA resolved when it was last built, so they can differ. The daily rebuild is meant to bound that gap, not to guarantee it.
 
 ## Workflow
 
@@ -156,7 +156,7 @@ If you want your workstation's GPU to serve your laptop, that is llmman's aggreg
 
 ## Upstream Tracking (Never Pinned)
 
-The Hive contributor runtime inside the image is **never pinned** to a static commit. The build resolves the upstream `v4` tracking branch, packages the resolved runtime assets, and stamps the commit into:
+The Hive contributor runtime inside the image is **never pinned** to a static commit. The build resolves the upstream `v5` tracking branch, packages the resolved runtime assets, and stamps the commit into:
 1. `/usr/share/hive/contribute/HIVE_COMMIT` inside the image
 2. The OCI image label `io.hivecommons.contribute.hive.ref`
 3. The image SBOM at `/usr/share/hive/contribute/sbom.spdx.json`

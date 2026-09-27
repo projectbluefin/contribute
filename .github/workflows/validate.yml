@@ -108,9 +108,9 @@ jobs:
           # stage cannot see a commit resolved inside the builder, so a missing
           # arg would ship an empty provenance label beside a populated
           # HIVE_COMMIT file. It refuses rather than build that image.
-          hive_commit="$(git ls-remote https://github.com/hivecommons/hive refs/heads/v4 | cut -f1)"
+          hive_commit="$(git ls-remote https://github.com/hivecommons/hive refs/heads/v5 | cut -f1)"
           [[ "$hive_commit" =~ ^[0-9a-f]{40}$ ]] ||
-            { echo "could not resolve hivecommons/hive v4" >&2; exit 1; }
+            { echo "could not resolve hivecommons/hive v5" >&2; exit 1; }
           podman build --format oci \
             --build-arg HIVE_COMMIT="$hive_commit" \
             -f image/contribute/Containerfile -t contribute:test .

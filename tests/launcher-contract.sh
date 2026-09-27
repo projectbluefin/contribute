@@ -231,7 +231,7 @@ EOF
   assert_contains "$output" "registration: $fake_home/.config/hive/contributor.env" "config output registration"
   assert_contains "$output" "image:        ghcr.io/projectbluefin/contribute:stable" "config output image"
   assert_contains "$output" "backend:      omp" "config output backend"
-  assert_contains "$output" "hive ref:     v4 (tracked, never pinned)" "config output hive ref"
+  assert_contains "$output" "hive ref:     v5 (tracked, never pinned)" "config output hive ref"
 
   # Verify file content
   local file_content
@@ -879,6 +879,79 @@ test_local_inference_network_endpoint_and_bad_url() {
   assert_eq "$(grep -c '^run ' "$podman_log" || true)" "0" "no container started for a malformed endpoint"
 }
 
+test_multi_hub_commons_projection() {
+  clean_env
+  local config_file="$fake_home/.config/hive-contribute.yml"
+  mkdir -p "$fake_home/.config/hive"
+  cat >"$config_file" <<EOF
+hub: wss://hub-a.example.com/contribute
+registration: $fake_home/.config/hive/contributor.env
+image: ghcr.io/projectbluefin/contribute:stable
+backend: omp
+EOF
+  chmod 600 "$config_file"
+  printf 'HIVE_HUB=wss://hub-a.example.com/contribute,wss://hub-b.example.com/contribute\nHIVE_REGISTRATION_TOKEN=token-a,token-b\nCONTRIBUTOR_ID=c-a,c-b\n' \
+    >"$fake_home/.config/hive/contributor.env"
+  chmod 600 "$fake_home/.config/hive/contributor.env"
+
+  local output
+  output="$("$launcher" run)"
+  assert_contains "$output" "starting isolated KVM worker" "valid multi-hub runs container"
+  assert_contains "$output" "✓ hive: wss://hub-a.example.com/contribute" "outputs config hub"
+
+  # Multi-hub in config is rejected (config hub must be single-valued)
+  sed -i "s|^hub: .*|hub: wss://hub-a.example.com/contribute,wss://hub-b.example.com/contribute|" "$config_file"
+  local status=0
+  output="$("$launcher" run 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "multi-hub in config must fail"
+  assert_contains "$output" "is not a single wss:// URL" "explains single hub requirement"
+  sed -i "s|^hub: .*|hub: wss://hub-a.example.com/contribute|" "$config_file"
+
+  # Invalid hub URL in registration
+  : >"$podman_log"
+  printf 'HIVE_HUB=wss://hub-a.example.com/contribute,not-a-valid-url\nHIVE_REGISTRATION_TOKEN=token-a,token-b\n' \
+    >"$fake_home/.config/hive/contributor.env"
+  chmod 600 "$fake_home/.config/hive/contributor.env"
+  status=0
+  output="$("$launcher" run 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "invalid hub URL in registration list must fail"
+  assert_contains "$output" "contains an invalid HIVE_HUB URL" "explains invalid registration hub"
+  assert_eq "$(grep -c '^run ' "$podman_log" || true)" "0" "no container started for invalid registration hub"
+
+  # Empty registration tokens
+  : >"$podman_log"
+  printf 'HIVE_HUB=wss://hub-a.example.com/contribute,wss://hub-b.example.com/contribute\n' \
+    >"$fake_home/.config/hive/contributor.env"
+  chmod 600 "$fake_home/.config/hive/contributor.env"
+  status=0
+  output="$("$launcher" run 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "empty tokens in registration must fail"
+  assert_contains "$output" "empty or malformed HIVE_REGISTRATION_TOKEN" "explains empty tokens"
+  assert_eq "$(grep -c '^run ' "$podman_log" || true)" "0" "no container started for empty tokens"
+
+  # Mismatched token and hub counts
+  : >"$podman_log"
+  printf 'HIVE_HUB=wss://hub-a.example.com/contribute,wss://hub-b.example.com/contribute\nHIVE_REGISTRATION_TOKEN=token-a\nCONTRIBUTOR_ID=c-a\n' \
+    >"$fake_home/.config/hive/contributor.env"
+  chmod 600 "$fake_home/.config/hive/contributor.env"
+  status=0
+  output="$("$launcher" run 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "mismatched hub and token list counts must fail"
+  assert_contains "$output" "mispaired HIVE_HUB (2 hubs) and HIVE_REGISTRATION_TOKEN (1 tokens)" "explains mispairing"
+  assert_eq "$(grep -c '^run ' "$podman_log" || true)" "0" "no container started for mispaired lists"
+
+  # Mismatched contributor ID and hub counts
+  : >"$podman_log"
+  printf 'HIVE_HUB=wss://hub-a.example.com/contribute,wss://hub-b.example.com/contribute\nHIVE_REGISTRATION_TOKEN=token-a,token-b\nCONTRIBUTOR_ID=c-a\n' \
+    >"$fake_home/.config/hive/contributor.env"
+  chmod 600 "$fake_home/.config/hive/contributor.env"
+  status=0
+  output="$("$launcher" run 2>&1)" || status=$?
+  [[ "$status" -ne 0 ]] || fail "mismatched hub and contributor ID list counts must fail"
+  assert_contains "$output" "mispaired HIVE_HUB (2 hubs) and CONTRIBUTOR_ID (1 IDs)" "explains ID mispairing"
+  assert_eq "$(grep -c '^run ' "$podman_log" || true)" "0" "no container started for mispaired ID list"
+}
+
 # doctor answers reachability, authentication, and model availability before a
 # worker exists, because the alternative is discovering a dead endpoint as a
 # failed assignment.
@@ -994,6 +1067,8 @@ test_local_inference_loopback_opt_in || exit 1
 echo "9. Testing a routable llmman endpoint and a malformed one..."
 test_local_inference_network_endpoint_and_bad_url || exit 1
 
+echo "9b. Testing multi-hub Commons projection and mismatched-list rejections..."
+test_multi_hub_commons_projection || exit 1
 echo "10. Testing doctor's llmman reachability, authentication, and model checks..."
 test_doctor_verifies_local_endpoint || exit 1
 

@@ -40,7 +40,7 @@ grep -qF 'HIVE_COMMIT is required' "$containerfile" ||
 ! grep -qE '^ARG HIVE_REF' "$containerfile" ||
   fail "HIVE_REF is no longer wired to anything; a settable arg that changes nothing is a lie"
 for caller in justfile .github/workflows/publish-contribute.yml .github/workflows/validate.yml; do
-  grep -qF 'refs/heads/v4' "$caller" || fail "${caller} does not resolve Hive's tracking branch"
+  grep -qF 'refs/heads/v5' "$caller" || fail "${caller} does not resolve Hive's tracking branch"
   grep -qF 'HIVE_COMMIT' "$caller" || fail "${caller} does not pass the resolved commit to the build"
 done
 grep -qF '/out/usr/share/hive/contribute/HIVE_COMMIT' "$containerfile" || fail "build must write resolved commit to HIVE_COMMIT"
@@ -91,7 +91,7 @@ grep -qF 'NODE_PATH=/usr/lib/hive/node_modules' "$containerfile" || fail "missin
 grep -qF 'io.hivecommons.contribute="true"' "$containerfile" || fail "missing contribute label"
 # shellcheck disable=SC2016 # matched literally in the Containerfile
 # The RESOLVED COMMIT, not the branch. AGENTS.md records this label as where
-# the SHA is stamped, and a label reading "v4" cannot tell two images built a
+# the SHA is stamped, and a label reading "v5" cannot tell two images built a
 # month apart from each other.
 grep -qF 'io.hivecommons.contribute.hive.ref="${HIVE_COMMIT}"' "$containerfile" ||
   fail "the hive.ref label must carry the resolved commit, not the branch"

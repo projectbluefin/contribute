@@ -36,7 +36,7 @@ Hive.
 Nothing in this repository pins Hive components (`contributor-agent.sh`, `contributor-relay.js`,
 `pi-backend.js`, `lib/pane-classifier.js`, `backends.conf`, `gh-wrapper.sh`,
 `restrictions/contributor-default.json`).
-Every image build resolves the upstream `v4` tracking branch, stamps the commit into
+Every image build resolves the upstream `v5` tracking branch, stamps the commit into
 `/usr/share/hive/contribute/HIVE_COMMIT`, records it in labels (`io.hivecommons.contribute.hive.ref`),
 and documents it in the SBOM. `hive-contribute setup` clones the same branch.
 

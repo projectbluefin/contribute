@@ -1,7 +1,7 @@
 name: publish contribute image
 
 on:
-  # Daily rebuild picks up upstream Hive's tracking branch (v4) automatically
+  # Daily rebuild picks up upstream Hive's tracking branch (v5) automatically
   # so the unpinned contributor image does not go stale.
   schedule:
     - cron: '40 3 * * *'
@@ -145,9 +145,9 @@ jobs:
           # the build legs would publish an index whose amd64 and arm64 images
           # carry different Hive commits, with SBOMs and attestations that
           # disagree about a tag claiming to be one artifact.
-          hive_commit="$(git ls-remote https://github.com/hivecommons/hive refs/heads/v4 | cut -f1)"
+          hive_commit="$(git ls-remote https://github.com/hivecommons/hive refs/heads/v5 | cut -f1)"
           [[ "$hive_commit" =~ ^[0-9a-f]{40}$ ]] ||
-            { echo "could not resolve hivecommons/hive v4" >&2; exit 1; }
+            { echo "could not resolve hivecommons/hive v5" >&2; exit 1; }
 
           release=false
           # The repo SHA alone does NOT identify this image. A scheduled

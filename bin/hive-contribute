@@ -48,10 +48,10 @@ DEFAULT_CPUS="2"
 # Hive's own tracking branch. Nothing here pins a commit: the appliance runs
 # upstream's current contributor runtime, and registration is performed by that
 # same branch's contribute-setup, so both follow one line. They are not the
-# same commit: setup clones v4 live, while the image carries the SHA resolved
+# same commit: setup clones v5 live, while the image carries the SHA resolved
 # when it was last built, so they can differ. The daily rebuild is meant to
 # bound that gap, not to guarantee it.
-HIVE_REF="v4"
+HIVE_REF="v5"
 
 config_value() {
   # One key, first match, comments and surrounding quotes removed, leading ~
@@ -104,8 +104,10 @@ load_config() {
     # Seed from an existing Hive registration when there is one: the hub is the
     # single value this launcher cannot invent, and Hive already wrote it.
     local seeded=""
-    [[ -f "$DEFAULT_REGISTRATION" ]] &&
+    if [[ -f "$DEFAULT_REGISTRATION" ]]; then
       seeded="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?HIVE_HUB[[:space:]]*=[[:space:]]*"?([^"]*)"?[[:space:]]*$/\2/p' "$DEFAULT_REGISTRATION" | head -1)"
+      seeded="${seeded%%,*}"
+    fi
     write_default_config "$seeded"
     note "wrote ${CONFIG_PATH}"
   fi
@@ -125,11 +127,49 @@ load_config() {
   CPUS="${CPUS:-$DEFAULT_CPUS}"
 }
 
+# A hub setting in the config or registration may be a single wss:// endpoint
+# or hivectl's comma-separated Commons projection (ranked, spread, neediest).
+valid_hub_list() {
+  local list="$1" hub
+  local -a hubs
+  [[ -n "$list" && "$list" != ,* && "$list" != *, && "$list" != *,,* ]] || return 1
+  IFS=',' read -r -a hubs <<<"$list"
+  for hub in "${hubs[@]}"; do
+    [[ "$hub" =~ ^wss://[^[:space:]/,]+(/[^[:space:]]*)?$ ]] || return 1
+  done
+}
+
 require_hub() {
   [[ -n "${HUB:-}" ]] ||
     fail "no hub in ${CONFIG_PATH}. Run 'hive-contribute setup', or set 'hub: wss://<host>/contribute'."
-  [[ "$HUB" =~ ^wss://[^[:space:]/]+(/[^[:space:]]*)?$ ]] ||
-    fail "hub '${HUB}' in ${CONFIG_PATH} is not a wss:// URL."
+  [[ "$HUB" != *,* && "$HUB" =~ ^wss://[^[:space:]/]+(/[^[:space:]]*)?$ ]] ||
+    fail "hub '${HUB}' in ${CONFIG_PATH} is not a single wss:// URL."
+  if [[ -f "$REGISTRATION" ]]; then
+    local reg_hubs reg_tokens reg_ids
+    local -a h_arr=() t_arr=() id_arr=()
+    reg_hubs="$(registration_value HIVE_HUB)"
+    valid_hub_list "$reg_hubs" ||
+      fail "registration ${REGISTRATION} contains an invalid HIVE_HUB URL."
+    IFS=',' read -r -a h_arr <<<"$reg_hubs"
+
+    reg_tokens="$(registration_value HIVE_REGISTRATION_TOKEN)"
+    [[ -n "$reg_tokens" && "$reg_tokens" != ,* && "$reg_tokens" != *, && "$reg_tokens" != *,,* ]] ||
+      fail "registration ${REGISTRATION} has empty or malformed HIVE_REGISTRATION_TOKEN."
+    IFS=',' read -r -a t_arr <<<"$reg_tokens"
+    if [[ "${#h_arr[@]}" -gt 1 && "${#t_arr[@]}" -ne "${#h_arr[@]}" ]]; then
+      fail "registration ${REGISTRATION} has mispaired HIVE_HUB (${#h_arr[@]} hubs) and HIVE_REGISTRATION_TOKEN (${#t_arr[@]} tokens)."
+    fi
+
+    reg_ids="$(registration_value CONTRIBUTOR_ID)"
+    if [[ -n "$reg_ids" ]]; then
+      [[ "$reg_ids" != ,* && "$reg_ids" != *, && "$reg_ids" != *,,* ]] ||
+        fail "registration ${REGISTRATION} has malformed CONTRIBUTOR_ID."
+      IFS=',' read -r -a id_arr <<<"$reg_ids"
+      if [[ "${#id_arr[@]}" -ne "${#h_arr[@]}" ]]; then
+        fail "registration ${REGISTRATION} has mispaired HIVE_HUB (${#h_arr[@]} hubs) and CONTRIBUTOR_ID (${#id_arr[@]} IDs)."
+      fi
+    fi
+  fi
 }
 
 instance_slug() {
@@ -303,6 +343,7 @@ EOF
   rm -rf "$tmp"
   local hub
   hub="$(registration_value HIVE_HUB)"
+  hub="${hub%%,*}"
   if [[ -n "$hub" && "$hub" != "$HUB" ]]; then
     # The hub is the one value that must agree between config and credential.
     sed -i -E "s|^[[:space:]]*hub[[:space:]]*:.*$|hub: ${hub}|" "$CONFIG_PATH"

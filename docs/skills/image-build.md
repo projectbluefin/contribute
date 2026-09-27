@@ -93,7 +93,7 @@ The OCI image leaves model and effort selection to OMP.
     sets `startup.checkUpdate: false`, since a read-only image cannot perform
     the `omp update` the banner advertises, and `symbolPreset: nerd`.
 15. **Upstream Hive is never pinned**: the caller resolves Hive's tracking
-    branch (`refs/heads/v4`) and passes the SHA as `--build-arg HIVE_COMMIT`;
+    branch (`refs/heads/v5`) and passes the SHA as `--build-arg HIVE_COMMIT`;
     `just contribute-build` and both workflows do this. The build REQUIRES it
     and refuses a missing or malformed value — a build that resolved the branch
     itself could stamp the in-image commit file but not the label, shipping an
@@ -104,7 +104,7 @@ The OCI image leaves model and effort selection to OMP.
 
 ## Pin maintenance
 
-Upstream Hive tracks `v4` and is resolved at build time (never statically pinned).
+Upstream Hive tracks `v5` and is resolved at build time (never statically pinned).
 OMP pins appear in `image/contribute/Containerfile`. `node scripts/update-omp-pins.mjs <version>`
 reads the published GitHub release asset digests and updates the pins. Renovate runs
 that command daily after changing `OMP_VERSION`, then automerges only after

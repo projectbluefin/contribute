@@ -39,8 +39,8 @@ contribute-build tag="localhost/hive/contribute:dev":
     set -euo pipefail
     ENGINE="${CONTAINER_ENGINE:-podman}"
     VERSION="$(bash scripts/contribute-version.sh)"
-    HIVE_COMMIT="$(git ls-remote https://github.com/hivecommons/hive refs/heads/v4 | cut -f1)"
-    [[ "$HIVE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "could not resolve hivecommons/hive v4" >&2; exit 1; }
+    HIVE_COMMIT="$(git ls-remote https://github.com/hivecommons/hive refs/heads/v5 | cut -f1)"
+    [[ "$HIVE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "could not resolve hivecommons/hive v5" >&2; exit 1; }
     echo "→ building {{tag}} as version ${VERSION} with Hive ${HIVE_COMMIT:0:12}"
     "$ENGINE" build \
       --format oci \
