@@ -983,6 +983,120 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
+# Scenario 7d: `switch` moves the worker's first hive, and refuses the cases
+# where there is nothing to move. Picking a hive is the whole command, so a
+# named hive that does not match, a machine with one hive, and a machine with
+# none each have to say so rather than reorder a list or bootstrap into a
+# prompt over an empty menu.
+# -----------------------------------------------------------------------------
+test_switch_moves_the_first_hive() {
+  clean_env
+  local reg="$fake_home/.config/hive/contributor.env" state="$fake_home/.config/hive/fake-profiles"
+  mkdir -p "$fake_home/.config/hive"
+  cat >"$fake_home/.config/hive-contribute.yml" <<EOF
+hub: wss://hub-a.example.com/contribute
+registration: $reg
+image: ghcr.io/projectbluefin/contribute:stable
+backend: omp
+EOF
+  chmod 600 "$fake_home/.config/hive-contribute.yml"
+
+  # hivectl reduced to the profile store it owns, as scenario 7b2 does:
+  # one name<TAB>hub per line, active first, contributor.env projected from it.
+  cat >"$fake_bin/git" <<'EOF'
+#!/usr/bin/env bash
+dir=""
+[[ "${1:-}" == -C ]] && { dir="$2"; shift 2; }
+case "${1:-}" in
+  ls-remote) printf '0000000000000000000000000000000000000000\trefs/tags/v5.1.0\n' ;;
+  init) mkdir -p "${@: -1}/.git" ;;
+  checkout)
+    mkdir -p "$dir/bin"
+    cat >"$dir/bin/hivectl-bootstrap.sh" <<'BOOT'
+#!/usr/bin/env bash
+set -eu
+state="$HOME/.config/hive/fake-profiles"
+project() {
+  local hubs tokens ids
+  hubs="$(cut -f2 "$state" | paste -sd,)"
+  tokens="$(cut -f1 "$state" | sed 's/^/token-/' | paste -sd,)"
+  ids="$(cut -f1 "$state" | sed 's/^/c-/' | paste -sd,)"
+  printf 'HIVE_REGISTRATION_TOKEN=%s\nHIVE_HUB=%s\nCONTRIBUTOR_ID=%s\n' "$tokens" "$hubs" "$ids" >"$HOME/.config/hive/contributor.env"
+}
+case "$1 ${2:-}" in
+  "hives --help") exit 0 ;;
+  "hives list") jq -Rn '[inputs | split("\t") | {name: .[0], hub: .[1], active: false}] | (.[0].active = true)' <"$state" ;;
+  "hives use") { grep -P "^$3\t" "$state"; grep -vP "^$3\t" "$state"; } >"$state.new"; mv "$state.new" "$state"; echo "USE $3" >>"$state.log"; project ;;
+  "hives strategy") echo "The Commons strategy: ranked" ;;
+esac
+BOOT
+    chmod +x "$dir/bin/hivectl-bootstrap.sh"
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "$fake_bin/git"
+
+  local output status
+
+  # Case A: no registration at all. `switch` has nothing to choose between, so
+  # it names the command that creates the choice instead of prompting.
+  : >"$state.log"
+  status=0
+  output="$("$launcher" switch 2>&1)" || status=$?
+  assert_eq "$status" "1" "switch with no hives exits non-zero"
+  assert_contains "$output" "no hives yet" "switch with no hives names the gap"
+  assert_contains "$output" "hive-contribute hives" "switch with no hives names the picker"
+  [[ ! -s "$state.log" ]] || fail "switch reordered hives on a machine with none: $(cat "$state.log")"
+
+  # Case B: exactly one hive. Reordering a one-item list is a no-op, and
+  # reporting it as a switch would be a lie.
+  printf 'hub-a\twss://hub-a.example.com/contribute\n' >"$state"
+  printf 'HIVE_REGISTRATION_TOKEN=token-hub-a\nHIVE_HUB=wss://hub-a.example.com/contribute\nCONTRIBUTOR_ID=c-hub-a\n' >"$reg"
+  chmod 600 "$reg"
+  : >"$state.log"
+  output="$("$launcher" switch 2>&1)" || fail "switch with a single hive exited non-zero"
+  assert_contains "$output" "only one hive followed: wss://hub-a.example.com/contribute" "single hive named"
+  assert_contains "$output" "hive-contribute hives" "single hive points at the picker"
+  [[ ! -s "$state.log" ]] || fail "switch called hivectl for a single-hive list: $(cat "$state.log")"
+
+  # Case C: a named hive is matched against the same label the listing shows,
+  # by substring, and becomes the hive the worker asks first.
+  printf 'hub-a\twss://hub-a.example.com/contribute\nacme-b\twss://hosted-b.hive.hivecommons.dev/contribute\n' >"$state"
+  : >"$state.log"
+  output="$("$launcher" switch acme-b 2>&1)" || fail "switch to a followed hive exited non-zero"
+  grep -qxF 'USE acme-b' "$state.log" ||
+    fail "switch did not move the named hive through hivectl: $(cat "$state.log" 2>/dev/null)"
+  grep -qx 'HIVE_HUB=wss://hosted-b.hive.hivecommons.dev/contribute,wss://hub-a.example.com/contribute' "$reg" ||
+    fail "switch did not put the named hive first in the registration: $(grep '^HIVE_HUB=' "$reg")"
+  assert_contains "$output" "  1. acme-b  (hosted-b.hive.hivecommons.dev)" "switched hive listed first"
+  assert_contains "$output" "  2. hub-a  (hub-a.example.com)" "the other hive stays followed"
+  assert_contains "$output" "routing: ranked" "routing reported alongside the new order"
+
+  # Case D: a name that matches nothing must fail rather than fall through to
+  # the prompt, which would silently switch to whatever was picked instead.
+  : >"$state.log"
+  status=0
+  output="$("$launcher" switch nope </dev/null 2>&1)" || status=$?
+  assert_eq "$status" "1" "switch to an unknown hive exits non-zero"
+  assert_contains "$output" "no followed hive matches 'nope'." "unmatched hive named"
+  [[ ! -s "$state.log" ]] || fail "an unmatched name still reordered hives: $(cat "$state.log")"
+
+  # Case E: no argument prompts with every followed hive and switches to the
+  # one chosen. hub-a is second in the list after case C.
+  : >"$state.log"
+  output="$(printf '2\n' | "$launcher" switch 2>&1)" || fail "prompted switch exited non-zero"
+  assert_contains "$output" "Which hive should the worker ask first?" "switch prompts without an argument"
+  grep -qxF 'USE hub-a' "$state.log" ||
+    fail "the prompted choice was not applied: $(cat "$state.log" 2>/dev/null)"
+  grep -qx 'HIVE_HUB=wss://hub-a.example.com/contribute,wss://hosted-b.hive.hivecommons.dev/contribute' "$reg" ||
+    fail "the prompted choice did not reach the registration: $(grep '^HIVE_HUB=' "$reg")"
+  assert_contains "$output" "  1. hub-a  (hub-a.example.com)" "prompted choice listed first"
+
+  rm -f "$fake_bin/git" "$state" "$state.log"
+}
+
+# -----------------------------------------------------------------------------
 # Scenario 6: non-Linux host contract (#646). When run on macOS or Windows,
 #             doctor and run must name the platform requirement and Lima/WSL2
 #             remediation rather than failing on remote or missing container engines.
@@ -1371,6 +1485,8 @@ echo "5b2. Testing that the hives picker adds what was ticked..."
 test_hives_picker_adds_ticked_hives || exit 1
 echo "5c. Testing that hive changes reach this registration's running workers only..."
 test_hives_reload_reaches_matching_workers || exit 1
+echo "5d. Testing that switch moves the first hive, and refuses when it cannot..."
+test_switch_moves_the_first_hive || exit 1
 echo "6. Testing non-Linux host rejection..."
 test_non_linux_host_rejection || exit 1
 echo "7. Testing that local inference stays off until it is selected..."
