@@ -94,6 +94,12 @@ if registry connectivity fails.
 - Pass secrets only through inherited environment names or documented private
   mounts. Never put values in arguments, logs, image layers, socket paths, SSH
   targets, or committed files.
+- `hive-contribute hives` (and `switch`, for hive labels) authenticates one
+  request to the Hive Commons directory (`https://hive.hivecommons.dev/api/saas/my-hives`)
+  with the operator's github.com token, to list the hives that know the
+  account — upstream `contribute-setup`'s own lookup. The token crosses on
+  stdin (`curl --config -`), never argv, and the flow announces the lookup
+  before performing it.
 - Preserve `--userns keep-id:uid=65532,gid=65532` for the `0600` contributor registration. Under WSL2, keep this file on the Linux filesystem to ensure the `0600` mode is preserved.
 - The forwarded provider-credential allowlist names GitHub, Copilot, Anthropic,
   OpenAI, OpenRouter, Gemini, Google, and terminal variables, plus the Amazon Bedrock
