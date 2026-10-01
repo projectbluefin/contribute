@@ -124,6 +124,15 @@ lockfile, pushes the result onto the branch, and dispatches `validate` on the
 refreshed commit. It is a `pull_request_target` workflow: the workflow file and
 the script both come from `main`, the head contributes only its lockfile, and
 nothing from the pull request head is executed.
+The hash refresh only rewrites pins the lockfile already carries, so a bump that
+adds a new transitive dependency cannot be repaired by it -- and pip rejects the
+whole `--require-hashes` install over the one unhashed package. The refresh
+therefore checks each pinned release's PyPI dependency list against the lock and
+fails, naming the missing packages, rather than pushing a lock that installs
+nowhere; recompile it with
+`uv pip compile --generate-hashes --python-version 3.13 -`. Dependencies gated
+behind an extra, or behind an environment marker this check cannot decide, are
+never reported.
 The OMP, GitHub CLI, Node.js, and tmux synchronizers are configuration over one
 shared implementation in `scripts/lib/release-pins.mjs`: change the pin-rewriting
 or release-lookup behaviour there, not in four places.
