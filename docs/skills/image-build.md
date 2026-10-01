@@ -1,7 +1,7 @@
 ---
 name: image-build
-version: "3.7"
-last_updated: "2026-09-19"
+version: "3.9"
+last_updated: "2026-10-01"
 id: image-build
 one_line_purpose: Build and pin the OMP contributor image.
 entry_point: docs/skills/image-build.md
@@ -117,13 +117,22 @@ runs in their respective Renovate branches via `node scripts/update-gh-pins.mjs`
 Those post-upgrade tasks only run under a self-hosted Renovate that allowlists
 them, and the organisation runner and the hosted app that also push these
 branches do not. For `requirements-ci.lock` the pull request itself is the
-backstop: `.github/workflows/renovate-hashes.yml` regenerates the hashes on
+backstop: `.github/workflows/renovate-hashes.yml` recompiles the lockfile on
 any pull request that Renovate (`renovate[bot]` or `mergeraptor[bot]`) opens
 and pushes from a `renovate/*` branch of this repository and that touches the
 lockfile, pushes the result onto the branch, and dispatches `validate` on the
 refreshed commit. It is a `pull_request_target` workflow: the workflow file and
 the script both come from `main`, the head contributes only its lockfile, and
-nothing from the pull request head is executed.
+nothing from the pull request head is executed. The synchronizer requires `uv`
+on its PATH; the repair job installs it with `setup-uv`, and the Renovate
+container ships `uv` for the post-upgrade run.
+It compiles sanitized PyPI pins with Python 3.13 and generated hashes, retaining
+the bumped versions while adding newly required transitive dependencies. Only
+wheels are eligible, project configuration is ignored, and includes, URLs,
+local paths, and index directives in the head lockfile are rejected before
+resolution. Existing incompatible pins fail resolution without rewriting the lock,
+as does a pin that the platform-specific resolution drops because an environment
+marker excluded it.
 The OMP, GitHub CLI, Node.js, and tmux synchronizers are configuration over one
 shared implementation in `scripts/lib/release-pins.mjs`: change the pin-rewriting
 or release-lookup behaviour there, not in four places.

@@ -60,7 +60,10 @@ Node.js, and tmux) along with PyPI dependencies in `requirements-ci.lock`.
 Allowlisted tasks (`scripts/update-omp-pins.mjs`, `scripts/update-gh-pins.mjs`,
 `scripts/update-node-pins.mjs`, `scripts/update-tmux-pins.mjs`, and
 `scripts/update-requirements-ci-hashes.mjs`) synchronize version pins and verified
-per-architecture digests across Containerfiles and lockfile hashes.
+per-architecture digests across Containerfiles, and recompile the lockfile.
+Because only a self-hosted Renovate runs those tasks,
+`.github/workflows/renovate-hashes.yml` recompiles `requirements-ci.lock` again
+on the Renovate pull request as the backstop that actually lands.
 After checks and OMP-specific automerge, the `main` push triggers the image
 publish workflow.
 

@@ -13,7 +13,7 @@ name: renovate-hashes
 # is neither the first nor the most frequent runner to touch the branch (#686).
 #
 # So the repair runs here, on the pull request, regardless of which Renovate
-# pushed it: regenerate the hashes from PyPI metadata and push the result back
+# pushed it: resolve the pinned requirements and hashes from PyPI and push them back
 # onto the Renovate branch.
 #
 # Trust model. This job holds a token that can push to any branch of the
@@ -124,11 +124,17 @@ jobs:
         with:
           node-version: '24.x'
 
-      - name: Regenerate requirements-ci.lock hashes from PyPI
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: false
+
+      - name: Resolve requirements-ci.lock dependencies and hashes from PyPI
         id: refresh
         # The script resolves the lockfile from its working directory, so the
         # base's script runs with the head checkout as its working directory.
-        # It has no dependencies beyond the Node.js standard library.
+        # uv reads sanitized pins in an isolated directory, ignores config,
+        # and uses only wheels: PR input cannot run package build hooks.
         working-directory: head
         run: |
           set -euo pipefail
