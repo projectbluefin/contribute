@@ -1,7 +1,7 @@
 ---
 name: image-build
-version: "3.7"
-last_updated: "2026-09-19"
+version: "3.9"
+last_updated: "2026-10-02"
 id: image-build
 one_line_purpose: Build and pin the OMP contributor image.
 entry_point: docs/skills/image-build.md
@@ -117,13 +117,29 @@ runs in their respective Renovate branches via `node scripts/update-gh-pins.mjs`
 Those post-upgrade tasks only run under a self-hosted Renovate that allowlists
 them, and the organisation runner and the hosted app that also push these
 branches do not. For `requirements-ci.lock` the pull request itself is the
-backstop: `.github/workflows/renovate-hashes.yml` regenerates the hashes on
+backstop: `.github/workflows/renovate-hashes.yml` recompiles the lock with hashes on
 any pull request that Renovate (`renovate[bot]` or `mergeraptor[bot]`) opens
 and pushes from a `renovate/*` branch of this repository and that touches the
 lockfile, pushes the result onto the branch, and dispatches `validate` on the
 refreshed commit. It is a `pull_request_target` workflow: the workflow file and
 the script both come from `main`, the head contributes only its lockfile, and
-nothing from the pull request head is executed.
+nothing from the pull request head is executed. The CI lock synchronizer requires
+`uv` on `PATH` and compiles the trusted CI roots (`pre-commit` and `uv` itself,
+declared in the script) for Python 3.13. `uv` is a root so that the workflows
+installing the compiler can take it from the hashed lock with
+`pip install --require-hashes` instead of an unverified PyPI download.
+Versions come from the lockfile; all existing pins
+are sanitized constraints, not additional roots. Newly needed transitive
+packages gain hashes and unused pins disappear, regardless of their `# via`
+annotations. Add future direct CI requirements to the script's root list,
+not by inferring roots from lock comments or unannotated entries. It rejects
+non-pinned requirement directives and disables uv config discovery and source
+builds so PR data cannot select executable build hooks. Conflicting pins for
+packages still in the dependency closure fail resolution without changing the
+lockfile. Constraint annotations use a stable lockfile name rather than a
+temporary path. That `uv` requirement also applies to
+the same command run as a Renovate post-upgrade task; where the Renovate runtime
+has no `uv` the task fails and `renovate-hashes.yml` is the repair path.
 The OMP, GitHub CLI, Node.js, and tmux synchronizers are configuration over one
 shared implementation in `scripts/lib/release-pins.mjs`: change the pin-rewriting
 or release-lookup behaviour there, not in four places.
@@ -134,6 +150,7 @@ or release-lookup behaviour there, not in four places.
 node --test tests/update-omp-pins.test.mjs
 node --test tests/update-derived-pins.test.mjs
 node --test tests/renovate-tracking.test.mjs
+CI_LOCK_UV_TEST=1 node --test tests/ci-lock-pruning.test.mjs # requires uv and PyPI
 bash tests/contribute-contract.sh
 git diff --check
 ```

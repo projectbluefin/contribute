@@ -91,6 +91,8 @@ jobs:
           node --test tests/update-omp-pins.test.mjs
           node --test tests/update-derived-pins.test.mjs
           node --test tests/renovate-tracking.test.mjs
+          python -m pip install uv
+          CI_LOCK_UV_TEST=1 node --test tests/ci-lock-pruning.test.mjs
           bash tests/contribute-contract.sh
           bash tests/launcher-contract.sh
           bash tests/version-derivation.sh
