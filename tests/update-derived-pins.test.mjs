@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,7 +24,7 @@ import {
 } from "../scripts/update-tmux-pins.mjs";
 
 import {
-	fetchPackageHashes,
+	stripConstraintAnnotations,
 	syncRequirementsCiHashes,
 	updateLockfileContent,
 } from "../scripts/update-requirements-ci-hashes.mjs";
@@ -239,60 +240,193 @@ test("syncTmuxPins updates contributor image from tmux-builds release", async (t
 // PyPI (requirements-ci.lock) contracts
 // --------------------------------------------------------------------------
 
-test("fetchPackageHashes extracts and sorts unique sha256 digests from PyPI", async () => {
-	const mockPyPiPayload = {
-		urls: [
-			{ digests: { sha256: X64 } },
-			{ digests: { sha256: ARM64 } },
-			{ digests: { sha256: X64 } },
-		],
-	};
-	const hashes = await fetchPackageHashes("sample-pkg", "1.0.0", async () => response(mockPyPiPayload));
-	assert.deepEqual(hashes, [X64, ARM64].sort());
+test("resolver failures leave the lockfile untouched", async () => {
+	const root = await mkdtemp(join(tmpdir(), "ci-lock-"));
+	const path = join(root, "requirements-ci.lock");
+	const source = "foo==2.0.0\n";
+	try {
+		await writeFile(path, source);
+		await assert.rejects(
+			() => syncRequirementsCiHashes({ root, runImpl: () => ({ status: 1, stderr: "conflicting pins" }) }),
+			/dependency resolution failed/,
+		);
+		assert.equal(await readFile(path, "utf8"), source);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
 
+test("lockfile data cannot supply resolver options or executable requirements", async () => {
+	for (const directive of ["--index-url https://example.com", "-r other.txt", "-e .", "foo @ file:///tmp/foo.whl"]) {
+		await assert.rejects(
+			() => updateLockfileContent(`${directive}\n`, () => assert.fail("must reject before invoking uv")),
+			/cannot parse requirement line/,
+		);
+	}
 	await assert.rejects(
-		() => fetchPackageHashes("sample-pkg", "1.0.0", async () => response({}, { status: 404, statusText: "Not Found" })),
-		/PyPI metadata lookup failed/,
-	);
-	await assert.rejects(
-		() => fetchPackageHashes("sample-pkg", "1.0.0", async () => response({ urls: [] })),
-		/No release files found on PyPI/,
+		() => updateLockfileContent("foo==1.0.0\n", () => ({ status: 0, stdout: "" })),
+		/empty lockfile/,
 	);
 });
 
-test("updateLockfileContent regenerates hashes and preserves comments", async () => {
+test("updateLockfileContent recompiles pins and includes new transitive dependencies", async () => {
 	const initial = `# Header comment
 # Compiled via: uv pip compile
 foo==1.0.0 \\
     --hash=sha256:${"1".repeat(64)}
     # via bar
 `;
-	const updated = await updateLockfileContent(initial, async (url) => {
-		assert.match(String(url), /pypi\.org\/pypi\/foo\/1\.0\.0\/json/);
-		return response({
-			urls: [
-				{ digests: { sha256: X64 } },
-				{ digests: { sha256: ARM64 } },
-			],
-		});
+	const updated = await updateLockfileContent(initial, (command, args, options) => {
+		assert.equal(command, "uv");
+		assert.ok(args.includes("--no-config"));
+		assert.ok(args.includes("--only-binary"));
+		// Annotations stay on so the refresh does not rewrite every block of
+		// the lockfile to drop its existing `# via` lines.
+		assert.ok(!args.includes("--no-annotate"));
+		assert.equal(options.input, "foo==1.0.0\n");
+		return { status: 0, stdout: `foo==1.0.0 \\\n    --hash=sha256:${X64}\nnew-dep==2.0.0 \\\n    --hash=sha256:${ARM64}\n` };
 	});
 
 	assert.match(updated, /^# Header comment/m);
 	assert.match(updated, /^# Compiled via: uv pip compile/m);
 	assert.match(updated, /^foo==1\.0\.0 \\$/m);
-	assert.match(updated, new RegExp(`^    --hash=sha256:${[X64, ARM64].sort()[0]} \\\\$`, "m"));
-	assert.match(updated, new RegExp(`^    --hash=sha256:${[X64, ARM64].sort()[1]}$`, "m"));
-	assert.match(updated, /^    # via bar$/m);
+	assert.match(updated, /^new-dep==2\.0\.0 \\$/m);
+	assert.match(updated, new RegExp(`^    --hash=sha256:${ARM64}$`, "m"));
+});
+
+test("transitive pins are replayed as constraints, not as permanent requirements", async (t) => {
+	// Every entry used to be fed to uv as a top-level `==` requirement, so a
+	// transitive dependency nothing depended on any more could never leave the
+	// lock, and one whose new version disagreed with the old pin blocked
+	// resolution until someone hand-edited the file.
+	const source = `# Header
+pre-commit==4.6.2 \\
+    --hash=sha256:${"1".repeat(64)}
+nodeenv==1.11.0 \\
+    --hash=sha256:${"2".repeat(64)}
+    # via pre-commit
+filelock==4.0.7 \\
+    --hash=sha256:${"3".repeat(64)}
+    # via
+    #   python-discovery
+    #   virtualenv
+`;
+
+	let constraintsPath;
+	let constraints;
+	const updated = await updateLockfileContent(source, (command, args, options) => {
+		assert.equal(command, "uv");
+		// Only the unannotated entry is an ask of this project.
+		assert.equal(options.input, "pre-commit==4.6.2\n");
+		constraintsPath = args[args.indexOf("--constraint") + 1];
+		assert.ok(constraintsPath, "transitive pins are handed over as --constraint");
+		constraints = readFileSync(constraintsPath, "utf8");
+		return { status: 0, stdout: `pre-commit==4.6.2 \\\n    --hash=sha256:${X64}\n    # via -r -\n` };
+	});
+
+	assert.equal(constraints, "nodeenv==1.11.0\nfilelock==4.0.7\n");
+	assert.match(updated, /^# Header/m);
+	// A constraint binds a version only while something still needs the
+	// package, so a dropped transitive dependency is simply gone.
+	assert.doesNotMatch(updated, /nodeenv/);
+	// The scratch constraints file does not outlive the run.
+	assert.equal(existsSync(constraintsPath), false);
+});
+
+test("a via annotation naming only an input file leaves the entry direct", async () => {
+	// `# via -r -` or `# via -c constraints.txt` records which input the
+	// requirement was read from, not a package that depends on it. Reading
+	// either as "transitive" would demote this project's own asks to
+	// constraints and resolve nothing at all.
+	const source = `# Header
+pre-commit==4.6.2 \\
+    --hash=sha256:${"1".repeat(64)}
+    # via -r -
+nodeenv==1.11.0 \\
+    --hash=sha256:${"2".repeat(64)}
+    # via
+    #   -c constraints.txt
+    #   pre-commit
+`;
+	let constraints;
+	await updateLockfileContent(source, (command, args, options) => {
+		assert.equal(options.input, "pre-commit==4.6.2\n");
+		constraints = readFileSync(args[args.indexOf("--constraint") + 1], "utf8");
+		return { status: 0, stdout: `pre-commit==4.6.2 \\\n    --hash=sha256:${X64}\n` };
+	});
+	assert.equal(constraints, "nodeenv==1.11.0\n");
+});
+
+test("the scratch constraints file never reaches the committed lockfile", () => {
+	// uv annotates every source of a requirement, including the constraints
+	// file, whose path is a fresh temporary directory on each run. Left in, it
+	// would rewrite the lockfile every time and publish the runner's temp path.
+	const output = `foo==1.0.0 \\
+    --hash=sha256:${X64}
+    # via
+    #   -c /tmp/requirements-ci-abc123/constraints.txt
+    #   bar
+baz==2.0.0 \\
+    --hash=sha256:${ARM64}
+    # via -c /tmp/requirements-ci-abc123/constraints.txt
+qux==3.0.0
+    # via
+    #   -c /tmp/requirements-ci-abc123/constraints.txt
+    #   bar
+    #   baz
+`;
+	const stripped = stripConstraintAnnotations(output);
+	assert.doesNotMatch(stripped, /constraints\.txt/);
+	// One remaining source collapses back to the single-line form uv would have
+	// written without the constraints file.
+	assert.match(stripped, /^    # via bar$/m);
+	// A package the constraints file alone vouched for keeps no empty `# via`.
+	assert.doesNotMatch(stripped, /^    # via$\n(?!    #   )/m);
+	// Several remaining sources keep the indented list.
+	assert.match(stripped, /^    # via\n    #   bar\n    #   baz$/m);
+	// Nothing else moves.
+	assert.match(stripped, /^foo==1\.0\.0 \\$/m);
+	assert.match(stripped, new RegExp(`^    --hash=sha256:${ARM64}$`, "m"));
+});
+
+test("a lockfile with no via annotations keeps every entry as a requirement", async () => {
+	// --no-annotate output records nothing about what is transitive, so there is
+	// no safe way to demote any of it.
+	const source = `# Header
+foo==1.0.0 \\
+    --hash=sha256:${"1".repeat(64)}
+bar==2.0.0 \\
+    --hash=sha256:${"2".repeat(64)}
+`;
+	await updateLockfileContent(source, (command, args, options) => {
+		assert.equal(args.includes("--constraint"), false);
+		assert.equal(options.input, "foo==1.0.0\nbar==2.0.0\n");
+		return { status: 0, stdout: `foo==1.0.0 \\\n    --hash=sha256:${X64}\n` };
+	});
+});
+
+test("a missing uv names itself as the prerequisite", async () => {
+	// spawnSync reports this as a bare `spawnSync uv ENOENT`, which says nothing
+	// about uv being something the caller has to install.
+	const enoent = Object.assign(new Error("spawnSync uv ENOENT"), { code: "ENOENT" });
+	await assert.rejects(
+		() => updateLockfileContent(`foo==1.0.0\n`, () => ({ error: enoent })),
+		/uv was not found on PATH/,
+	);
+
+	// Any other spawn failure still surfaces unchanged.
+	const permission = Object.assign(new Error("spawnSync uv EACCES"), { code: "EACCES" });
+	await assert.rejects(
+		() => updateLockfileContent(`foo==1.0.0\n`, () => ({ error: permission })),
+		/EACCES/,
+	);
 });
 
 test("updateLockfileContent keeps extras and environment markers, and refuses unparseable lines", async () => {
-	const hashPayload = response({
-		urls: [{ digests: { sha256: X64 } }, { digests: { sha256: ARM64 } }],
-	});
-	const lookups = [];
-	const fetchImpl = async (url) => {
-		lookups.push(String(url));
-		return hashPayload;
+	const inputs = [];
+	const runImpl = (command, args, options) => {
+		inputs.push(options.input);
+		return { status: 0, stdout: options.input.replaceAll("\n", ` \\\n    --hash=sha256:${X64}\n`) };
 	};
 
 	// An extras requirement does not start with `name==`, so a splitter that
@@ -306,21 +440,21 @@ coverage[toml]==7.6.0 \\
     --hash=sha256:${"2".repeat(64)}
     # via pytest-cov
 `;
-	const extrasUpdated = await updateLockfileContent(withExtras, fetchImpl);
+	const extrasUpdated = await updateLockfileContent(withExtras, runImpl);
 	assert.match(extrasUpdated, /^coverage\[toml\]==7\.6\.0 \\$/m);
-	assert.match(extrasUpdated, /^    # via pytest-cov$/m);
-	// PyPI is queried for the project, not for the extras selector.
-	assert.ok(lookups.some((url) => url.includes("/pypi/coverage/7.6.0/json")));
+	assert.ok(inputs[0].includes("coverage[toml]==7.6.0\n"));
 
-	// The marker decides whether the package installs at all, so re-emitting
-	// the requirement without it silently changes what CI installs.
+	// The marker decides whether the package installs at all, so dropping it
+	// before handing the requirement to the resolver silently changes what CI
+	// installs. uv owns what survives resolution for the target Python, so the
+	// guarantee this script can make is that the marker reaches it intact.
 	const withMarker = `# Header
 tomli==2.0.1 ; python_version < "3.11" \\
     --hash=sha256:${"3".repeat(64)}
     # via pytest
 `;
-	const markerUpdated = await updateLockfileContent(withMarker, fetchImpl);
-	assert.match(markerUpdated, /^tomli==2\.0\.1 ; python_version < "3\.11" \\$/m);
+	await updateLockfileContent(withMarker, runImpl);
+	assert.equal(inputs[1], `tomli==2.0.1 ; python_version < "3.11"\n`);
 
 	// Anything this cannot parse must stop the rewrite rather than be omitted
 	// from it.
@@ -328,7 +462,7 @@ tomli==2.0.1 ; python_version < "3.11" \\
 		() =>
 			updateLockfileContent(
 				`# Header\nfoo==1.0.0 unexpected-token \\\n    --hash=sha256:${"4".repeat(64)}\n`,
-				fetchImpl,
+				runImpl,
 			),
 		/cannot parse requirement line/,
 	);
@@ -396,6 +530,17 @@ test("Renovate configuration tracks GH, Node, tmux, and requirements-ci with pos
 	const workflow = await readFile(".github/workflows/publish-contribute.yml", "utf8");
 	assert.match(workflow, /push:\n    branches:\n      - main/);
 	assert.match(workflow, /node --test tests\/update-derived-pins\.test\.mjs/);
+});
+
+test("the lock header names the command the script actually runs", async () => {
+	// A maintainer reproducing the lock from its header must get the same
+	// resolution the script performs, not their local uv config and index.
+	const script = await readFile("scripts/update-requirements-ci-hashes.mjs", "utf8");
+	const header = (await readFile("requirements-ci.lock", "utf8")).split("\n").filter((l) => l.startsWith("#")).join("\n");
+	for (const flag of ["--no-config", "--generate-hashes", "--only-binary :all:", "--no-header", "--default-index https://pypi.org/simple"]) {
+		assert.ok(header.includes(flag), `requirements-ci.lock header omits ${flag}`);
+		assert.ok(script.includes(flag.split(" ")[0]), `script no longer passes ${flag}`);
+	}
 });
 
 // --------------------------------------------------------------------------

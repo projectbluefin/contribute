@@ -13,7 +13,7 @@ name: renovate-hashes
 # is neither the first nor the most frequent runner to touch the branch (#686).
 #
 # So the repair runs here, on the pull request, regardless of which Renovate
-# pushed it: regenerate the hashes from PyPI metadata and push the result back
+# pushed it: recompile the pinned dependency closure and push the result back
 # onto the Renovate branch.
 #
 # Trust model. This job holds a token that can push to any branch of the
@@ -124,18 +124,27 @@ jobs:
         with:
           node-version: '24.x'
 
-      - name: Regenerate requirements-ci.lock hashes from PyPI
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.x'
+
+      - name: Install the lockfile compiler
+        run: python -m pip install uv
+
+      - name: Recompile requirements-ci.lock with hashes
         id: refresh
         # The script resolves the lockfile from its working directory, so the
         # base's script runs with the head checkout as its working directory.
-        # It has no dependencies beyond the Node.js standard library.
+        # uv resolves sanitized pins only, with config discovery and source
+        # builds disabled; no PR-supplied config or build hooks can execute.
         working-directory: head
         run: |
           set -euo pipefail
           node "${GITHUB_WORKSPACE}/base/scripts/update-requirements-ci-hashes.mjs"
           if git diff --quiet -- requirements-ci.lock; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "requirements-ci.lock already carries the hashes for its pinned versions."
+            echo "requirements-ci.lock already carries the complete pinned dependency closure."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
             git --no-pager diff -- requirements-ci.lock
@@ -156,7 +165,7 @@ jobs:
             -m 'chore(deps): refresh requirements-ci.lock hashes for the bumped versions' \
             -m "Renovate bumped the pinned version but could not run the post-upgrade
           task that rewrites the --hash lines, so pip --require-hashes rejected the
-          new release. Regenerated from PyPI release metadata by
+          new release. Recompiled with hashes and new transitive dependencies by
           scripts/update-requirements-ci-hashes.mjs in ${RUN_URL}." \
             -- requirements-ci.lock
           # The token appears here and nowhere else. A rejected push means

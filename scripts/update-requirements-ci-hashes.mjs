@@ -1,24 +1,13 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const LOCKFILE = "requirements-ci.lock";
-const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
-
-// A line that starts a requirement. Extras are part of the name, so
-// `coverage[toml]==7.6.0` has to be recognised here; a requirement this misses
-// is folded into the previous package's block and disappears from the rewrite.
-// Hash and comment lines are indented, so they can never match.
-const REQUIREMENT_START_PATTERN = /^[a-zA-Z0-9._-]+(?:\[[^\]\n]*\])?\s*==/;
-
-// The full requirement spec, minus the trailing line continuation: name,
-// optional extras, version, and an optional PEP 508 environment marker.
 const REQUIREMENT_PATTERN =
 	/^(?<name>[a-zA-Z0-9._-]+)(?<extras>\[[^\]\n]*\])?\s*==\s*(?<version>[0-9][a-zA-Z0-9._!*+-]*)(?<marker>\s*;.*)?$/;
 
-// Parses one requirement line into the PyPI lookup key and the spec to re-emit.
-// `spec` is rebuilt rather than reused verbatim so the rewrite keeps extras and
-// the environment marker, which decide whether the package installs at all.
 export function parseRequirement(line) {
 	const spec = line.replace(/\s*\\\s*$/, "").trim();
 	const match = spec.match(REQUIREMENT_PATTERN);
@@ -27,77 +16,174 @@ export function parseRequirement(line) {
 	return { name, version, spec: `${name}${extras}==${version}${marker}` };
 }
 
-export async function fetchPackageHashes(name, version, fetchImpl = fetch) {
-	const url = `https://pypi.org/pypi/${name}/${version}/json`;
-	const response = await fetchImpl(url);
-	if (!response.ok) {
-		throw new Error(`PyPI metadata lookup failed for ${name}==${version}: ${response.status} ${response.statusText}`);
-	}
-	const data = await response.json();
-	if (!Array.isArray(data.urls) || data.urls.length === 0) {
-		throw new Error(`No release files found on PyPI for ${name}==${version}`);
-	}
-	const hashes = data.urls
-		.map((u) => u.digests?.sha256)
-		.filter((h) => typeof h === "string" && SHA256_HEX_PATTERN.test(h));
-	if (hashes.length === 0) {
-		throw new Error(`No valid SHA-256 hashes found on PyPI for ${name}==${version}`);
-	}
-	return [...new Set(hashes)].sort();
-}
+// `# via` is the only record of which entries are this project's own asks and
+// which uv pulled in for something else. A source of `-r <file>` or
+// `-c <file>` names the input the requirement was read from, not a package
+// that depends on it, so it leaves the entry direct.
+const VIA_LINE = /^#\s*via(?:\s+(?<inline>\S.*))?$/;
+const VIA_SOURCE = /^#\s{2,}(?<source>\S.*)$/;
+const VIA_FILE_SOURCE = /^-[rc]\s/;
 
-export async function updateLockfileContent(source, fetchImpl = fetch) {
+export function splitLockfile(source) {
+	const header = [];
+	const entries = [];
 	const lines = source.split("\n");
-	const firstIndex = lines.findIndex((line) => REQUIREMENT_START_PATTERN.test(line));
-	if (firstIndex === -1) return source;
-
-	const header = lines.slice(0, firstIndex).map((line) => `${line}\n`).join("");
-
-	const blocks = [];
-	for (const line of lines.slice(firstIndex)) {
-		if (REQUIREMENT_START_PATTERN.test(line)) blocks.push([line]);
-		else blocks[blocks.length - 1].push(line);
-	}
-
-	let reconstructed = header;
-
-	for (const block of blocks) {
-		const requirement = parseRequirement(block[0]);
-		// Refuse rather than skip. A skipped block is not left alone: it is
-		// omitted from the rewrite, so the package and its hashes vanish from a
-		// --require-hashes lockfile with nothing said.
+	let current = null;
+	for (let i = 0; i < lines.length; i += 1) {
+		const line = lines[i];
+		const trimmed = line.trim();
+		if (!trimmed) {
+			if (entries.length === 0) header.push(line);
+			continue;
+		}
+		if (trimmed.startsWith("#")) {
+			if (entries.length === 0) {
+				header.push(line);
+				continue;
+			}
+			const via = VIA_LINE.exec(trimmed);
+			if (!current || !via) continue;
+			const sources = [];
+			if (via.groups.inline) {
+				sources.push(via.groups.inline.trim());
+			} else {
+				while (i + 1 < lines.length) {
+					const next = VIA_SOURCE.exec(lines[i + 1].trim());
+					if (!next) break;
+					sources.push(next.groups.source.trim());
+					i += 1;
+				}
+			}
+			if (sources.some((entry) => !VIA_FILE_SOURCE.test(entry))) current.direct = false;
+			continue;
+		}
+		if (/^\s+--hash=sha256:[0-9a-f]{64}(?:\s*\\)?\s*$/.test(line)) continue;
+		const requirement = parseRequirement(line);
 		if (!requirement) {
-			throw new Error(`${LOCKFILE}: cannot parse requirement line: ${block[0].trim()}`);
+			throw new Error(`${LOCKFILE}: cannot parse requirement line: ${line.trim()}`);
 		}
-		const comments = block.filter((l) => l.trim().startsWith("#"));
-
-		const hashes = await fetchPackageHashes(requirement.name, requirement.version, fetchImpl);
-		reconstructed += `${requirement.spec} \\\n`;
-		hashes.forEach((h, idx) => {
-			const isLast = idx === hashes.length - 1;
-			reconstructed += `    --hash=sha256:${h}${isLast ? "" : " \\"}\n`;
-		});
-		if (comments.length > 0) {
-			reconstructed += comments.join("\n") + "\n";
-		}
+		current = { spec: requirement.spec, direct: true };
+		entries.push(current);
 	}
-
-	return reconstructed;
+	return { header, entries };
 }
 
-export async function syncRequirementsCiHashes({ root = process.cwd(), fetchImpl = fetch } = {}) {
+// A lockfile that carries no `# via` annotations at all (one compiled with
+// --no-annotate, or hand-written) says nothing about which entries are
+// transitive, so every entry has to stay a requirement.
+function partition(entries) {
+	const direct = entries.filter((entry) => entry.direct);
+	if (direct.length === entries.length || direct.length === 0) {
+		return { requirements: entries.map((entry) => entry.spec), constraints: [] };
+	}
+	return {
+		requirements: direct.map((entry) => entry.spec),
+		constraints: entries.filter((entry) => !entry.direct).map((entry) => entry.spec),
+	};
+}
+
+// uv records where each requirement came from, including the scratch
+// constraints file: `# via\n#   -c /tmp/requirements-ci-XXXX/constraints.txt`.
+// That path is different on every run, so left in it would churn the lockfile
+// and leak the runner's temporary directory into a committed file.
+export function stripConstraintAnnotations(output) {
+	const lines = output.split("\n");
+	const result = [];
+	for (let i = 0; i < lines.length; i += 1) {
+		const line = lines[i];
+		const via = /^(?<indent>\s*)#\s*via(?<inline>\s+\S.*)?$/.exec(line);
+		if (!via) {
+			result.push(line);
+			continue;
+		}
+		const { indent, inline } = via.groups;
+		const sources = [];
+		if (inline) {
+			sources.push(inline.trim());
+		} else {
+			while (i + 1 < lines.length) {
+				const next = /^\s*#\s{2,}(?<source>\S.*)$/.exec(lines[i + 1]);
+				if (!next) break;
+				sources.push(next.groups.source.trim());
+				i += 1;
+			}
+		}
+		const kept = sources.filter((source) => !source.startsWith("-c "));
+		if (kept.length === 0) continue;
+		if (kept.length === 1) {
+			result.push(`${indent}# via ${kept[0]}`);
+			continue;
+		}
+		result.push(`${indent}# via`);
+		for (const source of kept) result.push(`${indent}#   ${source}`);
+	}
+	return result.join("\n");
+}
+
+export async function updateLockfileContent(source, runImpl = spawnSync) {
+	const { header, entries } = splitLockfile(source);
+	if (entries.length === 0) return source;
+	const { requirements, constraints } = partition(entries);
+
+	// Transitive pins are replayed as constraints, not as requirements. As
+	// requirements they were permanent: a transitive dependency nothing depends
+	// on any more stayed in the lock forever, and one whose new version
+	// disagreed with the old pin deadlocked resolution until someone hand-edited
+	// the file. A constraint binds the version only while something still asks
+	// for the package, and is ignored once nothing does.
+	const scratch = constraints.length > 0 ? await mkdtemp(join(tmpdir(), "requirements-ci-")) : null;
+	try {
+		const args = [
+			"--no-config", "pip", "compile", "-", "--generate-hashes",
+			"--python-version", "3.13", "--only-binary", ":all:",
+			// Annotations stay on: the lockfile already carries the `# via`
+			// lines, they are what tells requirements from transitive pins on
+			// the next run, and --no-annotate would rewrite every block of the
+			// file on the first run for no gain.
+			"--default-index", "https://pypi.org/simple", "--no-header",
+		];
+		if (scratch) {
+			const constraintsPath = join(scratch, "constraints.txt");
+			await writeFile(constraintsPath, `${constraints.join("\n")}\n`);
+			args.push("--constraint", constraintsPath);
+		}
+
+		// Resolve the complete closure, keeping Renovate's pins. Only sanitized
+		// requirements cross the PR boundary: no config, indexes, or build hooks.
+		const result = runImpl("uv", args, {
+			input: `${requirements.join("\n")}\n`,
+			encoding: "utf8",
+			maxBuffer: 10 * 1024 * 1024,
+		});
+		if (result.error) {
+			if (result.error.code === "ENOENT") {
+				throw new Error(
+					`${LOCKFILE}: uv was not found on PATH. The lockfile compiler is a prerequisite of this script; install uv and run it again.`,
+				);
+			}
+			throw result.error;
+		}
+		if (result.status !== 0) {
+			throw new Error(`${LOCKFILE}: dependency resolution failed: ${result.stderr}`);
+		}
+		if (!result.stdout.trim()) throw new Error(`${LOCKFILE}: resolver produced an empty lockfile`);
+		return `${header.join("\n")}\n${stripConstraintAnnotations(result.stdout)}`;
+	} finally {
+		if (scratch) await rm(scratch, { recursive: true, force: true });
+	}
+}
+
+export async function syncRequirementsCiHashes({ root = process.cwd(), runImpl = spawnSync } = {}) {
 	const path = join(root, LOCKFILE);
 	const source = await readFile(path, "utf8");
-	const updated = await updateLockfileContent(source, fetchImpl);
-	if (updated !== source) {
-		await writeFile(path, updated);
-	}
+	const updated = await updateLockfileContent(source, runImpl);
+	if (updated !== source) await writeFile(path, updated);
 	return { path, updated: updated !== source };
 }
 
 async function main() {
 	const result = await syncRequirementsCiHashes();
-	process.stdout.write(`requirements-ci.lock: ${result.updated ? "hashes updated" : "hashes current"}\n`);
+	process.stdout.write(`requirements-ci.lock: ${result.updated ? "lock recompiled" : "lock current"}\n`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

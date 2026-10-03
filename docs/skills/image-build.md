@@ -1,7 +1,7 @@
 ---
 name: image-build
-version: "3.7"
-last_updated: "2026-09-19"
+version: "3.8"
+last_updated: "2026-10-02"
 id: image-build
 one_line_purpose: Build and pin the OMP contributor image.
 entry_point: docs/skills/image-build.md
@@ -117,13 +117,24 @@ runs in their respective Renovate branches via `node scripts/update-gh-pins.mjs`
 Those post-upgrade tasks only run under a self-hosted Renovate that allowlists
 them, and the organisation runner and the hosted app that also push these
 branches do not. For `requirements-ci.lock` the pull request itself is the
-backstop: `.github/workflows/renovate-hashes.yml` regenerates the hashes on
+backstop: `.github/workflows/renovate-hashes.yml` recompiles the lock with hashes on
 any pull request that Renovate (`renovate[bot]` or `mergeraptor[bot]`) opens
 and pushes from a `renovate/*` branch of this repository and that touches the
 lockfile, pushes the result onto the branch, and dispatches `validate` on the
 refreshed commit. It is a `pull_request_target` workflow: the workflow file and
 the script both come from `main`, the head contributes only its lockfile, and
-nothing from the pull request head is executed.
+nothing from the pull request head is executed. The CI lock synchronizer requires
+`uv` on `PATH`. It compiles the existing pins for Python 3.13, adding newly
+introduced transitive dependencies rather than only replacing hashes. Entries
+without a `# via` annotation are the requirements; annotated ones are replayed as
+`--constraint` pins, so a transitive dependency nothing needs any more leaves the
+lock instead of pinning itself there forever. It rejects
+non-pinned requirement directives and disables uv config discovery and source
+builds so PR data cannot select executable build hooks. Conflicting pins fail
+resolution without changing the lockfile. A missing `uv` fails with a message
+naming it as the prerequisite. That `uv` requirement also applies to
+the same command run as a Renovate post-upgrade task; where the Renovate runtime
+has no `uv` the task fails and `renovate-hashes.yml` is the repair path.
 The OMP, GitHub CLI, Node.js, and tmux synchronizers are configuration over one
 shared implementation in `scripts/lib/release-pins.mjs`: change the pin-rewriting
 or release-lookup behaviour there, not in four places.
