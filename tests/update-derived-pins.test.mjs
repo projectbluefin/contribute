@@ -23,7 +23,11 @@ import {
 } from "../scripts/update-tmux-pins.mjs";
 
 import {
+	evaluateMarker,
 	fetchPackageHashes,
+	lockPythonVersion,
+	missingDependencies,
+	normalizeName,
 	syncRequirementsCiHashes,
 	updateLockfileContent,
 } from "../scripts/update-requirements-ci-hashes.mjs";
@@ -332,6 +336,111 @@ tomli==2.0.1 ; python_version < "3.11" \\
 			),
 		/cannot parse requirement line/,
 	);
+});
+
+test("evaluateMarker only reports a dependency as required when it is sure", () => {
+	// No marker at all: always installed.
+	assert.equal(evaluateMarker("", "3.13"), true);
+	// Gated on an extra the lock does not ask for.
+	assert.equal(evaluateMarker('extra == "toml"', "3.13"), false);
+	// Decided against the interpreter the lock was compiled for.
+	assert.equal(evaluateMarker('python_version < "3.11"', "3.13"), false);
+	assert.equal(evaluateMarker('python_version >= "3.9"', "3.13"), true);
+	assert.equal(evaluateMarker('python_version < "3.11"', null), null);
+	// The CI environment this lock installs into.
+	assert.equal(evaluateMarker('sys_platform == "win32"', "3.13"), false);
+	assert.equal(evaluateMarker('os_name == "posix"', "3.13"), true);
+	// Boolean composition, including parentheses.
+	assert.equal(evaluateMarker('python_version >= "3.9" and sys_platform == "linux"', "3.13"), true);
+	assert.equal(evaluateMarker('(sys_platform == "win32" or python_version >= "3.9")', "3.13"), true);
+	// A variable this script does not model leaves the marker undecided, and
+	// undecided must never be read as "required" -- a false alarm here fails
+	// the Renovate hash refresh on a lock that is in fact satisfiable.
+	assert.equal(evaluateMarker('platform_machine == "aarch64"', "3.13"), null);
+	assert.equal(evaluateMarker('platform_machine == "aarch64" and python_version >= "3.9"', "3.13"), null);
+	assert.equal(evaluateMarker('platform_machine == "aarch64" and python_version < "3.11"', "3.13"), false);
+	assert.equal(evaluateMarker("python_version <", "3.13"), null);
+});
+
+test("lockPythonVersion and normalizeName read the lock the way pip does", () => {
+	assert.equal(
+		lockPythonVersion("# Compiled via: uv pip compile --generate-hashes --python-version 3.13 -\n"),
+		"3.13",
+	);
+	assert.equal(lockPythonVersion("# Compiled by hand\n"), null);
+	// PEP 503: these are all the same project, so the lock's `pyyaml` satisfies
+	// a dependency on `PyYAML`.
+	assert.equal(normalizeName("PyYAML"), "pyyaml");
+	assert.equal(normalizeName("zope.interface"), "zope-interface");
+	assert.equal(normalizeName("typing_extensions"), "typing-extensions");
+});
+
+test("missingDependencies names only dependencies the lock really lacks", () => {
+	const packages = [
+		{
+			name: "pre-commit",
+			requiresDist: [
+				"virtualenv>=20.10.0",
+				"PyYAML>=5.1",
+				'tomli>=1.1.0; python_version < "3.11"',
+				'covdefaults>=2.3; extra == "test"',
+				"nodeenv>=0.11.1",
+			],
+		},
+		{ name: "virtualenv", requiresDist: ["distlib<1,>=0.3.7", "platformdirs<6,>=3.9.1"] },
+		{ name: "pyyaml", requiresDist: [] },
+		{ name: "nodeenv", requiresDist: [] },
+		{ name: "distlib", requiresDist: [] },
+	];
+
+	const missing = missingDependencies(packages, "3.13");
+	// platformdirs is genuinely absent; tomli is excluded by the interpreter,
+	// covdefaults by the extra, and PyYAML is present under its folded name.
+	assert.deepEqual(missing, [{ name: "platformdirs", requiredBy: ["virtualenv"] }]);
+
+	const complete = missingDependencies(
+		[...packages, { name: "platformdirs", requiresDist: [] }], "3.13");
+	assert.deepEqual(complete, []);
+});
+
+test("updateLockfileContent refuses a lock that lost a transitive dependency", async () => {
+	// Renovate bumps a pin, the new release grows a dependency, and this script
+	// can only rewrite hashes for pins that are already in the file. Left
+	// unsaid, the refreshed lock installs nowhere: pip rejects the whole
+	// --require-hashes install over the unhashed dependency.
+	const lock = `# Compiled via: uv pip compile --generate-hashes --python-version 3.13 -
+virtualenv==21.13.0 \\
+    --hash=sha256:${"1".repeat(64)}
+    # via pre-commit
+`;
+	const fetchImpl = async () => response({
+		urls: [{ digests: { sha256: X64 } }],
+		info: { requires_dist: ["distlib<1,>=0.3.7", 'tomli>=1.1.0; python_version < "3.11"'] },
+	});
+
+	await assert.rejects(
+		() => updateLockfileContent(lock, fetchImpl),
+		(error) => {
+			assert.match(error.message, /does not pin/);
+			assert.match(error.message, /distlib \(required by virtualenv\)/);
+			// Excluded by the interpreter the lock names, so not an offender.
+			assert.doesNotMatch(error.message, /tomli/);
+			assert.match(error.message, /uv pip compile --generate-hashes/);
+			return true;
+		},
+	);
+
+	// The same release with its dependency pinned rewrites as before.
+	const satisfied = `# Compiled via: uv pip compile --generate-hashes --python-version 3.13 -
+distlib==0.4.3 \\
+    --hash=sha256:${"2".repeat(64)}
+    # via virtualenv
+virtualenv==21.13.0 \\
+    --hash=sha256:${"1".repeat(64)}
+    # via pre-commit
+`;
+	const updated = await updateLockfileContent(satisfied, fetchImpl);
+	assert.match(updated, /^virtualenv==21\.13\.0 \\$/m);
 });
 
 // --------------------------------------------------------------------------
