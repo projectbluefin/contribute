@@ -442,6 +442,9 @@ run_hives() {
   github_auth_ready || fail "gh is not authenticated. Run: gh auth login --web --hostname github.com --scopes repo,read:org"
 
   local account registry name hub _active
+  # The lookup below authenticates with the operator's github.com token; say
+  # so before it happens — the credential model must have no silent edges.
+  note "asking ${HIVE_DIRECTORY} which hives know this GitHub account (authenticated with your gh token)"
   account="$(account_hives)"
   registry="$(registry_hives)"
   while IFS=$'\t' read -r name hub; do
