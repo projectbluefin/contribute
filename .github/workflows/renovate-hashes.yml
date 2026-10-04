@@ -13,8 +13,10 @@ name: renovate-hashes
 # is neither the first nor the most frequent runner to touch the branch (#686).
 #
 # So the repair runs here, on the pull request, regardless of which Renovate
-# pushed it: regenerate the hashes from PyPI metadata and push the result back
-# onto the Renovate branch.
+# pushed it: recompile the lockfile with `uv pip compile --generate-hashes`,
+# keeping Renovate's pins as preferences, and push the result back onto the
+# Renovate branch. Recompiling rather than re-hashing the existing lines is
+# what adds a dependency that the bumped release newly requires (#733).
 #
 # Trust model. This job holds a token that can push to any branch of the
 # repository, and main's ruleset blocks deletion and force-pushes but does not
@@ -124,18 +126,26 @@ jobs:
         with:
           node-version: '24.x'
 
-      - name: Regenerate requirements-ci.lock hashes from PyPI
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # No cache: a pull_request_target job must not restore or save state
+          # that a pull request could have shaped.
+          enable-cache: false
+
+      - name: Recompile requirements-ci.lock with uv
         id: refresh
         # The script resolves the lockfile from its working directory, so the
         # base's script runs with the head checkout as its working directory.
-        # It has no dependencies beyond the Node.js standard library.
+        # It runs uv with --no-build, so no package build backend executes,
+        # and --no-config, so no uv configuration in the head is read.
         working-directory: head
         run: |
           set -euo pipefail
           node "${GITHUB_WORKSPACE}/base/scripts/update-requirements-ci-hashes.mjs"
           if git diff --quiet -- requirements-ci.lock; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "requirements-ci.lock already carries the hashes for its pinned versions."
+            echo "requirements-ci.lock already matches its compiled dependency tree."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
             git --no-pager diff -- requirements-ci.lock
@@ -153,11 +163,12 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit --quiet \
-            -m 'chore(deps): refresh requirements-ci.lock hashes for the bumped versions' \
+            -m 'chore(deps): recompile requirements-ci.lock for the bumped versions' \
             -m "Renovate bumped the pinned version but could not run the post-upgrade
-          task that rewrites the --hash lines, so pip --require-hashes rejected the
-          new release. Regenerated from PyPI release metadata by
-          scripts/update-requirements-ci-hashes.mjs in ${RUN_URL}." \
+          task that recompiles the lockfile, so its --hash lines and any newly
+          required dependency were missing and pip --require-hashes rejected it.
+          Recompiled with uv by scripts/update-requirements-ci-hashes.mjs in
+          ${RUN_URL}." \
             -- requirements-ci.lock
           # The token appears here and nowhere else. A rejected push means
           # Renovate moved the branch while this ran; that push has its own

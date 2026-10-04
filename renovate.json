@@ -62,7 +62,7 @@
       "versioningTemplate": "loose"
     },
     {
-      "description": "Track requirements-ci.lock package versions; the post-upgrade task regenerates sha256 hashes from PyPI metadata.",
+      "description": "Track requirements-ci.lock package versions; the post-upgrade task recompiles the lockfile with uv so hashes and newly required dependencies follow the bump.",
       "customType": "regex",
       "managerFilePatterns": [
         "/(^|/)requirements-ci\\.lock$/"
@@ -192,7 +192,7 @@
       }
     },
     {
-      "description": "Regenerate requirements-ci.lock sha256 hashes when managed PyPI package versions change. Only a self-hosted Renovate that allowlists this command runs it (.github/workflows/renovate.yml); the organisation runner and the hosted app push the version bump alone, and .github/workflows/renovate-hashes.yml repairs the branch on the pull request. The github-actions[bot] author above is that repair, which Renovate must not read as a manual edit.",
+      "description": "Recompile requirements-ci.lock (uv pip compile --generate-hashes, keeping Renovate's pins as preferences) when managed PyPI package versions change, so hashes are current and a dependency a bumped release newly requires is added. Only a self-hosted Renovate that allowlists this command runs it (.github/workflows/renovate.yml); the organisation runner and the hosted app push the version bump alone, and .github/workflows/renovate-hashes.yml repairs the branch on the pull request. The github-actions[bot] author above is that repair, which Renovate must not read as a manual edit.",
       "matchDatasources": [
         "pypi"
       ],
@@ -203,7 +203,10 @@
         "fileFilters": [
           "requirements-ci.lock"
         ],
-        "executionMode": "branch"
+        "executionMode": "branch",
+        "installTools": {
+          "uv": {}
+        }
       }
     }
   ]
