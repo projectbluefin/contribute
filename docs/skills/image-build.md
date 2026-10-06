@@ -113,17 +113,21 @@ builds and executes both native architectures before updating its published inde
 Derived checksum automation for GitHub CLI, Node.js, tmux, and `requirements-ci.lock`
 runs in their respective Renovate branches via `node scripts/update-gh-pins.mjs`,
 `node scripts/update-node-pins.mjs`, `node scripts/update-tmux-pins.mjs`, and
-`scripts/update-requirements-ci-hashes.mjs`.
+`scripts/update-requirements-ci-hashes.mjs`. The last one recompiles the
+lockfile with `uv pip compile --generate-hashes`, keeping Renovate's pins as
+preferences, so a dependency that a bumped release newly requires is added
+with its hashes; the Renovate rule installs `uv` for it through `installTools`.
 Those post-upgrade tasks only run under a self-hosted Renovate that allowlists
 them, and the organisation runner and the hosted app that also push these
 branches do not. For `requirements-ci.lock` the pull request itself is the
-backstop: `.github/workflows/renovate-hashes.yml` regenerates the hashes on
+backstop: `.github/workflows/renovate-hashes.yml` recompiles the lockfile on
 any pull request that Renovate (`renovate[bot]` or `mergeraptor[bot]`) opens
 and pushes from a `renovate/*` branch of this repository and that touches the
 lockfile, pushes the result onto the branch, and dispatches `validate` on the
 refreshed commit. It is a `pull_request_target` workflow: the workflow file and
 the script both come from `main`, the head contributes only its lockfile, and
-nothing from the pull request head is executed.
+nothing from the pull request head is executed — uv runs with `--no-build`
+and `--no-config`.
 The OMP, GitHub CLI, Node.js, and tmux synchronizers are configuration over one
 shared implementation in `scripts/lib/release-pins.mjs`: change the pin-rewriting
 or release-lookup behaviour there, not in four places.
