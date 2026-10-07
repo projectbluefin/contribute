@@ -53,7 +53,10 @@ TMUX
 chmod 0755 "$stub_bin/tmux"
 
 # Agent stand-in: records what the entrypoint handed it, then behaves per
-# FAKE_AGENT_MODE.
+# FAKE_AGENT_MODE. `ok` outlives its session by a beat: the entrypoint polls for
+# the session every 0.1s and treats an agent that is already gone as a launch
+# failure, so an agent that exits the instant it creates the session races
+# that poll and the run never reaches the attach/no-tty branch.
 agent="$scratch/agent.sh"
 cat >"$agent" <<'AGENT'
 #!/usr/bin/env bash
@@ -65,7 +68,7 @@ cat >"$agent" <<'AGENT'
   done
 } >"$FAKE_AGENT_ENV"
 case "${FAKE_AGENT_MODE:-ok}" in
-  ok) : >"$FAKE_SESSION"; exit 0 ;;
+  ok) : >"$FAKE_SESSION"; sleep 1; exit 0 ;;
   fail-after-session) : >"$FAKE_SESSION"; exit 3 ;;
   fail-before-session) exit 7 ;;
   session-vanishes) : >"$FAKE_SESSION"; sleep 0.3; rm -f "$FAKE_SESSION"; sleep 30 ;;
