@@ -112,6 +112,10 @@ function withTokens(t, values) {
 			else process.env[name] = value;
 		}
 	});
+	setTokens(values);
+}
+
+function setTokens(values) {
 	for (const name of TOKEN_VARIABLES) {
 		if (values[name] === undefined) delete process.env[name];
 		else process.env[name] = values[name];
@@ -148,8 +152,9 @@ test("syncOmpPins authenticates with the first token set, Renovate's before gh's
 		[{ GH_TOKEN: "gh", GITHUB_TOKEN: "actions" }, "gh"],
 		[{ GITHUB_TOKEN: "actions" }, "actions"],
 	];
+	withTokens(t, {});
 	for (const [tokens, expected] of cases) {
-		withTokens(t, tokens);
+		setTokens(tokens);
 		const root = await ompRoot(t, RENOVATED_CONTAINERFILE);
 		let authorization;
 		await syncOmpPins({
@@ -169,7 +174,7 @@ test("syncOmpPins leaves the Containerfile untouched when the release cannot be 
 		["a failed lookup", { ok: false, status: 404, statusText: "Not Found", json: async () => RELEASE }, /GitHub release lookup failed: 404 Not Found/],
 		["a different release", response({ ...RELEASE, tag_name: "v18.2.0" }), /requested OMP 18\.2\.1, received 18\.2\.0/],
 		["a prerelease", response({ ...RELEASE, prerelease: true }), /published stable release/],
-		["a missing digest", response({ ...RELEASE, assets: [RELEASE.assets[0]] }), /no omp-linux-x64 asset/],
+		["a missing asset", response({ ...RELEASE, assets: [RELEASE.assets[0]] }), /no omp-linux-x64 asset/],
 	];
 	for (const [name, reply, error] of refusals) {
 		const root = await ompRoot(t);
