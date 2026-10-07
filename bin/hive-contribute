@@ -610,6 +610,7 @@ run_switch() {
   fi
   if command -v gh &>/dev/null && command -v jq &>/dev/null; then
     local name hub
+    note "asking ${HIVE_DIRECTORY} which hives know this GitHub account (authenticated with your gh token)"
     while IFS=$'\t' read -r name hub; do
       [[ -n "$hub" ]] && HIVE_NAME["$hub"]="$name"
     done <<<"$(account_hives)"
