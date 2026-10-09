@@ -25,6 +25,7 @@ import {
 
 import {
 	directRequirements,
+	runUv,
 	syncRequirementsCiHashes,
 } from "../scripts/update-requirements-ci-hashes.mjs";
 
@@ -315,6 +316,19 @@ test("syncRequirementsCiHashes recompiles without the bumped pins' stale hashes"
 		/uv pip compile failed/,
 	);
 	assert.equal(await readFile(path, "utf8"), LOCKFILE_AFTER_BUMP);
+});
+
+test("runUv names uv as the missing prerequisite instead of a bare ENOENT", async (t) => {
+	// Renovate runtimes without uv must fail loudly and say why.
+	const emptyBin = await mkdtemp(join(tmpdir(), "no-uv-"));
+	const savedPath = process.env.PATH;
+	t.after(async () => {
+		process.env.PATH = savedPath;
+		await rm(emptyBin, { recursive: true, force: true });
+	});
+	process.env.PATH = emptyBin;
+
+	assert.throws(() => runUv(["--version"], { cwd: emptyBin, input: "" }), /^Error: cannot run uv: .*ENOENT/);
 });
 
 // --------------------------------------------------------------------------
