@@ -895,6 +895,7 @@ EOF
   output="$(printf '1 2 3 4 5\n  reef.example.org \n2\n3\n' | "$launcher" hives 2>&1)" || status=$?
   assert_eq "$status" "1" "a selection with one failed registration exits non-zero"
   assert_contains "$output" "1 of your choices did not take effect" "failed choice counted"
+  assert_contains "$output" "which hives know this GitHub account (authenticated with your gh token)" "hives announces the token-bearing lookup"
   assert_eq "$(grep -c ') \[ \] acme/b' <<<"$output")" "1" "a hive in both the account list and the registry is offered once"
   assert_contains "$output" ") [ ] public/d  (hosted-d.hive.hivecommons.dev)" "a Commons registry hive is offered as a choice"
   assert_not_contains "$output" "public/e" "an offline registry hive is not offered"
@@ -1086,6 +1087,7 @@ EOF
   grep -qx 'HIVE_HUB=wss://hosted-b.hive.hivecommons.dev/contribute,wss://hub-a.example.com/contribute' "$reg" ||
     fail "switch did not put the named hive first in the registration: $(grep '^HIVE_HUB=' "$reg")"
   assert_contains "$output" "  1. acme-b  (hosted-b.hive.hivecommons.dev)" "switched hive listed first"
+  assert_contains "$output" "which hives know this GitHub account (authenticated with your gh token)" "switch announces the token-bearing lookup"
   assert_contains "$output" "  2. hub-a  (hub-a.example.com)" "the other hive stays followed"
   assert_contains "$output" "routing: ranked" "routing reported alongside the new order"
 
