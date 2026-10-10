@@ -17,10 +17,10 @@ shift
 # Executables copied verbatim into /usr/bin.
 #
 # bash and git are the load-bearing pair: omp's `bash` tool spawns a shell, and
-# the fix and land paths patch code and push it. The rest is the handful of
-# utilities that every shell one-liner an agent writes assumes exists. FSDK's
-# distroless base ships coreutils but not these, so without them `gh ... | grep`
-# fails at the pipe — four megabytes to keep the shell from being a decoration.
+# the fix and land paths patch code and push it. The rest is the userland that
+# every shell one-liner an agent writes assumes exists. FSDK's distroless base
+# ships no executables at all, so without these `gh ... | grep` fails at the
+# pipe and `#!/usr/bin/env bash` fails before the script starts.
 python3_real="$(command -v python3 || true)"
 [[ -n "$python3_real" ]] && python3_real="$(readlink -f "$python3_real")"
 python3_ver=""
@@ -47,6 +47,24 @@ binaries=(
 if [[ -n "$python3_real" && -x "$python3_real" ]]; then
   binaries+=("$python3_real")
 fi
+
+# GNU coreutils, the whole set: Hive's runtime, this entrypoint and every agent
+# one-liner use it (cat, mkdir, env, sleep, timeout, ...). tests/
+# contribute-contract.sh reads this array and executes each one in the image.
+coreutils=(
+  '[' arch b2sum base32 base64 basename basenc cat chcon chgrp chmod chown
+  chroot cksum comm cp csplit cut date dd df dir dircolors dirname du echo env
+  expand expr factor false fmt fold groups head hostid hostname id install join
+  link ln logname ls md5sum mkdir mkfifo mknod mktemp mv nice nl nohup nproc
+  numfmt od paste pathchk pinky pr printenv printf ptx pwd readlink realpath rm
+  rmdir runcon seq sha1sum sha224sum sha256sum sha384sum sha512sum shred shuf
+  sleep sort split stat stdbuf stty sum sync tac tail tee test timeout touch tr
+  true truncate tsort tty uname unexpand uniq unlink users vdir wc who whoami
+  yes
+)
+for name in "${coreutils[@]}"; do
+  binaries+=("/usr/bin/${name}")
+done
 
 # Callers may name additional absolute executables after the destination. Their
 # ELF closures are staged by the same ldd path as the appliance's fixed base.
@@ -132,6 +150,10 @@ done
 # git dispatches to `git-remote-https` by name; upstream ships it as a link to
 # the same binary rather than a second copy.
 ln -sf git-remote-http "${dest}/usr/libexec/git-core/git-remote-https"
+
+# stdbuf works by LD_PRELOADing this library into the command it runs.
+install -D -m 0755 /usr/libexec/coreutils/libstdbuf.so \
+  "${dest}/usr/libexec/coreutils/libstdbuf.so"
 
 # /bin is a symlink to /usr/bin in this base, so one link covers every caller
 # that hardcodes /bin/sh.

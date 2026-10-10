@@ -1,7 +1,7 @@
 ---
 name: image-build
-version: "3.7"
-last_updated: "2026-09-19"
+version: "3.8"
+last_updated: "2026-10-09"
 id: image-build
 one_line_purpose: Build and pin the OMP contributor image.
 entry_point: docs/skills/image-build.md
@@ -43,7 +43,10 @@ The OCI image leaves model and effort selection to OMP.
    `backends.conf`), Hive's `gh` policy layer (`gh-wrapper.sh` installed as the
    agent's `gh`, the real binary at `/opt/hive/bin/gh-real`, the root-owned
    `/etc/hive/contributor-mode` marker, and `restrictions/contributor-default.json`),
-   Node with the locked `ws` module, GitHub CLI, tmux, and the minimal base closure.
+   Node with the locked `ws` module, GitHub CLI, tmux, GNU coreutils, and the
+   minimal base closure. The FSDK base ships no executables, so every command
+   the shell, Hive's runtime, or an agent runs is staged by
+   `image/contribute/stage-runtime.sh`.
    `omp-backend.js` is host-side staging for upstream's own recipe and is not in
    the closure; upstream's contributor image does not ship it either.
 6. The contributor entrypoint accepts only `AGENT_BACKEND=omp`; provider, model,
