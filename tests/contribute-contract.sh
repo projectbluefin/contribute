@@ -172,6 +172,9 @@ grep -qF 'HIVE_GH_TOKEN_CACHE' "$entry" ||
 # --- scripts/generate-contribute-sbom.py unit contract ------------------------
 python3 "$root/tests/contribute_sbom_contract.py" || fail "tests/contribute_sbom_contract.py failed"
 
+# --- image/contribute/entrypoint.sh executed on the host ----------------------
+bash "$root/tests/entrypoint-runtime.sh" || fail "tests/entrypoint-runtime.sh failed"
+
 if [[ -z "$image" ]]; then
   echo "contribute-contract: static contract holds"
   exit 0
