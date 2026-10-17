@@ -923,6 +923,7 @@ EOF
   output="$(printf '1 2 3 4 6\nnot-a-hive.example.org\n1\n1\n' | "$launcher" hives 2>&1)" || status=$?
   assert_eq "$status" "1" "an unreachable typed hive exits non-zero"
   assert_contains "$output" "not-a-hive.example.org does not answer as a Hive hub" "unreachable hive named"
+  assert_contains "$output" "which hives know this GitHub account (authenticated with your gh token)" "hives still announces the token-bearing lookup when a follow-up run is short-circuited"
   ! grep -q 'not-a-hive' "$state.log" || fail "an address that is not a hub was registered"
 
   # Submitting the list unchanged says so instead of silently ending.
