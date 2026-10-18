@@ -202,6 +202,15 @@ test "$(inspect '{{json .Config.Entrypoint}}')" = '["/usr/local/bin/hive-contrib
 # shellcheck disable=SC2016 # the single-quoted $HOME expands inside the container, not this shell
 "$engine" run --rm --entrypoint /usr/bin/bash "$image" -c 'set -eu; omp --version; node -e "require.resolve(\"ws\")"; python3 --version >/dev/null; gh --version >/dev/null; /opt/hive/bin/gh-real --version >/dev/null; tmux -V; git --version >/dev/null; curl --version >/dev/null; find --version >/dev/null; grep --version >/dev/null; sed --version >/dev/null; cmp --version >/dev/null; test -w "$HOME"; test -w "$HOME/workspace"; test -f /usr/local/bin/contributor-relay.js; test -f /usr/local/bin/pi-backend.js; test ! -e /usr/local/bin/omp-backend.js; test -f /usr/local/bin/lib/pane-classifier.js; test -f /usr/share/hive/contribute/HIVE_COMMIT; test ! -e /usr/bin/npm; test ! -e /usr/bin/corepack' >/dev/null || fail "runtime closure"
 
+# Every staged coreutils program executes, read from the array stage-runtime.sh
+# stages so the two cannot drift. GNU `false --version` exits 1 by design;
+# `stdbuf -oL true` proves its LD_PRELOAD library was staged too.
+mapfile -t coreutils < <(bash -c 'eval "$(sed -n "/^coreutils=(/,/^)/p" "$1")"; printf "%s\n" "${coreutils[@]}"' _ "$root/image/contribute/stage-runtime.sh")
+((${#coreutils[@]} > 90)) || fail "could not read the coreutils list from stage-runtime.sh"
+# shellcheck disable=SC2016 # the probe expands inside the container, not here
+"$engine" run --rm --entrypoint /usr/bin/bash "$image" -c 'for b; do if [[ $b == false ]]; then ! /usr/bin/false; else "/usr/bin/$b" --version >/dev/null; fi || { echo "coreutils: $b does not execute" >&2; exit 1; }; done; stdbuf -oL true' _ "${coreutils[@]}" ||
+  fail "staged coreutils"
+
 # Hive's gh policy layer, exercised as the agent meets it: the wrapper IS gh,
 # it refuses the credential store and every mutating or unreviewed surface,
 # and it still passes real work through to the binary behind it. Each probe
