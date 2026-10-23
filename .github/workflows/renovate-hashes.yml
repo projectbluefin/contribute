@@ -18,6 +18,18 @@ name: renovate-hashes
 # Renovate branch. Recompiling rather than re-hashing the existing lines is
 # what adds a dependency that the bumped release newly requires (#733).
 #
+# The same gap also leaves the image's runtime pins broken. Renovate bumps
+# OMP_VERSION, GH_VERSION, NODE_VERSION, and TMUX_VERSION in
+# image/contribute/Containerfile, and the post-upgrade tasks that supply the
+# matching per-architecture digests (scripts/update-{omp,gh,node,tmux}-pins.mjs)
+# are skipped by the very same runners that skip the hash task, so every
+# runtime bump arrives with the previous release's digests and the build fails
+# at `sha256sum -c`. The repair below now also re-runs those synchronizers on
+# the pull request, under the same trust model: the code runs from main, the
+# head contributes the Containerfile to be repaired, and the write token only
+# reaches the push. That is why `image/contribute/Containerfile` is now on the
+# trigger paths alongside requirements-ci.lock.
+#
 # Trust model. This job holds a token that can push to any branch of the
 # repository, and main's ruleset blocks deletion and force-pushes but does not
 # require a pull request, so that token must never reach code that arrived on
@@ -30,11 +42,15 @@ name: renovate-hashes
 #     below, and keep the write token. Someone pushing to a Renovate branch
 #     cannot alter this job any more; only a change merged to main can.
 #   - Nothing from the pull request head is executed. The script comes from
-#     the default checkout of main; the head contributes exactly one data
-#     file, requirements-ci.lock, which is checked out into a separate
-#     directory by the event's head SHA and only read.
-#   - Neither checkout persists credentials. The token is handed to exactly
-#     one command, the `git push` that lands the refresh on Renovate's branch.
+#     the default checkout of main; the head contributes exactly the managed
+#     data files (requirements-ci.lock and image/contribute/Containerfile),
+#     checked out into a separate directory by the event's head SHA and only
+#     read.
+#   - Neither checkout persists credentials. The token reaches the two public
+#     things this job does: the `git push` that lands the refresh on
+#     Renovate's branch, and the GitHub release lookups the pin synchronizers
+#     make against api.github.com. It never reaches pull-request code; the
+#     synchronizers run from main's checkout, not the head's.
 #   - The job only runs for pull requests opened by one of the Renovate
 #     identities (`renovate[bot]`, the Mend-hosted app; `mergeraptor[bot]`,
 #     the organisation runner and this repository's own renovate.yml) from a
@@ -68,6 +84,7 @@ on:
     branches: [main]
     paths:
       - requirements-ci.lock
+      - image/contribute/Containerfile
 
 permissions: {}
 
@@ -97,7 +114,7 @@ jobs:
         github.actor == 'mergeraptor[bot]'
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write # the one `git push` that lands the refresh on the Renovate branch
       actions: write # `gh workflow run validate.yml` on the refreshed commit
@@ -111,7 +128,7 @@ jobs:
           path: base
           persist-credentials: false
 
-      - name: Check out the Renovate head (the lockfile that is repaired)
+      - name: Check out the Renovate head (the data that is repaired)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # The exact commit the event describes, so the refresh is a child of
@@ -151,8 +168,45 @@ jobs:
             git --no-pager diff -- requirements-ci.lock
           fi
 
+      - name: Repair the containerfile pin digests
+        id: pins
+        # The pin synchronizers resolve the CURRENTLY pinned version against
+        # GitHub releases and rewrite both architecture digests, so the version
+        # bump Renovate left without its digests is corrected exactly the way
+        # the hash task corrects the lockfile. They read api.github.com, so
+        # they are handed this job's token the same way renovate.yml hands it
+        # to them in its own run (renovate-tracking.test.mjs asserts that
+        # hand-off); the token reaches those public reads, never pull-request
+        # code.
+        working-directory: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # This job only runs when a managed file changed. Repair the pins
+          # only when the Containerfile itself changed, so a lockfile-only PR
+          # never spends four GitHub release lookups rewriting digests that are
+          # already correct.
+          if ! diff -q "${GITHUB_WORKSPACE}/base/image/contribute/Containerfile" "image/contribute/Containerfile" >/dev/null; then
+            # All four runtime pins: any of them may be the one that drifted,
+            # and each re-resolves only its own ARG, so the others are no-ops.
+            node "${GITHUB_WORKSPACE}/base/scripts/update-omp-pins.mjs"
+            node "${GITHUB_WORKSPACE}/base/scripts/update-gh-pins.mjs"
+            node "${GITHUB_WORKSPACE}/base/scripts/update-node-pins.mjs"
+            node "${GITHUB_WORKSPACE}/base/scripts/update-tmux-pins.mjs"
+            if git diff --quiet -- image/contribute/Containerfile; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "containerfile pins already match their pinned versions."
+            else
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              git --no-pager diff -- image/contribute/Containerfile
+            fi
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Push the refresh onto the Renovate branch
-        if: steps.refresh.outputs.changed == 'true'
+        if: steps.refresh.outputs.changed == 'true' || steps.pins.outputs.changed == 'true'
         working-directory: head
         env:
           BRANCH: ${{ github.head_ref }}
@@ -162,14 +216,19 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Stage both managed files; git stages only what actually changed, so
+          # a lockfile-only or pin-only refresh commits exactly one file.
+          git add requirements-ci.lock image/contribute/Containerfile
           git commit --quiet \
-            -m 'chore(deps): recompile requirements-ci.lock for the bumped versions' \
-            -m "Renovate bumped the pinned version but could not run the post-upgrade
-          task that recompiles the lockfile, so its --hash lines and any newly
-          required dependency were missing and pip --require-hashes rejected it.
-          Recompiled with uv by scripts/update-requirements-ci-hashes.mjs in
-          ${RUN_URL}." \
-            -- requirements-ci.lock
+            -m 'chore(deps): repair Renovate drift in lockfile hashes and containerfile pins' \
+            -m "Renovate bumped the pinned versions but could not run the
+          post-upgrade tasks that recompile requirements-ci.lock and refresh the
+          OMP, GH, Node, and tmux digests, so the lockfile --hash lines, any newly
+          required dependency, and the runtime pin digests were wrong and validate
+          rejected the image.
+          Repaired with scripts/update-requirements-ci-hashes.mjs and the
+          scripts/update-*-pins.mjs synchronizers in ${RUN_URL}." \
+            -- requirements-ci.lock image/contribute/Containerfile
           # The token appears here and nowhere else. A rejected push means
           # Renovate moved the branch while this ran; that push has its own
           # run of this workflow, so failing here is correct and loses nothing.
@@ -178,7 +237,7 @@ jobs:
             "HEAD:refs/heads/${BRANCH}"
 
       - name: Run validate on the refreshed commit
-        if: steps.refresh.outputs.changed == 'true'
+        if: steps.refresh.outputs.changed == 'true' || steps.pins.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.head_ref }}
