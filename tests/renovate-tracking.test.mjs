@@ -147,6 +147,40 @@ test("every postUpgradeTask command is allowlisted in the Renovate workflow", as
 	}
 });
 
+test("renovate-hashes.yml repairs the containerfile pin drift it is meant to cover", async () => {
+// The hash repair only triggers on requirements-ci.lock, so the image's
+// runtime pins had no fallback when Renovate skipped the pin post-upgrade
+// tasks: every OMP/GH/Node/tmux bump arrived with the previous release's
+// digests. This is the Containerfile analogue of that repair, and it has to
+// stay wired or that gap returns silently.
+const repair = await readRepoFile(".github/workflows/renovate-hashes.yml");
+
+// The trigger must fire on the Containerfile, not just the lockfile. The
+// paths block ends at the first blank line after it.
+const paths = /paths:\s*\n((?:\s*-\s*\S+\s*\n)+)/.exec(repair);
+assert.ok(paths, "renovate-hashes.yml sets no trigger paths");
+const pathEntries = [...paths[1].matchAll(/- (\S+)/g)].map((match) => match[1]);
+assert.ok(pathEntries.includes("requirements-ci.lock"), "renovate-hashes.yml no longer triggers on requirements-ci.lock");
+assert.ok(
+	pathEntries.includes("image/contribute/Containerfile"),
+	"renovate-hashes.yml does not trigger on image/contribute/Containerfile, so a pin-only PR never reaches the repair",
+);
+
+// Every runtime pin synchronizer is actually invoked by the repair, so a pin
+// that drifts is rewritten rather than left sitting beside a version bump.
+for (const script of [
+	"scripts/update-omp-pins.mjs",
+	"scripts/update-gh-pins.mjs",
+	"scripts/update-node-pins.mjs",
+	"scripts/update-tmux-pins.mjs",
+]) {
+	assert.ok(
+		repair.includes(script),
+		`renovate-hashes.yml does not run ${script}; a drift in that pin would go unrepaired`,
+	);
+}
+});
+
 test("the digest refresher for each pin is a real, executable script", async () => {
 	const commands = config.packageRules.flatMap((rule) => rule.postUpgradeTasks?.commands ?? []);
 	for (const command of commands) {
