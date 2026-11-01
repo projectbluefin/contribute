@@ -33,7 +33,7 @@ platformdirs==4.14.2 \
 pre-commit==4.7.0 \
     --hash=sha256:1f3deee12b914c8fa184bd2b5953391c2e4f36763e403d4a23dc9983fa7c6e86 \
     --hash=sha256:2e229038ad3656081b70c27913157e4b636ef306f643f024a8a8e3f0f7b2f877
-python-discovery==1.6.7 \
+python-discovery==1.9.0 \
     --hash=sha256:5422f67e5f533bb02d7b73de1c422ed74037536fd869e05156c07565926ec68e \
     --hash=sha256:7f7c28568c8ec3d988d8bddbdbec8e65f08e8767e52f734e18b8b498549b9b70
     # via virtualenv
