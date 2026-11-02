@@ -117,9 +117,9 @@ RUN set -eu; \
     curl --fail --location --show-error --silent "https://codeload.github.com/hivecommons/hive/tar.gz/${hive_commit}" -o "$workdir/hive.tar.gz"; \
     mkdir -p "$workdir/hive"; \
     tar -xzf "$workdir/hive.tar.gz" -C "$workdir/hive" --strip-components=1 --wildcards \
-      "*/bin/contributor-agent.sh" "*/bin/contributor-relay.js" "*/bin/pi-backend.js" "*/bin/lib/*" \
+      "*/bin/contributor-agent.sh" "*/bin/contributor-relay.js" "*/bin/pi-backend.js" "*/bin/mlx-backend.js" "*/bin/lib/*" \
       "*/bin/gh-wrapper.sh" "*/config/backends.conf" "*/config/restrictions/contributor-default.json"; \
-    install -m 0755 "$workdir/hive/bin/contributor-agent.sh" "$workdir/hive/bin/contributor-relay.js" "$workdir/hive/bin/pi-backend.js" /out/usr/local/bin/; \
+    install -m 0755 "$workdir/hive/bin/contributor-agent.sh" "$workdir/hive/bin/contributor-relay.js" "$workdir/hive/bin/pi-backend.js" "$workdir/hive/bin/mlx-backend.js" /out/usr/local/bin/; \
     cp -a "$workdir/hive/bin/lib/." /out/usr/local/bin/lib/; \
     [ -n "$(ls -A /out/usr/local/bin/lib)" ] || { echo "bin/lib/ staged empty from ${hive_commit}" >&2; exit 1; }; \
     install -m 0755 "$workdir/hive/bin/gh-wrapper.sh" /out/usr/bin/gh; \
