@@ -52,7 +52,7 @@ grep -qF '/out/usr/share/hive/contribute/HIVE_COMMIT' "$containerfile" || fail "
 # asserts pane-classifier.js actually landed in the built image.
 # omp-backend.js is deliberately absent — it is a host-side staging helper for
 # `just contribute-hive`, and upstream's own contributor image does not ship it.
-for path in contributor-agent.sh contributor-relay.js pi-backend.js bin/lib/ backends.conf gh-wrapper.sh contributor-default.json; do
+for path in contributor-agent.sh contributor-relay.js pi-backend.js mlx-backend.js bin/lib/ backends.conf gh-wrapper.sh contributor-default.json; do
   grep -q "${path}" "$containerfile" || fail "missing Hive runtime ${path}"
 done
 ! grep -qF 'bin/omp-backend.js' "$containerfile" ||
@@ -203,7 +203,7 @@ test "$(image_env XDG_STATE_HOME)" = "${guest_home}/.local/state" || fail "image
 test "$(inspect '{{json .Config.Entrypoint}}')" = '["/usr/local/bin/hive-contribute"]' || fail "image entrypoint"
 
 # shellcheck disable=SC2016 # the single-quoted $HOME expands inside the container, not this shell
-"$engine" run --rm --entrypoint /usr/bin/bash "$image" -c 'set -eu; omp --version; node -e "require.resolve(\"ws\")"; python3 --version >/dev/null; gh --version >/dev/null; /opt/hive/bin/gh-real --version >/dev/null; tmux -V; git --version >/dev/null; curl --version >/dev/null; find --version >/dev/null; grep --version >/dev/null; sed --version >/dev/null; cmp --version >/dev/null; test -w "$HOME"; test -w "$HOME/workspace"; test -f /usr/local/bin/contributor-relay.js; test -f /usr/local/bin/pi-backend.js; test ! -e /usr/local/bin/omp-backend.js; test -f /usr/local/bin/lib/pane-classifier.js; test -f /usr/share/hive/contribute/HIVE_COMMIT; test ! -e /usr/bin/npm; test ! -e /usr/bin/corepack' >/dev/null || fail "runtime closure"
+"$engine" run --rm --entrypoint /usr/bin/bash "$image" -c 'set -eu; omp --version; node -e "require.resolve(\"ws\")"; python3 --version >/dev/null; gh --version >/dev/null; /opt/hive/bin/gh-real --version >/dev/null; tmux -V; git --version >/dev/null; curl --version >/dev/null; find --version >/dev/null; grep --version >/dev/null; sed --version >/dev/null; cmp --version >/dev/null; test -w "$HOME"; test -w "$HOME/workspace"; test -f /usr/local/bin/contributor-relay.js; test -f /usr/local/bin/pi-backend.js; test -f /usr/local/bin/mlx-backend.js; test ! -e /usr/local/bin/omp-backend.js; test -f /usr/local/bin/lib/pane-classifier.js; test -f /usr/share/hive/contribute/HIVE_COMMIT; test ! -e /usr/bin/npm; test ! -e /usr/bin/corepack' >/dev/null || fail "runtime closure"
 
 # Every staged coreutils program executes, read from the array stage-runtime.sh
 # stages so the two cannot drift. GNU `false --version` exits 1 by design;
