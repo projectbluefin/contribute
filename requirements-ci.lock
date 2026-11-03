@@ -33,9 +33,9 @@ platformdirs==4.14.3 \
 pre-commit==4.7.0 \
     --hash=sha256:1f3deee12b914c8fa184bd2b5953391c2e4f36763e403d4a23dc9983fa7c6e86 \
     --hash=sha256:2e229038ad3656081b70c27913157e4b636ef306f643f024a8a8e3f0f7b2f877
-python-discovery==1.9.0 \
-    --hash=sha256:88beb57e51b919c30f303b053ec41359298ca349192035b0a802c76347ae96d7 \
-    --hash=sha256:fb65edfff3541b7ceb3a39be334a0f69f4cb5148287a053e1874748742fda93b
+python-discovery==1.9.2 \
+    --hash=sha256:65857e689ba72aeb5517e68b7025430ed60372b78d037245e0bed3d41ae7ba65 \
+    --hash=sha256:de397b9c4b09a5fb8bb4c51db3c0da71fb81d2283718d74fd1efaabffc32afbc
     # via virtualenv
 pyyaml==6.0.3 \
     --hash=sha256:00c4bdeba853cc34e7dd471f16b4114f4162dc03e6b7afcc2128711f0eca823c \
