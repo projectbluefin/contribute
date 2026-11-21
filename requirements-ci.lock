@@ -115,6 +115,6 @@ pyyaml==6.0.4 \
     --hash=sha256:f617e4e5c619fef5284335b24e3af3a77ce08dc5c389ff4b25033bb2749032b7
     # via pre-commit
 virtualenv==21.15.11 \
-    --hash=sha256:adc6799981f513ce852aea17ea592e0d342ce48e87f5d17a3d997966df582a67 \
-    --hash=sha256:c0fbae7de061402e31897d96cfbe7dc35ce93cd464fe05f9bdbecf61313447bf
+    --hash=sha256:0390c40275487b5e677a1e559e30204ff061db4c5fec39c81d0dff1b24d2b774 \
+    --hash=sha256:6ad11e129f546835ae81d47a27f48ed32dcc4e2a0776014a159bab8895cdb9ac
     # via pre-commit
