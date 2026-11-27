@@ -51,7 +51,7 @@ jobs:
           # Re-narrow the token to this repo: owner: alone would mint a token valid for every repo in projectbluefin, which is then handed to Renovate and the update-*.mjs synchronizers.
           repositories: ${{ github.event.repository.name }}
 
-      - uses: renovatebot/github-action@ebcbb513d07ead4d9c0c2139064301db05e84a3e # v46.3.15
+      - uses: renovatebot/github-action@1376d90bcd3a4d4e7393ae762eea56ac684aee38 # v48.0.0
         with:
           configurationFile: renovate.json
           token: ${{ steps.app-token.outputs.token }}
